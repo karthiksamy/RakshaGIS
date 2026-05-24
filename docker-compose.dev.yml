@@ -1,0 +1,30 @@
+#version: '3.9'
+
+# Development overrides — use with:
+#   docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+
+  web:
+    environment:
+      DATA_DIR: /data
+      DJANGO_SETTINGS_MODULE: config.settings.development
+    command: python manage.py runserver 0.0.0.0:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app                  # live source reload
+      - ${DATA_DIR}:/data
+
+  celery:
+    environment:
+      DATA_DIR: /data
+      DJANGO_SETTINGS_MODULE: config.settings.development
+    volumes:
+      - .:/app
+      - ${DATA_DIR}:/data
+
+  # Nginx not needed in development — Django serves directly on :8000
+  nginx:
+    profiles:
+      - production

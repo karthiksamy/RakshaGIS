@@ -1,0 +1,129 @@
+#version: '3.9'
+
+# DATA_DIR is set in .env — it is the HOST path where all persistent data lives.
+# Inside every app container it is always mounted as /data.
+
+x-app-base: &app-base
+  build: .
+  env_file: .env
+  environment:
+    DATA_DIR: /data                                 # fixed path inside container
+    DJANGO_SETTINGS_MODULE: config.settings.production
+  volumes:
+    - .:/app                                        # source code bind-mount (dev + migrations)
+    - ${DATA_DIR:?Run setup.sh first to set DATA_DIR}:/data
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_started
+
+services:
+
+  # ── PostgreSQL + PostGIS ─────────────────────────────────────────
+  db:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-rakshagis}
+      POSTGRES_USER: ${DB_USER:-raksha}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ${DATA_DIR}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-raksha} -d ${DB_NAME:-rakshagis}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - ${DATA_DIR}/redis:/data
+
+  # ── Django (Gunicorn) ────────────────────────────────────────────
+  web:
+    <<: *app-base
+    command: gunicorn --bind 0.0.0.0:8000 --workers 4 --timeout 120 config.wsgi:application
+
+  # ── Celery worker ────────────────────────────────────────────────
+  celery:
+    <<: *app-base
+    command: celery -A config worker --loglevel=info --concurrency=2
+
+  # ── Vector tile server (PostGIS → MVT) ──────────────────────────
+  pg_tileserv:
+    image: pramsey/pg_tileserv:latest
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${DB_USER:-raksha}:${DB_PASSWORD}@db:5432/${DB_NAME:-rakshagis}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ── Nginx (reverse proxy + static/media + tile proxy) ────────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx-docker.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${DATA_DIR}/staticfiles:/staticfiles:ro
+      - ${DATA_DIR}/media:/media:ro
+      - ${DATA_DIR}/certbot/conf:/etc/letsencrypt:ro
+      - ${DATA_DIR}/certbot/www:/var/www/certbot:ro
+    depends_on:
+      - web
+      - pg_tileserv
+
+  # ── Let's Encrypt certificate renewal ───────────────────────────
+  certbot:
+    image: certbot/certbot
+    restart: unless-stopped
+    volumes:
+      - ${DATA_DIR}/certbot/conf:/etc/letsencrypt
+      - ${DATA_DIR}/certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done'"
+
+  # ── Ollama (local AI) ────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ${DATA_DIR}/ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+
+  # ── Prometheus (metrics scraping) ───────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${DATA_DIR}/prometheus:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+
+  # ── Grafana (dashboards) ─────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    volumes:
+      - ${DATA_DIR}/grafana:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-changeme}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus

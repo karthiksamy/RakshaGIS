@@ -1,0 +1,10 @@
+data/
+logs/
+*.pyc
+__pycache__/
+*.pyo
+.git/
+.env.local
+.DS_Store
+frontend/node_modules/
+frontend/dist/

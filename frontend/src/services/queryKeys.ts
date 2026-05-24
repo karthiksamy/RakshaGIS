@@ -1,0 +1,16 @@
+export const qk = {
+  me: () => ['me'] as const,
+  projects: (params?: Record<string, unknown>) => ['projects', params] as const,
+  project: (id: number) => ['projects', id] as const,
+  projectWorkflow: (id: number) => ['projects', id, 'workflow'] as const,
+  projectFeatures: (id: number) => ['projects', id, 'features'] as const,
+  organisations: () => ['organisations'] as const,
+  users: (params?: Record<string, unknown>) => ['users', params] as const,
+  basemaps: () => ['basemaps'] as const,
+  documents: (params?: Record<string, unknown>) => ['documents', params] as const,
+  chatSessions: () => ['chat-sessions'] as const,
+  chatSession: (id: number) => ['chat-sessions', id] as const,
+  aiTasks: () => ['ai-tasks'] as const,
+  aiTask: (id: number) => ['ai-tasks', id] as const,
+  attributeTemplates: () => ['attribute-templates'] as const,
+}

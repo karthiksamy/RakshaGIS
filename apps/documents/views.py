@@ -15,13 +15,13 @@ from .serializers import DocumentSerializer
 class DocumentViewSet(viewsets.ModelViewSet):
     serializer_class = DocumentSerializer
     filter_backends = [DjangoFilterBackend, SearchFilter]
-    filterset_fields = ['project', 'category', 'ai_processed']
+    filterset_fields = ['project', 'folder', 'category', 'ai_processed']
     search_fields = ['title']
 
     def get_queryset(self):
         return org_queryset_filter(
             self.request.user,
-            Document.objects.select_related('project__organisation', 'uploaded_by'),
+            Document.objects.select_related('project__organisation', 'uploaded_by', 'folder'),
             org_field='project__organisation',
         )
 
@@ -52,11 +52,13 @@ class DocumentViewSet(viewsets.ModelViewSet):
     def process_ai(self, request, pk=None):
         """Queue async AI text extraction + summarisation for this document."""
         document = self.get_object()
-        if document.ai_processed:
-            return Response({'detail': 'Already processed.'}, status=status.HTTP_200_OK)
 
         from apps.ai_assistant.tasks import process_document_ai
         from apps.ai_assistant.models import AITask
+
+        # Reset flag so task re-runs even if already processed
+        document.ai_processed = False
+        document.save(update_fields=['ai_processed'])
 
         task = AITask.objects.create(
             task_type=AITask.PDF_EXTRACTION,

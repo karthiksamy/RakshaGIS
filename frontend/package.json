@@ -5,20 +5,30 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build && cp ../static/frontend/index.html ../templates/index.html",
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
   },
   "dependencies": {
     "@ant-design/icons": "^5.4.0",
     "@tanstack/react-query": "^5.56.0",
+    "@turf/line-offset": "^7.3.5",
+    "@turf/simplify": "^7.3.5",
+    "@turf/transform-rotate": "^7.3.5",
+    "@turf/transform-scale": "^7.3.5",
+    "@turf/turf": "^7.3.5",
     "antd": "^5.20.0",
     "axios": "^1.7.7",
     "dayjs": "^1.11.13",
+    "geotiff": "^3.0.5",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
     "ol": "^10.2.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.26.0",
+    "xlsx": "^0.18.5",
     "zustand": "^4.5.5"
   },
   "devDependencies": {

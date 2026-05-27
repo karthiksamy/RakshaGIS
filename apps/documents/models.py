@@ -27,6 +27,10 @@ class Document(models.Model):
     project = models.ForeignKey(
         'survey_projects.SurveyProject', on_delete=models.CASCADE, related_name='documents'
     )
+    folder = models.ForeignKey(
+        'survey_projects.ProjectLayerFolder', null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='documents',
+    )
     title = models.CharField(max_length=200)
     category = models.CharField(max_length=30, choices=CATEGORY_CHOICES, default=OTHER)
     file = models.FileField(upload_to=document_upload_path)

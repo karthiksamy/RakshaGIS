@@ -5,10 +5,14 @@ from .models import WorkflowStep, AuditLog, Notification
 class WorkflowStepSerializer(serializers.ModelSerializer):
     actor_name = serializers.CharField(source='actor.get_full_name', read_only=True)
     action_display = serializers.CharField(source='get_action_display', read_only=True)
+    survey_area_name = serializers.CharField(source='survey_area.name', read_only=True)
 
     class Meta:
         model = WorkflowStep
-        fields = ['id', 'project', 'action', 'action_display', 'actor', 'actor_name', 'remarks', 'timestamp']
+        fields = [
+            'id', 'project', 'survey_area', 'survey_area_name',
+            'action', 'action_display', 'actor', 'actor_name', 'remarks', 'timestamp',
+        ]
         read_only_fields = ['actor', 'timestamp']
 
 

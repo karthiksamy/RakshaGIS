@@ -9,6 +9,12 @@ __pycache__/
 dist/
 build/
 .eggs/
+.gitignore/
+.gitignore
+.build-hash
+
+#Data
+data/
 
 # Virtual environments
 .venv/

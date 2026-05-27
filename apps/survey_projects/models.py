@@ -102,6 +102,123 @@ class SurveyProject(models.Model):
         return f"{self.project_number} — {self.name}"
 
 
+class ProjectLayerFolder(models.Model):
+    COMMON    = 'COMMON'
+    BOUNDARY  = 'BOUNDARY'
+    PHASE     = 'PHASE'
+    ZONE      = 'ZONE'
+    YEAR      = 'YEAR'
+    VERSION   = 'VERSION'
+    DOC       = 'DOC'
+    SHAPEFILE = 'SHAPEFILE'
+    RASTER    = 'RASTER'
+    OTHERS    = 'OTHERS'
+
+    TYPE_CHOICES = [
+        (COMMON,    'Common Layer'),
+        (BOUNDARY,  'Admin Boundary'),
+        (PHASE,     'Phase'),
+        (ZONE,      'Pockets'),
+        (YEAR,      'Year'),
+        (VERSION,   'Version'),
+        (DOC,       'Document Folder'),
+        (SHAPEFILE, 'Shape Files Folder'),
+        (RASTER,    'Raster / GeoTIFF Folder'),
+        (OTHERS,    'Others'),
+    ]
+
+    # Leaf-level folder types — these get file leaves in the tree
+    LEAF_TYPES = (DOC, SHAPEFILE, RASTER)
+
+    project     = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='folders')
+    parent      = models.ForeignKey('self', null=True, blank=True, on_delete=models.CASCADE, related_name='children')
+    name        = models.CharField(max_length=200)
+    folder_type = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    year        = models.PositiveSmallIntegerField(null=True, blank=True)
+    is_final    = models.BooleanField(default=False)
+    order       = models.PositiveSmallIntegerField(default=0)
+    created_by  = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', 'name']
+
+    def __str__(self):
+        return f"{self.project.project_number} / {self.name}"
+
+
+class SurveyArea(models.Model):
+    """
+    A named geographic/survey work unit within a project.
+    Workflow (submit → check → approve) is performed at this level,
+    not at the project level.
+    """
+    DRAFT        = 'DRAFT'
+    SUBMITTED    = 'SUBMITTED'
+    UNDER_REVIEW = 'UNDER_REVIEW'
+    APPROVED     = 'APPROVED'
+    PUBLISHED    = 'PUBLISHED'
+    RETURNED     = 'RETURNED'
+
+    STATUS_CHOICES = [
+        (DRAFT,        'Draft'),
+        (SUBMITTED,    'Submitted for Checking'),
+        (UNDER_REVIEW, 'Under Review'),
+        (APPROVED,     'Approved'),
+        (PUBLISHED,    'Published'),
+        (RETURNED,     'Returned for Revision'),
+    ]
+
+    project     = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='survey_areas')
+    name        = models.CharField(max_length=200)
+    area_code   = models.CharField(max_length=50, blank=True)
+    description = models.TextField(blank=True)
+    # Optional link to the root layer folder for this area's GIS data
+    folder      = models.OneToOneField(
+        'ProjectLayerFolder', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='survey_area_link',
+    )
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='assigned_survey_areas',
+    )
+    status      = models.CharField(max_length=20, choices=STATUS_CHOICES, default=DRAFT)
+    created_by  = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='created_survey_areas',
+    )
+    created_at  = models.DateTimeField(auto_now_add=True)
+    updated_at  = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        unique_together = [('project', 'name')]
+        indexes = [
+            models.Index(fields=['project', 'status']),
+        ]
+
+    def __str__(self):
+        return f"{self.project.project_number} / {self.name}"
+
+
+class ProjectShare(models.Model):
+    """CEO/ADEO grants a specific DEO org read-only view access to one of their projects."""
+    project      = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='shares')
+    granted_to   = models.ForeignKey(
+        'accounts.Organisation', on_delete=models.CASCADE, related_name='shared_projects'
+    )
+    granted_by   = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='granted_shares'
+    )
+    created_at   = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('project', 'granted_to')]
+
+    def __str__(self):
+        return f"{self.project.project_number} → {self.granted_to.code}"
+
+
 class GISFeature(models.Model):
     POINT = 'POINT'
     LINE = 'LINE'
@@ -113,7 +230,11 @@ class GISFeature(models.Model):
         (POLYGON, 'Polygon'),
     ]
 
-    project = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='features')
+    project    = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='features')
+    folder     = models.ForeignKey(
+        ProjectLayerFolder, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='features'
+    )
     feature_id = models.CharField(max_length=50, blank=True)
     layer_name = models.CharField(max_length=64, validators=[validate_layer_name])
     geometry_type = models.CharField(max_length=10, choices=GEOMETRY_TYPE_CHOICES)
@@ -132,6 +253,7 @@ class GISFeature(models.Model):
         indexes = [
             models.Index(fields=['project', 'layer_name']),
             models.Index(fields=['project', 'is_deleted']),
+            models.Index(fields=['folder', 'is_deleted']),
         ]
 
     def __str__(self):
@@ -279,6 +401,10 @@ class ShapefileImport(models.Model):
     project            = models.ForeignKey(
         SurveyProject, on_delete=models.CASCADE, related_name='shapefile_imports'
     )
+    folder             = models.ForeignKey(
+        'ProjectLayerFolder', null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='shapefile_imports',
+    )
     file               = models.FileField(upload_to=_shapefile_upload_path)
     layer_name         = models.CharField(max_length=64, validators=[validate_layer_name])
     attribute_template = models.ForeignKey(
@@ -288,7 +414,11 @@ class ShapefileImport(models.Model):
     )
     status             = models.CharField(max_length=10, choices=STATUS_CHOICES, default=PENDING)
     feature_count      = models.PositiveIntegerField(null=True, blank=True)
+    columns            = models.JSONField(default=list, blank=True,
+                             help_text='Attribute column names detected in the source file')
     error              = models.TextField(blank=True)
+    ai_processed       = models.BooleanField(default=False)
+    ai_summary         = models.TextField(blank=True)
     created_by         = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='shapefile_imports'
     )
@@ -299,3 +429,194 @@ class ShapefileImport(models.Model):
 
     def __str__(self):
         return f"{self.layer_name} → {self.project.project_number} [{self.status}]"
+
+
+def _geotiff_upload_path(instance, filename):
+    from apps.core.folder_manager import get_project_rel_path
+    return f"{get_project_rel_path(instance.project)}/geotiffs/{filename}"
+
+
+class GeoTiffLayer(models.Model):
+    """Drone survey GeoTiff uploaded by SDO/Surveyor. Converted to COG async by Celery."""
+
+    PENDING = 'PENDING'
+    PROCESSING = 'PROCESSING'
+    DONE = 'DONE'
+    FAILED = 'FAILED'
+
+    STATUS_CHOICES = [
+        (PENDING, 'Pending'),
+        (PROCESSING, 'Processing'),
+        (DONE, 'Done'),
+        (FAILED, 'Failed'),
+    ]
+
+    project     = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='geotiff_layers')
+    folder      = models.ForeignKey(
+        ProjectLayerFolder, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='geotiff_layers'
+    )
+    name        = models.CharField(max_length=200)
+    file        = models.FileField(upload_to=_geotiff_upload_path)
+    cog_file    = models.FileField(upload_to=_geotiff_upload_path, blank=True)
+    status      = models.CharField(max_length=15, choices=STATUS_CHOICES, default=PENDING)
+    error       = models.TextField(blank=True)
+    is_visible  = models.BooleanField(default=True)
+    opacity     = models.FloatField(default=0.8)
+    created_by  = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='geotiff_layers')
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} — {self.project.project_number} [{self.status}]"
+
+
+# ── Feature Attachments ───────────────────────────────────────────────────────
+
+def _attachment_upload_path(instance, filename):
+    return f"features/{instance.feature.project_id}/{instance.feature_id}/attachments/{filename}"
+
+
+class FeatureAttachment(models.Model):
+    feature = models.ForeignKey(GISFeature, on_delete=models.CASCADE, related_name='attachments')
+    file = models.FileField(upload_to=_attachment_upload_path)
+    original_filename = models.CharField(max_length=255)
+    file_size = models.PositiveIntegerField(default=0)
+    file_type = models.CharField(max_length=10, blank=True)  # image, pdf, doc
+    caption = models.CharField(max_length=500, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, related_name='feature_attachments'
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-uploaded_at']
+
+    def __str__(self):
+        return f"{self.original_filename} → feature {self.feature_id}"
+
+
+# ── Project Milestones (Gantt) ────────────────────────────────────────────────
+
+class ProjectMilestone(models.Model):
+    PENDING = 'PENDING'
+    IN_PROGRESS = 'IN_PROGRESS'
+    COMPLETED = 'COMPLETED'
+    DELAYED = 'DELAYED'
+
+    STATUS_CHOICES = [
+        (PENDING, 'Pending'),
+        (IN_PROGRESS, 'In Progress'),
+        (COMPLETED, 'Completed'),
+        (DELAYED, 'Delayed'),
+    ]
+
+    project = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='milestones')
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    start_date = models.DateField(null=True, blank=True)
+    due_date = models.DateField()
+    completed_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default=PENDING)
+    assignee = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='milestones'
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='created_milestones'
+    )
+    order = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['due_date', 'order']
+        indexes = [models.Index(fields=['project', 'due_date'])]
+
+    def __str__(self):
+        return f"{self.project.project_number} / {self.name}"
+
+
+class QGISUploadLog(models.Model):
+    """
+    Server-side record of every file uploaded by the QGIS Sync plugin.
+    Used for history tracking, duplicate detection, and audit.
+    """
+
+    SUCCESS   = 'SUCCESS'
+    FAILED    = 'FAILED'
+    SKIPPED   = 'SKIPPED'
+
+    STATUS_CHOICES = [
+        (SUCCESS, 'Success'),
+        (FAILED,  'Failed'),
+        (SKIPPED, 'Skipped (duplicate)'),
+    ]
+
+    project     = models.ForeignKey(
+        SurveyProject, on_delete=models.CASCADE, related_name='qgis_uploads'
+    )
+    folder      = models.ForeignKey(
+        ProjectLayerFolder, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='qgis_uploads'
+    )
+    filename        = models.CharField(max_length=255)
+    original_path   = models.CharField(max_length=1000, blank=True,
+                         help_text='Full file path on the QGIS workstation')
+    file_size       = models.PositiveBigIntegerField(default=0)
+    algorithm_id    = models.CharField(max_length=200, blank=True,
+                         help_text='QGIS Processing algorithm that generated the file')
+    module_name     = models.CharField(max_length=200, blank=True,
+                         help_text='Module name resolved for folder routing')
+    status          = models.CharField(max_length=10, choices=STATUS_CHOICES, default=SUCCESS)
+    error_message   = models.TextField(blank=True)
+    uploaded_by     = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, related_name='qgis_uploads'
+    )
+    uploaded_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-uploaded_at']
+        indexes  = [models.Index(fields=['project', 'uploaded_at'])]
+
+    def __str__(self):
+        return f"{self.filename} → {self.project.project_number} [{self.status}]"
+
+
+class TemporaryLayer(models.Model):
+    """User-uploaded scratch layers (KML/KMZ/GeoJSON/Shapefile ZIP) for ad-hoc map viewing.
+    Stored separately from project GISFeature data — no project association required.
+    """
+    KML       = 'kml'
+    KMZ       = 'kmz'
+    GEOJSON   = 'geojson'
+    SHAPEFILE = 'shapefile'
+
+    FORMAT_CHOICES = [
+        (KML,       'KML'),
+        (KMZ,       'KMZ'),
+        (GEOJSON,   'GeoJSON'),
+        (SHAPEFILE, 'Shapefile (ZIP)'),
+    ]
+
+    name          = models.CharField(max_length=200)
+    purpose       = models.CharField(max_length=500, blank=True)
+    description   = models.TextField(blank=True)
+    file_format   = models.CharField(max_length=20, choices=FORMAT_CHOICES)
+    file          = models.FileField(upload_to='temp_layers/')
+    geojson       = models.JSONField(null=True, blank=True)
+    feature_count = models.IntegerField(default=0)
+    uploaded_by   = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='temp_layers'
+    )
+    created_at    = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} [{self.file_format}] by {self.uploaded_by}"

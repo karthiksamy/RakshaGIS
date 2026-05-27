@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import zipfile
 
@@ -56,6 +58,7 @@ def import_shapefile(self, job_id: int):
 
             with fiona.open(shp_path) as src:
                 src_crs = src.crs_wkt or 'EPSG:4326'
+                detected_columns = list(src.schema.get('properties', {}).keys())
 
                 for feat in src:
                     if feat.geometry is None:
@@ -83,12 +86,14 @@ def import_shapefile(self, job_id: int):
                         geometry=geos_geom,
                         attributes=attrs,
                         created_by=job.created_by,
+                        folder=job.folder,
                     ))
 
         GISFeature.objects.bulk_create(features_to_create, batch_size=500)
 
         job.status = ShapefileImport.DONE
         job.feature_count = len(features_to_create)
+        job.columns = detected_columns
         job.error = ''
 
     except Exception as exc:
@@ -97,4 +102,61 @@ def import_shapefile(self, job_id: int):
         self.retry(exc=exc, countdown=15)
 
     finally:
-        job.save(update_fields=['status', 'feature_count', 'error'])
+        job.save(update_fields=['status', 'feature_count', 'columns', 'error'])
+
+
+@shared_task(bind=True, max_retries=1)
+def convert_geotiff_to_cog(self, geotiff_id: int):
+    """Convert an uploaded GeoTiff to Cloud-Optimized GeoTIFF (COG) using GDAL."""
+    from django.conf import settings
+    from apps.survey_projects.models import GeoTiffLayer
+
+    layer = GeoTiffLayer.objects.get(id=geotiff_id)
+    layer.status = GeoTiffLayer.PROCESSING
+    layer.save(update_fields=['status'])
+
+    try:
+        src_path = os.path.join(settings.MEDIA_ROOT, layer.file.name)
+        dst_rel = layer.file.name.rsplit('.', 1)[0] + '_cog.tif'
+        dst_path = os.path.join(settings.MEDIA_ROOT, dst_rel)
+
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+
+        # Reproject to EPSG:3857 (Web Mercator) for OL display, then write COG
+        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # Step 1: Warp to 3857
+            subprocess.run(
+                ['gdalwarp', '-t_srs', 'EPSG:3857', '-of', 'GTiff', src_path, tmp_path],
+                check=True, capture_output=True,
+            )
+            # Step 2: Translate to COG
+            subprocess.run(
+                [
+                    'gdal_translate', tmp_path, dst_path,
+                    '-of', 'COG',
+                    '-co', 'COMPRESS=DEFLATE',
+                    '-co', 'TILING_SCHEME=GoogleMapsCompatible',
+                ],
+                check=True, capture_output=True,
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        layer.cog_file = dst_rel
+        layer.status = GeoTiffLayer.DONE
+        layer.error = ''
+
+    except subprocess.CalledProcessError as exc:
+        layer.status = GeoTiffLayer.FAILED
+        layer.error = (exc.stderr or b'').decode()[:500]
+        self.retry(exc=exc, countdown=30)
+    except Exception as exc:
+        layer.status = GeoTiffLayer.FAILED
+        layer.error = str(exc)
+        self.retry(exc=exc, countdown=30)
+    finally:
+        layer.save(update_fields=['status', 'cog_file', 'error'])

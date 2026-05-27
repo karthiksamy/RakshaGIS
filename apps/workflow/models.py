@@ -20,7 +20,13 @@ class WorkflowStep(models.Model):
     ]
 
     project = models.ForeignKey(
-        'survey_projects.SurveyProject', on_delete=models.CASCADE, related_name='workflow_steps'
+        'survey_projects.SurveyProject', on_delete=models.CASCADE, related_name='workflow_steps',
+        null=True, blank=True,
+    )
+    # Workflow is primarily tracked at the survey-area level
+    survey_area = models.ForeignKey(
+        'survey_projects.SurveyArea', on_delete=models.CASCADE, related_name='workflow_steps',
+        null=True, blank=True,
     )
     action = models.CharField(max_length=12, choices=ACTION_CHOICES)
     actor = models.ForeignKey(
@@ -33,7 +39,8 @@ class WorkflowStep(models.Model):
         ordering = ['timestamp']
 
     def __str__(self):
-        return f"{self.project.project_number} — {self.get_action_display()} by {self.actor}"
+        target = self.survey_area or self.project
+        return f"{target} — {self.get_action_display()} by {self.actor}"
 
 
 class AuditLog(models.Model):

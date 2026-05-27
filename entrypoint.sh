@@ -25,10 +25,14 @@ echo "==> PostgreSQL ready."
 # The celery container just waits for the DB and starts the worker.
 case "$1" in
     gunicorn)
+        echo "==> Creating any missing migrations..."
+        python manage.py makemigrations --no-input
         echo "==> Running migrations..."
         python manage.py migrate --no-input
         echo "==> Collecting static files..."
         python manage.py collectstatic --no-input
+        echo "==> Seeding basemaps..."
+        python manage.py seed_basemaps
         echo "==> Initialising folder structure..."
         python manage.py init_folders
         ;;

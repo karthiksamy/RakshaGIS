@@ -1,11 +1,12 @@
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.accounts.models import User
 from apps.accounts.permissions import org_queryset_filter
-from apps.survey_projects.models import SurveyProject
+from apps.survey_projects.models import SurveyProject, SurveyArea
 from .models import WorkflowStep, AuditLog, Notification
 from .serializers import (
     WorkflowStepSerializer, WorkflowTransitionSerializer,
@@ -14,21 +15,26 @@ from .serializers import (
 
 # (required_from_status, new_status, role_property)
 # role_property is a User property name (string) that must return True, or None for no role check.
+# These operate on SurveyProject.status (legacy project-level workflow).
 TRANSITIONS = {
-    # SDO forwards a draft project to the Checker
-    'forward': (SurveyProject.DRAFT, SurveyProject.SUBMITTED, 'can_forward'),
-    # SDO re-forwards a returned project after addressing remarks
-    're_forward': (SurveyProject.RETURNED, SurveyProject.SUBMITTED, 'can_forward'),
-    # Checker reviews and sends to Approver
-    'send_to_approver': (SurveyProject.SUBMITTED, SurveyProject.UNDER_REVIEW, 'can_check'),
-    # Checker returns to SDO with remarks
-    'return_to_sdo': (SurveyProject.SUBMITTED, SurveyProject.RETURNED, 'can_check'),
-    # Approver approves the project
-    'approve': (SurveyProject.UNDER_REVIEW, SurveyProject.APPROVED, 'can_approve'),
-    # Approver returns with remarks
-    'return_from_review': (SurveyProject.UNDER_REVIEW, SurveyProject.RETURNED, 'can_approve'),
-    # DEO Admin publishes an approved project
-    'publish': (SurveyProject.APPROVED, SurveyProject.PUBLISHED, 'can_publish'),
+    'forward':           (SurveyProject.DRAFT,        SurveyProject.SUBMITTED,    'can_forward'),
+    're_forward':        (SurveyProject.RETURNED,      SurveyProject.SUBMITTED,    'can_forward'),
+    'send_to_approver':  (SurveyProject.SUBMITTED,     SurveyProject.UNDER_REVIEW, 'can_check'),
+    'return_to_sdo':     (SurveyProject.SUBMITTED,     SurveyProject.RETURNED,     'can_check'),
+    'approve':           (SurveyProject.UNDER_REVIEW,  SurveyProject.APPROVED,     'can_approve'),
+    'return_from_review':(SurveyProject.UNDER_REVIEW,  SurveyProject.RETURNED,     'can_approve'),
+    'publish':           (SurveyProject.APPROVED,      SurveyProject.PUBLISHED,    'can_publish'),
+}
+
+# Area-level workflow transitions — same state names, but operate on SurveyArea.status.
+AREA_TRANSITIONS = {
+    'forward':           (SurveyArea.DRAFT,        SurveyArea.SUBMITTED,    'can_forward'),
+    're_forward':        (SurveyArea.RETURNED,      SurveyArea.SUBMITTED,    'can_forward'),
+    'send_to_approver':  (SurveyArea.SUBMITTED,     SurveyArea.UNDER_REVIEW, 'can_check'),
+    'return_to_sdo':     (SurveyArea.SUBMITTED,     SurveyArea.RETURNED,     'can_check'),
+    'approve':           (SurveyArea.UNDER_REVIEW,  SurveyArea.APPROVED,     'can_approve'),
+    'return_from_review':(SurveyArea.UNDER_REVIEW,  SurveyArea.RETURNED,     'can_approve'),
+    'publish':           (SurveyArea.APPROVED,      SurveyArea.PUBLISHED,    'can_publish'),
 }
 
 ACTION_MAP = {
@@ -52,6 +58,32 @@ TRANSITION_LABELS = {
 }
 
 
+def _create_final_folder(project, user):
+    from apps.survey_projects.models import ProjectLayerFolder, GISFeature
+    latest = ProjectLayerFolder.objects.filter(
+        project=project,
+        folder_type=ProjectLayerFolder.VERSION,
+        is_final=False,
+    ).order_by('-created_at').first()
+
+    if not latest:
+        return
+
+    final, created = ProjectLayerFolder.objects.get_or_create(
+        project=project,
+        parent=latest.parent,
+        folder_type=ProjectLayerFolder.VERSION,
+        is_final=True,
+        defaults={'name': 'Final', 'created_by': user, 'order': 999},
+    )
+    if created:
+        for feat in GISFeature.objects.filter(folder=latest, is_deleted=False):
+            feat.pk = None
+            feat.id = None
+            feat.folder = final
+            feat.save()
+
+
 def _notify_org_users(project, transition_name, actor):
     label = TRANSITION_LABELS.get(transition_name, transition_name)
     users = User.objects.filter(organisation=project.organisation).exclude(id=actor.id)
@@ -70,12 +102,14 @@ def _notify_org_users(project, transition_name, actor):
 class WorkflowStepViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = WorkflowStepSerializer
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ['project', 'action']
+    filterset_fields = ['project', 'survey_area', 'action']
 
     def get_queryset(self):
         return org_queryset_filter(
             self.request.user,
-            WorkflowStep.objects.select_related('project__organisation', 'actor'),
+            WorkflowStep.objects.select_related(
+                'project__organisation', 'survey_area', 'actor'
+            ),
             org_field='project__organisation',
         )
 
@@ -130,11 +164,90 @@ class WorkflowStepViewSet(viewsets.ReadOnlyModelViewSet):
             remarks=serializer.validated_data['remarks'],
         )
 
+        if transition_name == 'approve':
+            _create_final_folder(project, request.user)
+
         _notify_org_users(project, transition_name, request.user)
 
         return Response({
             'status': new_status,
             'detail': f'Project {TRANSITION_LABELS[transition_name]}.',
+        })
+
+    @action(
+        detail=False, methods=['post'],
+        url_path='area-transition/(?P<area_pk>[^/.]+)/(?P<transition_name>[^/.]+)'
+    )
+    def area_transition(self, request, area_pk=None, transition_name=None):
+        """Perform a workflow transition on a SurveyArea (not a project)."""
+        if transition_name not in AREA_TRANSITIONS:
+            return Response({'detail': 'Unknown transition.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            area = SurveyArea.objects.select_related('project__organisation').get(pk=area_pk)
+        except SurveyArea.DoesNotExist:
+            return Response({'detail': 'Survey area not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        if user.role != User.SUPERADMIN and area.project.organisation != user.organisation:
+            return Response({'detail': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+
+        required_status, new_status, role_attr = AREA_TRANSITIONS[transition_name]
+
+        if role_attr and not getattr(user, role_attr, False):
+            return Response(
+                {'detail': 'Your role does not allow this transition.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if area.status != required_status:
+            return Response(
+                {
+                    'detail': (
+                        f'Survey area must be in "{required_status}" state for this transition. '
+                        f'Current state: "{area.status}".'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = WorkflowTransitionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        area.status = new_status
+        area.save(update_fields=['status', 'updated_at'])
+
+        WorkflowStep.objects.create(
+            survey_area=area,
+            project=area.project,
+            action=ACTION_MAP[transition_name],
+            actor=request.user,
+            remarks=serializer.validated_data['remarks'],
+        )
+
+        if transition_name == 'approve':
+            _create_final_folder(area.project, request.user)
+
+        # Notify org users about the area status change
+        label = TRANSITION_LABELS.get(transition_name, transition_name)
+        users = User.objects.filter(organisation=area.project.organisation).exclude(id=user.id)
+        Notification.objects.bulk_create([
+            Notification(
+                recipient=u,
+                title=f"Survey Area '{area.name}' {label}",
+                message=(
+                    f'Survey area "{area.name}" in project "{area.project.name}" '
+                    f'has been {label} by {user.get_full_name() or user.username}.'
+                ),
+                notification_type=Notification.WORKFLOW,
+                project=area.project,
+            )
+            for u in users
+        ])
+
+        return Response({
+            'status': new_status,
+            'detail': f'Survey area {TRANSITION_LABELS[transition_name]}.',
         })
 
 
@@ -154,7 +267,7 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
 class NotificationViewSet(viewsets.ModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
-    http_method_names = ['get', 'patch', 'head', 'options']
+    http_method_names = ['get', 'patch', 'post', 'head', 'options']
 
     def get_queryset(self):
         return Notification.objects.filter(recipient=self.request.user).select_related('project')
@@ -168,3 +281,69 @@ class NotificationViewSet(viewsets.ModelViewSet):
     def unread_count(self, request):
         count = Notification.objects.filter(recipient=request.user, is_read=False).count()
         return Response({'unread': count})
+
+
+# ── Bulk Status Transition ────────────────────────────────────────────────────
+
+class BulkTransitionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        project_ids = request.data.get('project_ids', [])
+        transition_name = request.data.get('transition', '')
+        remarks = request.data.get('remarks', '')
+
+        if not project_ids or transition_name not in TRANSITIONS:
+            return Response(
+                {'detail': 'Provide valid project_ids and transition name.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+        required_status, new_status, role_attr = TRANSITIONS[transition_name]
+
+        if role_attr and not getattr(user, role_attr, False):
+            return Response(
+                {'detail': f'Your role ({user.get_role_display()}) cannot perform "{transition_name}".'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        success_ids = []
+        failed = []
+
+        for pid in project_ids:
+            try:
+                if user.is_superadmin:
+                    project = SurveyProject.objects.get(pk=pid)
+                else:
+                    project = SurveyProject.objects.get(pk=pid, organisation=user.organisation)
+            except SurveyProject.DoesNotExist:
+                failed.append({'id': pid, 'reason': 'Not found or permission denied'})
+                continue
+
+            if project.status != required_status:
+                failed.append({
+                    'id': pid,
+                    'reason': f'Expected status {required_status}, got {project.status}',
+                })
+                continue
+
+            project.status = new_status
+            project.save(update_fields=['status', 'updated_at'])
+            WorkflowStep.objects.create(
+                project=project,
+                action=ACTION_MAP[transition_name],
+                actor=user,
+                remarks=remarks,
+            )
+            if transition_name == 'approve':
+                _create_final_folder(project, user)
+            _notify_org_users(project, transition_name, user)
+            success_ids.append(pid)
+
+        return Response({
+            'transitioned': len(success_ids),
+            'failed': len(failed),
+            'success_ids': success_ids,
+            'errors': failed,
+        })

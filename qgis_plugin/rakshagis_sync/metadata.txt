@@ -1,0 +1,17 @@
+[general]
+name=RakshaGIS Sync
+qgisMinimumVersion=3.16
+description=Automatically upload QGIS processing outputs (GeoTIFF, Shapefile, GeoJSON, CSV, reports) to the RakshaGIS platform with smart folder detection and background sync.
+version=1.0.0
+author=DGDE / RakshaGIS Team
+email=admin@rakshagis.local
+about=RakshaGIS Sync connects QGIS processing modules (Change Detection, Land Use Analysis, Classification) directly to the RakshaGIS server. Files are routed by extension into the correct project folder and uploaded in the background. Supports GeoTIFF, Shapefile, GeoJSON, GeoPackage, KML, CSV, PDF, and image outputs.
+tracker=https://github.com/dgde/rakshagis/issues
+repository=https://github.com/dgde/rakshagis
+tags=upload,sync,gis,server,defence,survey
+homepage=https://rakshagis.local
+category=Plugins
+icon=icons/rakshagis.png
+experimental=False
+deprecated=False
+hasProcessingProvider=False

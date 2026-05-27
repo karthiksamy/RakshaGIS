@@ -1,47 +1,46 @@
-from rest_framework_gis.serializers import GeoFeatureModelSerializer
 from rest_framework import serializers
 from .models import State, District, Taluk, Village, RevenueMap
 
 
-class StateSerializer(GeoFeatureModelSerializer):
+class StateSerializer(serializers.ModelSerializer):
     class Meta:
         model = State
-        geo_field = 'geometry'
         fields = ['id', 'name', 'code']
+        extra_kwargs = {'geometry': {'required': False}}
 
 
-class DistrictSerializer(GeoFeatureModelSerializer):
+class DistrictSerializer(serializers.ModelSerializer):
     state_name = serializers.CharField(source='state.name', read_only=True)
 
     class Meta:
         model = District
-        geo_field = 'geometry'
         fields = ['id', 'name', 'code', 'state', 'state_name']
+        extra_kwargs = {'geometry': {'required': False}}
 
 
-class TalukSerializer(GeoFeatureModelSerializer):
+class TalukSerializer(serializers.ModelSerializer):
     district_name = serializers.CharField(source='district.name', read_only=True)
 
     class Meta:
         model = Taluk
-        geo_field = 'geometry'
         fields = ['id', 'name', 'code', 'district', 'district_name']
+        extra_kwargs = {'geometry': {'required': False}}
 
 
-class VillageSerializer(GeoFeatureModelSerializer):
+class VillageSerializer(serializers.ModelSerializer):
     taluk_name = serializers.CharField(source='taluk.name', read_only=True)
 
     class Meta:
         model = Village
-        geo_field = 'geometry'
         fields = ['id', 'name', 'code', 'taluk', 'taluk_name']
+        extra_kwargs = {'geometry': {'required': False}}
 
 
-class RevenueMapSerializer(GeoFeatureModelSerializer):
+class RevenueMapSerializer(serializers.ModelSerializer):
     village_name = serializers.CharField(source='village.name', read_only=True)
 
     class Meta:
         model = RevenueMap
-        geo_field = 'geometry'
         fields = ['id', 'survey_number', 'village', 'village_name',
                   'area_hectares', 'classification', 'notes']
+        extra_kwargs = {'geometry': {'required': False}}

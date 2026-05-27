@@ -2,48 +2,215 @@ import json
 import httpx
 from django.conf import settings
 
+_EMBED_ONLY_FAMILIES = {'bert', 'nomic-bert'}
 
-def _resolve_ollama_url() -> str:
-    """Return local Ollama URL if reachable, otherwise fall back to Docker service URL."""
-    local = getattr(settings, 'OLLAMA_LOCAL_URL', 'http://localhost:11434')
+
+# ── URL probing helpers ────────────────────────────────────────────────────────
+
+def _probe_url(url: str, timeout: float = 2.0, api_key: str = '') -> bool:
+    headers = {'Authorization': f'Bearer {api_key}'} if api_key else {}
     try:
-        resp = httpx.get(f"{local}/api/tags", timeout=2)
-        if resp.status_code == 200:
-            return local
+        r = httpx.get(f"{url}/api/tags", timeout=timeout, headers=headers)
+        if r.status_code == 200:
+            return True
     except Exception:
         pass
-    return getattr(settings, 'OLLAMA_DOCKER_URL', settings.OLLAMA_BASE_URL)
+    # OpenAI-compat: try /v1/models
+    try:
+        r = httpx.get(f"{url}/v1/models", timeout=timeout, headers=headers)
+        return r.status_code in (200, 401)  # 401 = reachable but auth needed
+    except Exception:
+        return False
 
 
-class OllamaService:
+def _list_ollama_chat_models(url: str) -> list[str]:
+    try:
+        r = httpx.get(f"{url}/api/tags", timeout=3)
+        r.raise_for_status()
+        result = []
+        for m in r.json().get('models', []):
+            families = m.get('details', {}).get('families') or []
+            if any(f in _EMBED_ONLY_FAMILIES for f in families):
+                continue
+            result.append(m['name'])
+        return result
+    except Exception:
+        return []
+
+
+def _auto_resolve_ollama() -> tuple[str, str]:
+    """Try env-configured URLs in order; return first reachable (url, model)."""
+    configured_model = getattr(settings, 'OLLAMA_MODEL', 'llama3.2')
+    candidates = [
+        getattr(settings, 'OLLAMA_LOCAL_URL',  'http://localhost:11434'),
+        getattr(settings, 'OLLAMA_HOST_URL',   'http://host.docker.internal:11434'),
+        getattr(settings, 'OLLAMA_DOCKER_URL', 'http://ollama:11434'),
+        getattr(settings, 'OLLAMA_BASE_URL',   'http://ollama:11434'),
+    ]
+    seen, unique = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+
+    for url in unique:
+        chat_models = _list_ollama_chat_models(url)
+        if not chat_models:
+            continue
+        def _match(name: str) -> bool:
+            return name == configured_model or name.startswith(configured_model + ':')
+        model = next((m for m in chat_models if _match(m)), None) or chat_models[0]
+        return url, model
+
+    return unique[0], configured_model
+
+
+# ── Main service ───────────────────────────────────────────────────────────────
+
+class LLMService:
+    """
+    Unified LLM service.  Reads the active LLMConfig from DB; falls back to
+    env-based Ollama auto-detection when no DB config is active.
+    """
+
     def __init__(self):
-        self.base_url = _resolve_ollama_url()
-        self.model = settings.OLLAMA_MODEL
-        self.timeout = 120
+        self._load_config()
 
-    def _post(self, endpoint: str, payload: dict) -> dict:
-        response = httpx.post(
-            f"{self.base_url}{endpoint}",
-            json=payload,
+    def _load_config(self):
+        try:
+            from apps.ai_assistant.models import LLMConfig
+            cfg = LLMConfig.objects.filter(is_active=True).order_by('-updated_at').first()
+        except Exception:
+            cfg = None
+
+        if cfg:
+            self.provider  = cfg.provider
+            self.base_url  = cfg.base_url.rstrip('/')
+            self.model     = cfg.model_name
+            self.api_key   = cfg.api_key or ''
+            self.timeout   = cfg.timeout
+        else:
+            # No DB config — auto-detect local Ollama
+            from apps.ai_assistant.models import LLMConfig as _LC
+            url, model = _auto_resolve_ollama()
+            self.provider  = _LC.OLLAMA
+            self.base_url  = url
+            self.model     = model
+            self.api_key   = ''
+            self.timeout   = 120
+
+    # ── Internal HTTP ─────────────────────────────────────────────────────────
+
+    def _headers(self) -> dict:
+        h = {'Content-Type': 'application/json'}
+        if self.api_key:
+            h['Authorization'] = f'Bearer {self.api_key}'
+        return h
+
+    def _post_ollama_chat(self, messages: list[dict]) -> str:
+        r = httpx.post(
+            f"{self.base_url}/api/chat",
+            json={'model': self.model, 'messages': messages, 'stream': False},
+            headers=self._headers(),
             timeout=self.timeout,
         )
-        response.raise_for_status()
-        return response.json()
+        r.raise_for_status()
+        return r.json()['message']['content']
 
-    def chat(self, messages: list[dict]) -> str:
-        data = self._post('/api/chat', {
-            'model': self.model,
-            'messages': messages,
-            'stream': False,
-        })
-        return data['message']['content']
-
-    def generate(self, prompt: str, system: str = '') -> str:
-        payload = {'model': self.model, 'prompt': prompt, 'stream': False}
+    def _post_ollama_generate(self, prompt: str, system: str) -> str:
+        payload: dict = {'model': self.model, 'prompt': prompt, 'stream': False}
         if system:
             payload['system'] = system
-        data = self._post('/api/generate', payload)
-        return data['response']
+        r = httpx.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()['response']
+
+    def _post_openai_chat(self, messages: list[dict]) -> str:
+        r = httpx.post(
+            f"{self.base_url}/v1/chat/completions",
+            json={'model': self.model, 'messages': messages, 'stream': False},
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data['choices'][0]['message']['content']
+
+    def _post_hf(self, messages: list[dict]) -> str:
+        """HuggingFace Inference API (text-generation task or chat endpoint)."""
+        # Try the newer /v1/chat/completions endpoint first (HF Inference Endpoints)
+        try:
+            r = httpx.post(
+                f"{self.base_url}/v1/chat/completions",
+                json={'model': self.model, 'messages': messages, 'stream': False},
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return r.json()['choices'][0]['message']['content']
+        except Exception:
+            pass
+        # Fall back to legacy text-generation pipeline
+        prompt = '\n'.join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+        r = httpx.post(
+            f"{self.base_url}",
+            json={'inputs': prompt, 'parameters': {'max_new_tokens': 512}},
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        result = r.json()
+        if isinstance(result, list):
+            return result[0].get('generated_text', '')
+        return result.get('generated_text', str(result))
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def chat(self, messages: list[dict]) -> str:
+        from apps.ai_assistant.models import LLMConfig as _LC
+        if self.provider == _LC.OLLAMA:
+            return self._post_ollama_chat(messages)
+        elif self.provider == _LC.HUGGINGFACE:
+            return self._post_hf(messages)
+        else:
+            return self._post_openai_chat(messages)
+
+    def generate(self, prompt: str, system: str = '') -> str:
+        from apps.ai_assistant.models import LLMConfig as _LC
+        if self.provider == _LC.OLLAMA:
+            return self._post_ollama_generate(prompt, system)
+        else:
+            messages = []
+            if system:
+                messages.append({'role': 'system', 'content': system})
+            messages.append({'role': 'user', 'content': prompt})
+            return self.chat(messages)
+
+    def is_available(self) -> bool:
+        return _probe_url(self.base_url, timeout=5, api_key=self.api_key)
+
+    def list_models(self) -> list[str]:
+        """Return available model names from the configured endpoint."""
+        from apps.ai_assistant.models import LLMConfig as _LC
+        if self.provider == _LC.OLLAMA:
+            return _list_ollama_chat_models(self.base_url)
+        try:
+            r = httpx.get(
+                f"{self.base_url}/v1/models",
+                headers=self._headers(),
+                timeout=5,
+            )
+            r.raise_for_status()
+            return [m['id'] for m in r.json().get('data', [])]
+        except Exception:
+            return []
+
+    # ── Convenience wrappers ──────────────────────────────────────────────────
 
     def summarize_document(self, text: str) -> str:
         return self.generate(
@@ -68,8 +235,7 @@ class OllamaService:
     def answer_gis_question(self, question: str, context: str = '') -> str:
         system = (
             "You are a GIS assistant for DGDE RakshaGIS platform. "
-            "Answer questions about survey projects, land records, and spatial data. "
-            "If asked to query data, suggest the relevant filter parameters for the API."
+            "Answer questions about survey projects, land records, and spatial data."
         )
         prompt = question if not context else f"Context:\n{context}\n\nQuestion: {question}"
         return self.generate(prompt=prompt, system=system)
@@ -80,9 +246,6 @@ class OllamaService:
             system="You are a GIS data quality expert for Indian land survey systems.",
         )
 
-    def is_available(self) -> bool:
-        try:
-            resp = httpx.get(f"{self.base_url}/api/tags", timeout=5)
-            return resp.status_code == 200
-        except Exception:
-            return False
+
+# Keep OllamaService as an alias so existing code that imports it still works
+OllamaService = LLMService

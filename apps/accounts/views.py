@@ -1,14 +1,34 @@
-from rest_framework import viewsets, permissions
+from django.contrib.auth import authenticate
+from django.utils import timezone
+from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Organisation, User
+from .models import Organisation, User, TwoFactorDevice, TwoFactorPendingAuth, UserSession, LoginAuditLog, ExportAuditLog
 from .permissions import (
     IsSuperAdmin, CanManageUsers, OrgScopedAccess,
     org_queryset_filter, get_assignable_roles,
 )
 from .serializers import OrganisationSerializer, UserSerializer, UserProfileSerializer
+
+
+def _get_client_ip(request):
+    x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded:
+        return x_forwarded.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR')
+
+
+def _get_device_name(user_agent: str) -> str:
+    ua = user_agent.lower()
+    if 'mobile' in ua or 'android' in ua:
+        return 'Mobile'
+    if 'ipad' in ua or 'tablet' in ua:
+        return 'Tablet'
+    return 'Desktop'
 
 
 class OrganisationViewSet(viewsets.ModelViewSet):
@@ -67,7 +87,268 @@ class UserViewSet(viewsets.ModelViewSet):
 
         raise PermissionDenied("You do not have permission to create users.")
 
+    def destroy(self, request, *args, **kwargs):
+        target = self.get_object()
+        if target.role in User.ADMIN_ROLES:
+            raise PermissionDenied('Cannot delete an admin user.')
+        return super().destroy(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        target = self.get_object()
+        if target.role in User.ADMIN_ROLES and not request.data.get('is_active', True):
+            raise PermissionDenied('Cannot deactivate an admin user.')
+        return super().partial_update(request, *args, **kwargs)
+
+    @action(detail=True, methods=['post'], url_path='force-logout')
+    def force_logout(self, request, pk=None):
+        target = self.get_object()
+        if target.role in User.ADMIN_ROLES:
+            raise PermissionDenied('Cannot force-logout an admin user.')
+        target.is_active = False
+        target.save(update_fields=['is_active'])
+        return Response({'detail': 'User logged out and deactivated.'})
+
+    @action(detail=True, methods=['post'], url_path='change-password')
+    def change_password(self, request, pk=None):
+        target = self.get_object()
+        new_pw = request.data.get('new_password', '')
+        if len(new_pw) < 8:
+            return Response({'detail': 'Password too short.'}, status=400)
+        target.set_password(new_pw)
+        target.save(update_fields=['password'])
+        return Response({'detail': 'Password changed.'})
+
+    @action(detail=False, methods=['post'], url_path='change-my-password',
+            permission_classes=[permissions.IsAuthenticated])
+    def change_my_password(self, request):
+        old_pw = request.data.get('old_password', '')
+        new_pw = request.data.get('new_password', '')
+        if not request.user.check_password(old_pw):
+            return Response({'detail': 'Wrong current password.'}, status=400)
+        if len(new_pw) < 8:
+            return Response({'detail': 'Password too short.'}, status=400)
+        request.user.set_password(new_pw)
+        request.user.save(update_fields=['password'])
+        return Response({'detail': 'Password changed.'})
+
     @action(detail=False, methods=['get'], permission_classes=[permissions.IsAuthenticated])
     def me(self, request):
         serializer = UserProfileSerializer(request.user)
         return Response(serializer.data)
+
+
+# ── Custom Login (2FA + session tracking + audit logging) ─────────────────────
+
+class CustomLoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get('username', '')
+        password = request.data.get('password', '')
+        ip = _get_client_ip(request)
+        ua = request.META.get('HTTP_USER_AGENT', '')
+
+        user = authenticate(request, username=username, password=password)
+
+        if not user:
+            try:
+                u = User.objects.get(username=username)
+                reason = 'Wrong password' if u else 'User not found'
+            except User.DoesNotExist:
+                reason = 'User not found'
+
+            LoginAuditLog.objects.create(
+                username_attempted=username, success=False,
+                ip_address=ip, user_agent=ua[:500], failure_reason=reason,
+            )
+            return Response({'detail': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        if not user.is_active:
+            LoginAuditLog.objects.create(
+                user=user, username_attempted=username, success=False,
+                ip_address=ip, user_agent=ua[:500], failure_reason='Account disabled',
+            )
+            return Response({'detail': 'Account is disabled.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Check 2FA
+        try:
+            device = user.two_factor
+            if device.is_enabled:
+                pending = TwoFactorPendingAuth.objects.create(user=user)
+                return Response({
+                    'requires_2fa': True,
+                    'pre_auth_key': str(pending.token),
+                })
+        except TwoFactorDevice.DoesNotExist:
+            pass
+
+        return _issue_tokens(user, ip, ua)
+
+
+class TwoFactorCompleteView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        import pyotp
+        pre_auth_key = request.data.get('pre_auth_key', '')
+        totp_code = request.data.get('totp_code', '')
+        ip = _get_client_ip(request)
+        ua = request.META.get('HTTP_USER_AGENT', '')
+
+        try:
+            pending = TwoFactorPendingAuth.objects.select_related('user').get(token=pre_auth_key)
+        except TwoFactorPendingAuth.DoesNotExist:
+            return Response({'detail': 'Invalid or expired pre-auth key.'}, status=401)
+
+        if pending.is_expired():
+            pending.delete()
+            return Response({'detail': 'Pre-auth session expired. Please log in again.'}, status=401)
+
+        user = pending.user
+        try:
+            device = user.two_factor
+            totp = pyotp.TOTP(device.secret)
+            if not totp.verify(totp_code, valid_window=1):
+                return Response({'detail': 'Invalid authenticator code.'}, status=400)
+        except TwoFactorDevice.DoesNotExist:
+            return Response({'detail': 'No 2FA device configured.'}, status=400)
+
+        pending.delete()
+        return _issue_tokens(user, ip, ua)
+
+
+class TwoFactorSetupView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        """Return QR code URI and secret for initial setup."""
+        import pyotp, qrcode, io, base64
+        device, _ = TwoFactorDevice.objects.get_or_create(user=request.user)
+        if not device.secret:
+            device.secret = pyotp.random_base32()
+            device.save(update_fields=['secret'])
+
+        totp = pyotp.TOTP(device.secret)
+        uri = totp.provisioning_uri(
+            name=request.user.username,
+            issuer_name='RakshaGIS'
+        )
+        img = qrcode.make(uri)
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        qr_b64 = base64.b64encode(buf.getvalue()).decode()
+        return Response({
+            'secret': device.secret,
+            'qr_code': f'data:image/png;base64,{qr_b64}',
+            'is_enabled': device.is_enabled,
+        })
+
+    def post(self, request):
+        """Verify TOTP code and enable 2FA."""
+        import pyotp
+        code = request.data.get('code', '')
+        try:
+            device = request.user.two_factor
+        except TwoFactorDevice.DoesNotExist:
+            return Response({'detail': 'Run GET first to generate secret.'}, status=400)
+
+        totp = pyotp.TOTP(device.secret)
+        if not totp.verify(code, valid_window=1):
+            return Response({'detail': 'Invalid code.'}, status=400)
+
+        device.is_enabled = True
+        device.confirmed_at = timezone.now()
+        device.save(update_fields=['is_enabled', 'confirmed_at'])
+        return Response({'detail': '2FA enabled successfully.'})
+
+    def delete(self, request):
+        """Disable 2FA."""
+        try:
+            device = request.user.two_factor
+            device.is_enabled = False
+            device.save(update_fields=['is_enabled'])
+        except TwoFactorDevice.DoesNotExist:
+            pass
+        return Response({'detail': '2FA disabled.'})
+
+
+# ── Session Management ────────────────────────────────────────────────────────
+
+class UserSessionViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ['get', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        return UserSession.objects.filter(user=self.request.user, is_revoked=False)
+
+    def get_serializer_class(self):
+        from .serializers import UserSessionSerializer
+        return UserSessionSerializer
+
+    def destroy(self, request, *args, **kwargs):
+        session = self.get_object()
+        session.is_revoked = True
+        session.save(update_fields=['is_revoked'])
+        return Response({'detail': 'Session revoked.'}, status=204)
+
+    @action(detail=False, methods=['delete'], url_path='revoke-all')
+    def revoke_all(self, request):
+        UserSession.objects.filter(user=request.user, is_revoked=False).update(is_revoked=True)
+        return Response({'detail': 'All sessions revoked.'})
+
+
+# ── Audit Log Views ───────────────────────────────────────────────────────────
+
+class LoginAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsSuperAdmin]
+
+    def get_queryset(self):
+        from .serializers import LoginAuditLogSerializer
+        qs = LoginAuditLog.objects.select_related('user').order_by('-timestamp')
+        success = self.request.query_params.get('success')
+        if success is not None:
+            qs = qs.filter(success=success.lower() == 'true')
+        user_id = self.request.query_params.get('user')
+        if user_id:
+            qs = qs.filter(user_id=user_id)
+        return qs[:500]
+
+    def get_serializer_class(self):
+        from .serializers import LoginAuditLogSerializer
+        return LoginAuditLogSerializer
+
+
+class ExportAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = ExportAuditLog.objects.select_related('user', 'project').order_by('-timestamp')
+        if not user.is_superadmin:
+            qs = qs.filter(user=user)
+        return qs[:500]
+
+    def get_serializer_class(self):
+        from .serializers import ExportAuditLogSerializer
+        return ExportAuditLogSerializer
+
+
+def _issue_tokens(user, ip, ua):
+    """Create JWT tokens, record UserSession, log successful login."""
+    refresh = RefreshToken.for_user(user)
+    jti = str(refresh.access_token['jti'])
+
+    UserSession.objects.create(
+        user=user, jti=jti,
+        ip_address=ip, user_agent=ua[:500],
+        device_name=_get_device_name(ua),
+    )
+    LoginAuditLog.objects.create(
+        user=user, username_attempted=user.username,
+        success=True, ip_address=ip, user_agent=ua[:500],
+    )
+    return Response({
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+        'requires_2fa': False,
+    })

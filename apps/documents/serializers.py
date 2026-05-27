@@ -5,12 +5,13 @@ from .models import Document
 class DocumentSerializer(serializers.ModelSerializer):
     uploaded_by_name = serializers.CharField(source='uploaded_by.get_full_name', read_only=True)
     category_display = serializers.CharField(source='get_category_display', read_only=True)
+    folder_name      = serializers.CharField(source='folder.name', read_only=True)
     file_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Document
         fields = [
-            'id', 'project', 'title', 'category', 'category_display',
+            'id', 'project', 'folder', 'folder_name', 'title', 'category', 'category_display',
             'file', 'file_url', 'file_size', 'mime_type',
             'ai_summary', 'extracted_text', 'ai_processed',
             'uploaded_by', 'uploaded_by_name', 'uploaded_at',

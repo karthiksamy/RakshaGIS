@@ -53,18 +53,27 @@ class CanEditProject(BasePermission):
         return request.user.is_authenticated and request.user.can_forward
 
     def has_object_permission(self, request, view, obj):
-        from apps.survey_projects.models import SurveyProject
+        from apps.survey_projects.models import SurveyProject, ProjectLayerFolder, GISFeature
         if request.method in SAFE_METHODS:
             return True
         user = request.user
         if user.role == User.SUPERADMIN:
             return True
+        if not user.role in (User.SDO, User.SURVEYOR):
+            return False
+        # ProjectLayerFolder: org is on the related project
+        if isinstance(obj, ProjectLayerFolder):
+            return obj.project.organisation_id == user.organisation_id
+        # GISFeature: org is via project
+        if isinstance(obj, GISFeature):
+            return obj.project.organisation_id == user.organisation_id
+        # SurveyProject and other org-direct models
         editable_statuses = (SurveyProject.DRAFT, SurveyProject.RETURNED)
-        return (
-            user.role in (User.SDO, User.SURVEYOR)
-            and obj.organisation_id == user.organisation_id
-            and obj.status in editable_statuses
-        )
+        org_id = getattr(obj, 'organisation_id', None)
+        status  = getattr(obj, 'status', None)
+        if org_id is None or status is None:
+            return False
+        return org_id == user.organisation_id and status in editable_statuses
 
 
 class CanCheck(BasePermission):

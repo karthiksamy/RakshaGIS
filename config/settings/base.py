@@ -38,6 +38,8 @@ INSTALLED_APPS = [
     'apps.documents',
     'apps.workflow',
     'apps.ai_assistant',
+    'apps.dashboard',
+    'apps.reports',
 ]
 
 MIDDLEWARE = [
@@ -111,11 +113,15 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(DATA_DIR, 'media')
 STATIC_ROOT = os.path.join(DATA_DIR, 'staticfiles')
 
+# Allow GIS file uploads up to 200 MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 524288000   # 500 MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10485760    # 10 MB — larger files stream to disk
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'apps.accounts.authentication.SessionAwareJWTAuthentication',
         'rest_framework.authentication.SessionAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
@@ -141,8 +147,27 @@ CELERY_BROKER_URL = env('CELERY_BROKER_URL', default='redis://localhost:6379/1')
 CELERY_RESULT_BACKEND = env('REDIS_URL', default='redis://localhost:6379/0')
 CELERY_TIMEZONE = TIME_ZONE
 
+from celery.schedules import crontab
+CELERY_BEAT_SCHEDULE = {
+    'send-scheduled-reports': {
+        'task': 'apps.reports.tasks.send_scheduled_reports',
+        'schedule': crontab(hour=7, minute=0),
+    },
+}
+
+# Email (set EMAIL_BACKEND to smtp for production; console for local dev)
+EMAIL_BACKEND = env('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = env('EMAIL_HOST', default='')
+EMAIL_PORT = env.int('EMAIL_PORT', default=587)
+EMAIL_USE_TLS = env.bool('EMAIL_USE_TLS', default=True)
+EMAIL_HOST_USER = env('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default='')
+DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='noreply@rakshagis.in')
+
 OLLAMA_LOCAL_URL = env('OLLAMA_LOCAL_URL', default='http://localhost:11434')
+# host.docker.internal resolves to the Docker Desktop host on Windows/Mac/WSL2
+OLLAMA_HOST_URL  = env('OLLAMA_HOST_URL',  default='http://host.docker.internal:11434')
 OLLAMA_DOCKER_URL = env('OLLAMA_DOCKER_URL', default='http://ollama:11434')
 # Kept for backwards-compat; services.py auto-detects which URL to use at runtime.
 OLLAMA_BASE_URL = env('OLLAMA_BASE_URL', default='http://ollama:11434')
-OLLAMA_MODEL = env('OLLAMA_MODEL', default='llama3')
+OLLAMA_MODEL = env('OLLAMA_MODEL', default='llama3.2')

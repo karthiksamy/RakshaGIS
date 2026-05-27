@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import ChatSession, ChatMessage, AITask
+from .models import ChatSession, ChatMessage, AITask, LLMConfig
 
 
 class ChatMessageSerializer(serializers.ModelSerializer):
@@ -21,6 +21,32 @@ class ChatSessionSerializer(serializers.ModelSerializer):
 
 class ChatInputSerializer(serializers.Serializer):
     message = serializers.CharField()
+
+
+class LLMConfigSerializer(serializers.ModelSerializer):
+    provider_display = serializers.CharField(source='get_provider_display', read_only=True)
+    updated_by_name  = serializers.CharField(source='updated_by.get_full_name', read_only=True)
+
+    class Meta:
+        model = LLMConfig
+        fields = [
+            'id', 'name', 'provider', 'provider_display',
+            'base_url', 'model_name', 'api_key', 'timeout',
+            'is_active', 'notes',
+            'updated_by', 'updated_by_name', 'updated_at', 'created_at',
+        ]
+        read_only_fields = ['updated_by', 'updated_at', 'created_at']
+        extra_kwargs = {
+            'api_key': {'write_only': False},  # show masked value in GET
+        }
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Mask API key in list/retrieve — show last 4 chars only
+        key = data.get('api_key', '')
+        if key:
+            data['api_key'] = '•' * max(0, len(key) - 4) + key[-4:]
+        return data
 
 
 class AITaskSerializer(serializers.ModelSerializer):

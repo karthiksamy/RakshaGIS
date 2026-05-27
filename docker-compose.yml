@@ -13,6 +13,10 @@ x-app-base: &app-base
     - .:/app                                        # source code bind-mount (dev + migrations)
     - ${DATA_DIR:?Run setup.sh first to set DATA_DIR}:/data
   restart: unless-stopped
+  # Allow containers to reach the host's Ollama via host.docker.internal
+  # Works on Linux (host-gateway), WSL2, and Docker Desktop (Mac/Windows).
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   depends_on:
     db:
       condition: service_healthy
@@ -91,14 +95,214 @@ services:
       - ${DATA_DIR}/certbot/www:/var/www/certbot
     entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done'"
 
-  # ── Ollama (local AI) ────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════════
+  # AI BACKENDS — CPU and GPU variants
+  #
+  # CPU-only  →  docker compose --profile <name> up -d
+  # NVIDIA GPU →  docker compose --profile <name>-gpu up -d
+  #
+  # GPU prerequisites (NVIDIA):
+  #   1. Install NVIDIA Container Toolkit:
+  #      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+  #   2. Verify:  docker run --rm --gpus all nvidia/cuda:12.0-base-ubuntu22.04 nvidia-smi
+  #
+  # Model storage layout (all under DATA_DIR/models/):
+  #   ollama/       Ollama model blobs
+  #   localai/      LocalAI model files
+  #   llamacpp/     GGUF model file  → place model.gguf here
+  #   anythingllm/  AnythingLLM storage + embedded models
+  # ═══════════════════════════════════════════════════════════════════
+
+  # ── Ollama · CPU ──────────────────────────────────────────────────
+  # docker compose --profile docker-ollama up -d
+  # Pull a model: docker exec rakshagis-ollama-1 ollama pull llama3.2
   ollama:
     image: ollama/ollama:latest
+    profiles: ["docker-ollama"]
     restart: unless-stopped
     volumes:
-      - ${DATA_DIR}/ollama:/root/.ollama
+      - ${DATA_DIR}/models/ollama:/root/.ollama
     ports:
       - "127.0.0.1:11434:11434"
+
+  # ── Ollama · NVIDIA GPU ───────────────────────────────────────────
+  # docker compose --profile docker-ollama-gpu up -d
+  # Pull a model: docker exec rakshagis-ollama-gpu-1 ollama pull llama3.2
+  ollama-gpu:
+    image: ollama/ollama:latest
+    profiles: ["docker-ollama-gpu"]
+    restart: unless-stopped
+    volumes:
+      - ${DATA_DIR}/models/ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── LocalAI · CPU ────────────────────────────────────────────────
+  # docker compose --profile localai up -d
+  # AI Config: provider=OpenAI-Compatible, url=http://localai:8080
+  localai:
+    image: localai/localai:latest-aio-cpu
+    profiles: ["localai"]
+    restart: unless-stopped
+    environment:
+      - MODELS_PATH=/models
+      - CONTEXT_SIZE=4096
+      - THREADS=4
+    volumes:
+      - ${DATA_DIR}/models/localai:/models
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── LocalAI · NVIDIA GPU (CUDA 12) ───────────────────────────────
+  # docker compose --profile localai-gpu up -d
+  # AI Config: provider=OpenAI-Compatible, url=http://localai:8080
+  localai-gpu:
+    image: localai/localai:latest-aio-gpu-nvidia-cuda-12
+    profiles: ["localai-gpu"]
+    restart: unless-stopped
+    environment:
+      - MODELS_PATH=/models
+      - CONTEXT_SIZE=4096
+      - THREADS=4
+      - GPU_LAYERS=-1          # offload all layers to GPU
+    volumes:
+      - ${DATA_DIR}/models/localai:/models
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── LlamaCpp · CPU ───────────────────────────────────────────────
+  # docker compose --profile llamacpp up -d
+  # Place GGUF file at DATA_DIR/models/llamacpp/model.gguf
+  # AI Config: provider=OpenAI-Compatible, url=http://llamacpp:8081
+  llamacpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    profiles: ["llamacpp"]
+    restart: unless-stopped
+    command: >
+      --model /models/model.gguf
+      --host 0.0.0.0
+      --port 8081
+      --ctx-size 4096
+      --threads 4
+    volumes:
+      - ${DATA_DIR}/models/llamacpp:/models
+    ports:
+      - "127.0.0.1:8081:8081"
+
+  # ── LlamaCpp · NVIDIA GPU (CUDA) ─────────────────────────────────
+  # docker compose --profile llamacpp-gpu up -d
+  # Place GGUF file at DATA_DIR/models/llamacpp/model.gguf
+  # AI Config: provider=OpenAI-Compatible, url=http://llamacpp:8081
+  llamacpp-gpu:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    profiles: ["llamacpp-gpu"]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true
+        do
+          # Prefer a model whose name contains embedding keywords so that a chat
+          # GGUF in the same volume is not accidentally used for embeddings.
+          # Priority: nomic > bge > mxbai > minilm > e5 > gte > anything else.
+          MODEL=""
+          for pattern in nomic bge mxbai minilm MiniLM e5 gte embed; do
+            MODEL=$$(find /models -name "*$${pattern}*.gguf" ! -name "*.partial" 2>/dev/null | sort | head -1)
+            [ -n "$$MODEL" ] && break
+          done
+          # Fall back to any GGUF if no embedding model was found
+          [ -z "$$MODEL" ] && MODEL=$$(find /models -name "*.gguf" ! -name "*.partial" 2>/dev/null | sort | head -1)
+
+          if [ -n "$$MODEL" ]
+          then
+            echo "Starting llama-server: $$MODEL"
+
+            /app/llama-server -m "$$MODEL" \
+              --host 0.0.0.0 \
+              --port 8081 \
+              --embedding \
+              --pooling mean \
+              -c 8192 \
+              -ngl 0 \
+              --parallel 4
+
+            echo "llama-server exited, restarting in 5 sec"
+            sleep 5
+          else
+            echo "No GGUF model found"
+            sleep 15
+          fi
+        done
+    volumes:
+      - ${DATA_DIR}/models/llamacpp:/models
+    ports:
+      - "127.0.0.1:8081:8081"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── AnythingLLM · CPU ────────────────────────────────────────────
+  # docker compose --profile anythingllm up -d
+  # AI Config: provider=OpenAI-Compatible, url=http://anythingllm:3001/api/v1/openai
+  anythingllm:
+    image: mintplexlabs/anythingllm:latest
+    profiles: ["anythingllm"]
+    restart: unless-stopped
+    environment:
+      - STORAGE_DIR=/app/server/storage
+    volumes:
+      - ${DATA_DIR}/models/anythingllm:/app/server/storage
+    ports:
+      - "127.0.0.1:3001:3001"
+
+  # ── AnythingLLM · NVIDIA GPU ──────────────────────────────────────
+  # docker compose --profile anythingllm-gpu up -d
+  # AI Config: provider=OpenAI-Compatible, url=http://anythingllm:3001/api/v1/openai
+  anythingllm-gpu:
+    image: mintplexlabs/anythingllm:latest
+    profiles: ["anythingllm-gpu"]
+    restart: unless-stopped
+    environment:
+      - STORAGE_DIR=/app/server/storage
+    volumes:
+      - ${DATA_DIR}/models/anythingllm:/app/server/storage
+    ports:
+      - "127.0.0.1:3001:3001"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   # ── Prometheus (metrics scraping) ───────────────────────────────
   prometheus:

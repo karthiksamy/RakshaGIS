@@ -13,4 +13,9 @@ export const qk = {
   aiTasks: () => ['ai-tasks'] as const,
   aiTask: (id: number) => ['ai-tasks', id] as const,
   attributeTemplates: () => ['attribute-templates'] as const,
+  shapefileImports: (projectId: number) => ['shapefile-imports', projectId] as const,
+  geotiffs: (projectId: number) => ['geotiffs', projectId] as const,
+  activeVersion: (projectId: number) => ['projects', projectId, 'active-version'] as const,
+  surveyAreas: (projectId: number) => ['survey-areas', projectId] as const,
+  areaWorkflow: (areaId: number) => ['survey-areas', areaId, 'workflow'] as const,
 }

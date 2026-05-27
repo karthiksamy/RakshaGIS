@@ -1,6 +1,11 @@
 from rest_framework import serializers
 from rest_framework_gis.serializers import GeoFeatureModelSerializer
-from .models import SurveyProject, GISFeature, DefenceParcel, AttributeTemplate, ShapefileImport
+from rest_framework_gis.fields import GeometryField
+from .models import (
+    SurveyProject, SurveyArea, GISFeature, DefenceParcel, AttributeTemplate,
+    ShapefileImport, ProjectLayerFolder, ProjectShare, GeoTiffLayer,
+    FeatureAttachment, ProjectMilestone, QGISUploadLog, TemporaryLayer,
+)
 
 
 class SurveyProjectSerializer(serializers.ModelSerializer):
@@ -22,18 +27,66 @@ class SurveyProjectSerializer(serializers.ModelSerializer):
             'total_area_hectares', 'start_date', 'target_date',
             'created_by', 'created_by_name', 'created_at', 'updated_at',
         ]
+        read_only_fields = ['project_number', 'created_by', 'created_at', 'updated_at', 'status']
+        extra_kwargs = {'organisation': {'required': False}}
+
+
+class SurveyAreaSerializer(serializers.ModelSerializer):
+    assigned_to_name = serializers.CharField(source='assigned_to.get_full_name', read_only=True)
+    created_by_name  = serializers.CharField(source='created_by.get_full_name', read_only=True)
+    status_display   = serializers.CharField(source='get_status_display', read_only=True)
+    folder_name      = serializers.CharField(source='folder.name', read_only=True)
+
+    class Meta:
+        model  = SurveyArea
+        fields = [
+            'id', 'project', 'name', 'area_code', 'description',
+            'folder', 'folder_name',
+            'assigned_to', 'assigned_to_name',
+            'status', 'status_display',
+            'created_by', 'created_by_name', 'created_at', 'updated_at',
+        ]
         read_only_fields = ['created_by', 'created_at', 'updated_at', 'status']
 
 
-class GISFeatureSerializer(GeoFeatureModelSerializer):
+class ProjectLayerFolderSerializer(serializers.ModelSerializer):
+    children = serializers.SerializerMethodField()
+    folder_type_display = serializers.CharField(source='get_folder_type_display', read_only=True)
+
+    class Meta:
+        model = ProjectLayerFolder
+        fields = [
+            'id', 'project', 'parent', 'name', 'folder_type', 'folder_type_display',
+            'year', 'is_final', 'order', 'created_by', 'created_at', 'children',
+        ]
+        read_only_fields = ['created_by', 'created_at']
+
+    def get_children(self, obj):
+        return ProjectLayerFolderSerializer(obj.children.all(), many=True).data
+
+
+class ProjectShareSerializer(serializers.ModelSerializer):
+    project_name    = serializers.CharField(source='project.name', read_only=True)
+    granted_to_name = serializers.CharField(source='granted_to.name', read_only=True)
+
+    class Meta:
+        model = ProjectShare
+        fields = ['id', 'project', 'project_name', 'granted_to', 'granted_to_name', 'granted_by', 'created_at']
+        read_only_fields = ['granted_by', 'created_at']
+
+
+class GISFeatureSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
+    geometry = GeometryField()
+    # Override to remove validate_layer_name — layer_name is a plain text label
+    # stored in a text column, not used as a SQL identifier, so strict naming is not needed
+    layer_name = serializers.CharField(max_length=200)
 
     class Meta:
         model = GISFeature
-        geo_field = 'geometry'
         fields = [
-            'id', 'project', 'feature_id', 'layer_name', 'geometry_type',
-            'attributes', 'is_deleted',
+            'id', 'project', 'folder', 'feature_id', 'layer_name', 'geometry_type',
+            'geometry', 'attributes', 'is_deleted',
             'created_by', 'created_by_name', 'created_at', 'updated_at',
         ]
         read_only_fields = ['created_by', 'created_at', 'updated_at']
@@ -80,13 +133,149 @@ class AttributeTemplateSerializer(serializers.ModelSerializer):
 class ShapefileImportSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
     status_display  = serializers.CharField(source='get_status_display', read_only=True)
+    folder_name     = serializers.CharField(source='folder.name', read_only=True)
 
     class Meta:
         model = ShapefileImport
         fields = [
-            'id', 'project', 'file', 'layer_name',
+            'id', 'project', 'folder', 'folder_name', 'file', 'layer_name',
             'attribute_template', 'status', 'status_display',
-            'feature_count', 'error',
+            'feature_count', 'columns', 'error',
+            'ai_processed', 'ai_summary',
             'created_by', 'created_by_name', 'created_at',
         ]
-        read_only_fields = ['id', 'status', 'feature_count', 'error', 'created_by', 'created_at']
+        read_only_fields = ['id', 'status', 'feature_count', 'columns', 'error',
+                            'ai_processed', 'ai_summary', 'created_by', 'created_at']
+
+
+class BufferParcelSerializer(serializers.ModelSerializer):
+    organisation_name      = serializers.CharField(source='organisation.name', read_only=True)
+    category_display       = serializers.CharField(source='get_category_display', read_only=True)
+    classification_display = serializers.CharField(source='get_classification_display', read_only=True)
+    state_name             = serializers.CharField(source='state.name', read_only=True)
+    district_name          = serializers.CharField(source='district.name', read_only=True)
+    geometry               = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DefenceParcel
+        fields = [
+            'id', 'parcel_id', 'name',
+            'category', 'category_display',
+            'classification', 'classification_display',
+            'area_hectares', 'state_name', 'district_name', 'organisation_name',
+            'geometry',
+        ]
+
+    def get_geometry(self, obj):
+        import json
+        return json.loads(obj.geometry.geojson)
+
+
+class GeoTiffLayerSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
+    status_display  = serializers.CharField(source='get_status_display', read_only=True)
+    folder_name     = serializers.CharField(source='folder.name', read_only=True)
+    cog_url         = serializers.SerializerMethodField()
+
+    class Meta:
+        model = GeoTiffLayer
+        fields = [
+            'id', 'project', 'folder', 'folder_name', 'name', 'file',
+            'cog_file', 'cog_url', 'status', 'status_display', 'error',
+            'is_visible', 'opacity',
+            'created_by', 'created_by_name', 'created_at',
+        ]
+        read_only_fields = ['id', 'cog_file', 'status', 'error', 'created_by', 'created_at']
+
+    def get_cog_url(self, obj):
+        if obj.cog_file:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.cog_file.url)
+            return obj.cog_file.url
+        return None
+
+
+class FeatureAttachmentSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+    uploaded_by_name = serializers.CharField(source='uploaded_by.get_full_name', read_only=True)
+
+    class Meta:
+        model = FeatureAttachment
+        fields = [
+            'id', 'feature', 'file', 'file_url', 'original_filename',
+            'file_size', 'file_type', 'caption',
+            'uploaded_by', 'uploaded_by_name', 'uploaded_at',
+        ]
+        read_only_fields = ['id', 'original_filename', 'file_size', 'file_type', 'uploaded_by', 'uploaded_at']
+
+    def get_file_url(self, obj):
+        request = self.context.get('request')
+        if obj.file and request:
+            return request.build_absolute_uri(obj.file.url)
+        return obj.file.url if obj.file else None
+
+
+class ProjectMilestoneSerializer(serializers.ModelSerializer):
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    assignee_name = serializers.CharField(source='assignee.get_full_name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
+    progress_pct = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProjectMilestone
+        fields = [
+            'id', 'project', 'name', 'description',
+            'start_date', 'due_date', 'completed_date',
+            'status', 'status_display', 'order',
+            'assignee', 'assignee_name',
+            'progress_pct',
+            'created_by', 'created_by_name', 'created_at',
+        ]
+        read_only_fields = ['created_by', 'created_at']
+
+    def get_progress_pct(self, obj):
+        import datetime
+        if obj.status == 'COMPLETED':
+            return 100
+        if not obj.start_date:
+            return 0
+        today = datetime.date.today()
+        total = (obj.due_date - obj.start_date).days
+        if total <= 0:
+            return 0
+        elapsed = (today - obj.start_date).days
+        return min(100, max(0, int(elapsed / total * 100)))
+
+
+class QGISUploadLogSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(source='uploaded_by.get_full_name', read_only=True)
+    project_number   = serializers.CharField(source='project.project_number', read_only=True)
+    folder_name      = serializers.CharField(source='folder.name', read_only=True)
+
+    class Meta:
+        model  = QGISUploadLog
+        fields = [
+            'id', 'project', 'project_number', 'folder', 'folder_name',
+            'filename', 'original_path', 'file_size',
+            'algorithm_id', 'module_name',
+            'status', 'error_message',
+            'uploaded_by', 'uploaded_by_name', 'uploaded_at',
+        ]
+        read_only_fields = ['id', 'uploaded_at']
+
+
+class TemporaryLayerSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(source='uploaded_by.get_full_name', read_only=True)
+    file_format_display = serializers.CharField(source='get_file_format_display', read_only=True)
+
+    class Meta:
+        model  = TemporaryLayer
+        fields = [
+            'id', 'name', 'purpose', 'description',
+            'file_format', 'file_format_display',
+            'file', 'geojson', 'feature_count',
+            'uploaded_by', 'uploaded_by_name', 'created_at',
+        ]
+        read_only_fields = ['id', 'file_format', 'geojson', 'feature_count',
+                            'uploaded_by', 'uploaded_by_name', 'created_at']

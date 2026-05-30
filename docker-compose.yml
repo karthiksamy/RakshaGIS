@@ -2,9 +2,40 @@
 
 # DATA_DIR is set in .env — it is the HOST path where all persistent data lives.
 # Inside every app container it is always mounted as /data.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# OFFLINE OPERATION
+#
+# This application is designed for fully offline use after initial installation.
+# No service requires internet access during normal operation except:
+#   • AI model downloads (SuperAdmin-triggered, one-time)
+#   • Local OSM tile server import (one-time, see build.sh --import-osm)
+#
+# certbot (HTTPS) is in the "https" profile — NOT started by default.
+#   To use HTTPS with a public domain:
+#     docker compose --profile https up -d certbot
+#   For a private/intranet deployment use a self-signed or internal CA cert.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Two-network design for offline operation:
+#   raksha-net (internal) — all backend services; no outbound internet access
+#   raksha-edge (external) — nginx only; allows host port publishing (80/443)
+# nginx sits on both networks so it can proxy to backends while still being
+# reachable from the host.  No backend container touches raksha-edge.
+networks:
+  raksha-net:
+    # internal: true removed — web container needs to reach LAN databases
+    # (e.g. DGDE external PostgreSQL at 192.168.1.x).
+    # This is an intranet deployment; no outbound internet from backends is
+    # expected in practice, but Docker cannot enforce that AND allow LAN access
+    # simultaneously with a single network flag.
+    internal: false
+  raksha-edge:
+    internal: false   # nginx only — needed for port publishing (80/443)
 
 x-app-base: &app-base
   build: .
+  image: rakshagis:web
   env_file: .env
   environment:
     DATA_DIR: /data                                 # fixed path inside container
@@ -13,8 +44,11 @@ x-app-base: &app-base
     - .:/app                                        # source code bind-mount (dev + migrations)
     - ${DATA_DIR:?Run setup.sh first to set DATA_DIR}:/data
   restart: unless-stopped
+  networks:
+    - raksha-net
   # Allow containers to reach the host's Ollama via host.docker.internal
   # Works on Linux (host-gateway), WSL2, and Docker Desktop (Mac/Windows).
+  # Even with internal: true this static /etc/hosts entry routes to the host.
   extra_hosts:
     - "host.docker.internal:host-gateway"
   depends_on:
@@ -29,6 +63,8 @@ services:
   db:
     image: postgis/postgis:16-3.4
     restart: unless-stopped
+    networks:
+      - raksha-net
     environment:
       POSTGRES_DB: ${DB_NAME:-rakshagis}
       POSTGRES_USER: ${DB_USER:-raksha}
@@ -45,6 +81,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    networks:
+      - raksha-net
     command: redis-server --appendonly yes
     volumes:
       - ${DATA_DIR}/redis:/data
@@ -52,27 +90,119 @@ services:
   # ── Django (Gunicorn) ────────────────────────────────────────────
   web:
     <<: *app-base
-    command: gunicorn --bind 0.0.0.0:8000 --workers 4 --timeout 120 config.wsgi:application
+    # Daphne: ASGI server — handles both HTTP and WebSocket (replaces gunicorn)
+    command: daphne -b 0.0.0.0 -p 8000 config.asgi:application
 
   # ── Celery worker ────────────────────────────────────────────────
   celery:
     <<: *app-base
     command: celery -A config worker --loglevel=info --concurrency=2
 
+  # ── Playwright PDF print service ────────────────────────────────
+  # Headless Chromium that renders ArcGIS-style HTML layouts → PDF.
+  # Replaces the Mapnik PNG export with proper PDF output.
+  # Base image: mcr.microsoft.com/playwright:v1.60.0-jammy
+  # Build once (needs internet for image pull):
+  #   docker compose build print-service
+  print-service:
+    build:
+      context: services/print-service
+    image: rakshagis:print-service
+    restart: unless-stopped
+    networks:
+      - raksha-net
+    expose:
+      - "3001"
+    environment:
+      PORT: "3001"
+    healthcheck:
+      test: ["CMD", "node", "-e",
+        "require('http').get('http://localhost:3001/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   # ── Vector tile server (PostGIS → MVT) ──────────────────────────
   pg_tileserv:
     image: pramsey/pg_tileserv:latest
     restart: unless-stopped
+    networks:
+      - raksha-net
     environment:
       DATABASE_URL: postgres://${DB_USER:-raksha}:${DB_PASSWORD}@db:5432/${DB_NAME:-rakshagis}
     depends_on:
       db:
         condition: service_healthy
 
+  # ── Local OSM raster tile server ─────────────────────────────────
+  # Serves India OpenStreetMap tiles completely offline.
+  # FIRST-TIME SETUP (requires internet once):
+  #   ./build.sh --import-osm
+  # This downloads the India PBF from Geofabrik (~800 MB) and imports it.
+  # Import takes 2-4 hours on the first run; afterwards tiles are served
+  # from local storage.  Tile URL: /osm-tiles/{z}/{x}/{y}.png
+  # Disk requirement: ~15-20 GB for PostGIS data + tile cache.
+  osm-tiles:
+    image: overv/openstreetmap-tile-server:2.3.0
+    profiles: ["osm"]
+    restart: unless-stopped
+    networks:
+      - raksha-net
+    volumes:
+      - ${DATA_DIR}/tiles/osm-data:/data/database
+      - ${DATA_DIR}/tiles/tile-cache:/data/tiles
+    shm_size: '1g'
+    environment:
+      THREADS: "4"
+      UPDATES: "disabled"     # no live OSM update polling
+      ALLOW_CORS: "enabled"
+    command: run
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Cesium quantized-mesh terrain tile server ────────────────────
+  # Profile "terrain" — NOT started by default.
+  # Serves SRTM/Cartosat DEM tiles in Cesium's quantized-mesh format.
+  #
+  # FIRST-TIME SETUP:
+  #   1. Download SRTM 1 arc-second tiles for India:
+  #        ./setup_terrain.sh --download
+  #   2. Convert to quantized-mesh format (requires ctb-tile Docker image):
+  #        ./setup_terrain.sh --convert
+  #   3. Start the terrain server:
+  #        docker compose --profile terrain up -d terrain-server
+  #   4. Add to .env: TERRAIN_TILE_URL=/terrain-tiles
+  #
+  # Tile directory: ${DATA_DIR}/terrain/tilesets/terrain/
+  terrain-server:
+    image: nginx:1.27-alpine
+    profiles: ["terrain"]
+    restart: unless-stopped
+    networks:
+      - raksha-net
+    volumes:
+      - ${DATA_DIR}/terrain:/usr/share/nginx/html:ro
+      - ./deploy/nginx-terrain.conf:/etc/nginx/conf.d/default.conf:ro
+    expose:
+      - "8765"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8765/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   # ── Nginx (reverse proxy + static/media + tile proxy) ────────────
   nginx:
-    image: nginx:alpine
+    image: nginx:1.27-alpine
     restart: unless-stopped
+    networks:
+      - raksha-net    # can reach backend services (web, pg_tileserv, onlyoffice)
+      - raksha-edge   # can publish ports 80/443 to the host
     ports:
       - "80:80"
       - "443:443"
@@ -85,11 +215,19 @@ services:
     depends_on:
       - web
       - pg_tileserv
+      - onlyoffice
 
   # ── Let's Encrypt certificate renewal ───────────────────────────
+  # Profile "https" — NOT started by default.
+  # Only needed for public-domain HTTPS.  A dedicated secure line
+  # typically uses a private/internal CA or self-signed certificate.
+  # To enable: docker compose --profile https up -d certbot
   certbot:
     image: certbot/certbot
+    profiles: ["https"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     volumes:
       - ${DATA_DIR}/certbot/conf:/etc/letsencrypt
       - ${DATA_DIR}/certbot/www:/var/www/certbot
@@ -120,6 +258,8 @@ services:
     image: ollama/ollama:latest
     profiles: ["docker-ollama"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     volumes:
       - ${DATA_DIR}/models/ollama:/root/.ollama
     ports:
@@ -132,6 +272,8 @@ services:
     image: ollama/ollama:latest
     profiles: ["docker-ollama-gpu"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     volumes:
       - ${DATA_DIR}/models/ollama:/root/.ollama
     ports:
@@ -151,6 +293,8 @@ services:
     image: localai/localai:latest-aio-cpu
     profiles: ["localai"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     environment:
       - MODELS_PATH=/models
       - CONTEXT_SIZE=4096
@@ -172,6 +316,8 @@ services:
     image: localai/localai:latest-aio-gpu-nvidia-cuda-12
     profiles: ["localai-gpu"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     environment:
       - MODELS_PATH=/models
       - CONTEXT_SIZE=4096
@@ -202,6 +348,8 @@ services:
     image: ghcr.io/ggml-org/llama.cpp:server
     profiles: ["llamacpp"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     command: >
       --model /models/model.gguf
       --host 0.0.0.0
@@ -221,6 +369,8 @@ services:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda
     profiles: ["llamacpp-gpu"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -276,6 +426,8 @@ services:
     image: mintplexlabs/anythingllm:latest
     profiles: ["anythingllm"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     environment:
       - STORAGE_DIR=/app/server/storage
     volumes:
@@ -290,6 +442,8 @@ services:
     image: mintplexlabs/anythingllm:latest
     profiles: ["anythingllm-gpu"]
     restart: unless-stopped
+    networks:
+      - raksha-net
     environment:
       - STORAGE_DIR=/app/server/storage
     volumes:
@@ -305,9 +459,16 @@ services:
               capabilities: [gpu]
 
   # ── Prometheus (metrics scraping) ───────────────────────────────
+  # Profile "monitoring" — NOT started by default.
+  # Enable after Phase 5 dashboard setup:
+  #   docker compose --profile monitoring up -d prometheus grafana
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.55.1
+    profiles: ["monitoring"]
     restart: unless-stopped
+    networks:
+      - raksha-net
+    user: "65534:65534"   # nobody — matches prom/prometheus container UID
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ${DATA_DIR}/prometheus:/prometheus
@@ -319,9 +480,14 @@ services:
       - '--storage.tsdb.retention.time=30d'
 
   # ── Grafana (dashboards) ─────────────────────────────────────────
+  # Profile "monitoring" — NOT started by default.
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.4.2
+    profiles: ["monitoring"]
     restart: unless-stopped
+    networks:
+      - raksha-net
+    user: "472:472"   # grafana — matches grafana/grafana container UID
     volumes:
       - ${DATA_DIR}/grafana:/var/lib/grafana
     ports:
@@ -329,5 +495,41 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-changeme}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      # Disable all external connections — fully offline operation
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: ""
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
     depends_on:
       - prometheus
+
+  # ── OnlyOffice Community Document Server ────────────────────────────────────
+  # Free community edition — no license, no registration, no cloud connection.
+  # Starts automatically with `docker compose up -d`.
+  # Served via Nginx at /onlyoffice/ — never exposed directly to the internet.
+  # Embed in app with: new DocsAPI.DocEditor('id', { documentServerUrl: '/onlyoffice/' })
+  onlyoffice:
+    image: onlyoffice/documentserver:8.2.2
+    restart: unless-stopped
+    networks:
+      - raksha-net
+    environment:
+      ONLYOFFICE_DISABLE_TELEMETRY: "true"   # no usage data sent anywhere
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:-raksha_oo_secret_change_me}
+      JWT_HEADER: Authorization
+      JWT_IN_BODY: "true"
+      # Offline operation — disable external resource fetching
+      SPELLCHECK_ENABLED: "false"            # dictionary server not available offline
+      USE_UNAUTHORIZED_STORAGE: "true"       # allow local storage without external auth
+    volumes:
+      - ${DATA_DIR}/onlyoffice/data:/var/www/onlyoffice/Data
+      - ${DATA_DIR}/onlyoffice/logs:/var/log/onlyoffice
+      - ${DATA_DIR}/onlyoffice/cache:/var/lib/onlyoffice/documentserver/App_Data/cache/files
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

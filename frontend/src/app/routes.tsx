@@ -22,9 +22,15 @@ const StateMasterPage = lazy(() => import('@/features/master/StateMasterPage'))
 const DistrictMasterPage = lazy(() => import('@/features/master/DistrictMasterPage'))
 const TalukMasterPage = lazy(() => import('@/features/master/TalukMasterPage'))
 const VillageMasterPage = lazy(() => import('@/features/master/VillageMasterPage'))
-const BrandingSettingsPage = lazy(() => import('@/features/settings/BrandingSettingsPage'))
-const QGISSyncPage = lazy(() => import('@/features/qgis-sync/QGISSyncPage'))
-const AIConfigPage = lazy(() => import('@/features/ai-config/AIConfigPage'))
+const BoundaryImportPage = lazy(() => import('@/features/master/BoundaryImportPage'))
+const TerrainPage = lazy(() => import('@/features/terrain/TerrainPage'))
+const BoundaryExtractionPage = lazy(() => import('@/features/ai-vision/BoundaryExtractionPage'))
+const BackupPage = lazy(() => import('@/features/backups/BackupPage'))
+const BrandingSettingsPage   = lazy(() => import('@/features/settings/BrandingSettingsPage'))
+const QGISSyncPage           = lazy(() => import('@/features/qgis-sync/QGISSyncPage'))
+const AIConfigPage           = lazy(() => import('@/features/ai-config/AIConfigPage'))
+const ExternalDatabasePage   = lazy(() => import('@/features/admin/ExternalDatabasePage'))
+const AccessRequestsPage = lazy(() => import('@/features/projects/AccessRequestsPage'))
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const user = useAppStore((s) => s.user)
@@ -58,6 +64,7 @@ export default function AppRoutes() {
           <Route path="projects/:id/compare" element={<VersionComparePage />} />
           <Route path="projects/:id/gantt" element={<GanttPage />} />
           <Route path="documents" element={<DocumentsPage />} />
+          <Route path="access-requests" element={<AccessRequestsPage />} />
           <Route path="users" element={<UsersPage />} />
           <Route path="organisations" element={<OrganisationsPage />} />
           <Route path="ai-chat" element={<AIChatPage />} />
@@ -68,8 +75,13 @@ export default function AppRoutes() {
           <Route path="master/districts" element={<DistrictMasterPage />} />
           <Route path="master/taluks" element={<TalukMasterPage />} />
           <Route path="master/villages" element={<VillageMasterPage />} />
-          <Route path="settings/branding" element={<BrandingSettingsPage />} />
-          <Route path="settings/ai-config" element={<AIConfigPage />} />
+          <Route path="master/boundary-import" element={<BoundaryImportPage />} />
+          <Route path="terrain" element={<TerrainPage />} />
+          <Route path="ai-vision" element={<BoundaryExtractionPage />} />
+          <Route path="backups" element={<BackupPage />} />
+          <Route path="settings/branding"      element={<BrandingSettingsPage />} />
+          <Route path="settings/ai-config"     element={<AIConfigPage />} />
+          <Route path="settings/external-data" element={<ExternalDatabasePage />} />
           <Route path="qgis-sync" element={<QGISSyncPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

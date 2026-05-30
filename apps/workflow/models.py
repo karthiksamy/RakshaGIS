@@ -1,5 +1,5 @@
-from django.db import models
 from django.conf import settings
+from django.db import models
 
 
 class WorkflowStep(models.Model):
@@ -109,3 +109,33 @@ class Notification(models.Model):
 
     def __str__(self):
         return f"[{self.get_notification_type_display()}] {self.title} → {self.recipient}"
+
+
+class DisputeReport(models.Model):
+    """Records the result of a spatial overlap check run before a survey-area submission."""
+    CLEAN        = 'CLEAN'
+    HAS_DISPUTES = 'HAS_DISPUTES'
+    STATUS_CHOICES = [(CLEAN, 'Clean'), (HAS_DISPUTES, 'Has Disputes')]
+
+    survey_area   = models.ForeignKey(
+        'survey_projects.SurveyArea', on_delete=models.CASCADE, related_name='dispute_reports'
+    )
+    checked_at    = models.DateTimeField(auto_now_add=True)
+    checked_by    = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='+'
+    )
+    status        = models.CharField(max_length=15, choices=STATUS_CHOICES, default=CLEAN)
+    # List of dicts: source_feature_id, source_layer, target_feature_id, target_layer,
+    # target_project, target_org, overlap_sqm
+    disputes      = models.JSONField(default=list)
+    acknowledged  = models.BooleanField(default=False)
+    acknowledged_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+'
+    )
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-checked_at']
+
+    def __str__(self):
+        return f'DisputeReport({self.survey_area}, {self.status}, {self.checked_at:%Y-%m-%d})'

@@ -34,12 +34,32 @@ class Organisation(models.Model):
         help_text='Basemap shown by default to users in this org'
     )
 
-    # Extended contact / location fields (Phase 6)
+    # ── mst_office mirror fields ──────────────────────────────────────────────
+    # office_id ↔ mst_office.officeid  (5-char primary office code, e.g. 'DGDES')
     office_id    = models.CharField(max_length=5, unique=True, blank=True,
-                       help_text='5-character alphanumeric office code')
+                       help_text='5-character office code from mst_office (e.g. DGDES, PRDSC)')
+    # level ↔ officelevelid (2-char code stored in LEVEL_CHOICES above)
+    office_level_code = models.CharField(max_length=2, blank=True,
+                            help_text='Raw officelevelid from mst_office (e.g. L1, L2)')
+    # controllingoffice → separate FK (may differ from parentofficeid)
+    controlling_office = models.ForeignKey(
+        'self', null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='controlled_offices',
+        help_text='mst_office.controllingoffice — administrative controlling authority'
+    )
+    office_url   = models.URLField(max_length=75, blank=True)
+    address1     = models.CharField(max_length=75, blank=True)
+    address2     = models.CharField(max_length=75, blank=True)
+    address3     = models.CharField(max_length=75, blank=True)
+    circle       = models.CharField(max_length=50, blank=True,
+                       help_text='Circle/Command name from mst_office')
+    display_order= models.IntegerField(default=0,
+                       help_text='mst_office.dorder — sort order within level')
     officer_name = models.CharField(max_length=200, blank=True)
     mobile       = models.CharField(max_length=15, blank=True)
-    landline     = models.CharField(max_length=20, blank=True)
+    landline     = models.CharField(max_length=50, blank=True,
+                       help_text='mst_office.phonenos')
+    fax_nos      = models.CharField(max_length=25, blank=True)
     email        = models.EmailField(blank=True)
     state        = models.ForeignKey(
         'gis_layers.State', null=True, blank=True,
@@ -50,6 +70,21 @@ class Organisation(models.Model):
         on_delete=models.SET_NULL, related_name='+'
     )
     pincode      = models.CharField(max_length=6, blank=True)
+    creation_date= models.DateField(null=True, blank=True,
+                       help_text='mst_office.creationdate')
+    close_date   = models.DateField(null=True, blank=True,
+                       help_text='mst_office.closedate')
+    doe          = models.DateField(null=True, blank=True,
+                       help_text='Date of Establishment (mst_office.doe)')
+    dou          = models.DateField(null=True, blank=True,
+                       help_text='Date of last Update (mst_office.dou)')
+    # Audit trail from mst_office
+    enby         = models.CharField(max_length=15, blank=True,
+                       help_text='Entered-by user code from mst_office')
+    upby         = models.CharField(max_length=15, blank=True,
+                       help_text='Updated-by user code from mst_office')
+    csum         = models.TextField(blank=True,
+                       help_text='Checksum from mst_office')
 
     created_at = models.DateTimeField(auto_now_add=True)
 

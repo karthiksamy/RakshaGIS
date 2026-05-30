@@ -1,4 +1,7 @@
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
@@ -10,8 +13,15 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 from django.contrib.gis.db.models.functions import Distance
 from django.contrib.gis.measure import D
 
-from apps.accounts.permissions import CanEditProject, IsSuperAdmin, org_queryset_filter
-from .models import SurveyProject, SurveyArea, GISFeature, DefenceParcel, AttributeTemplate, ShapefileImport, ProjectLayerFolder, ProjectShare, GeoTiffLayer, FeatureAttachment, ProjectMilestone
+from apps.accounts.permissions import (
+    CanEditProject, IsSuperAdmin, org_queryset_filter,
+    get_shared_project_ids, get_approved_area_ids,
+)
+from .models import (
+    SurveyProject, SurveyArea, GISFeature, DefenceParcel, AttributeTemplate,
+    ShapefileImport, ProjectLayerFolder, ProjectShare, GeoTiffLayer,
+    FeatureAttachment, ProjectMilestone, SurveyAreaAccessRequest,
+)
 from .serializers import (
     SurveyProjectSerializer, SurveyAreaSerializer, GISFeatureSerializer, DefenceParcelSerializer,
     AttributeTemplateSerializer, ShapefileImportSerializer,
@@ -29,12 +39,24 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'updated_at', 'name', 'priority']
 
     def get_queryset(self):
-        return org_queryset_filter(
-            self.request.user,
-            SurveyProject.objects.select_related(
-                'organisation', 'created_by', 'state', 'district', 'taluk', 'village'
-            )
+        from django.db.models import Q
+        user = self.request.user
+        base_qs = SurveyProject.objects.select_related(
+            'organisation', 'created_by', 'state', 'district', 'taluk', 'village'
         )
+        own_qs = org_queryset_filter(user, base_qs)
+        if user.is_superadmin or user.role == 'PDDE_VIEWER':
+            return own_qs
+        # Include projects shared to this org + projects containing approved survey area grants
+        shared_ids = get_shared_project_ids(user)
+        approved_project_ids = list(
+            SurveyArea.objects.filter(id__in=get_approved_area_ids(user))
+            .values_list('project_id', flat=True)
+        )
+        extra_ids = list(set(shared_ids + approved_project_ids))
+        if not extra_ids:
+            return own_qs
+        return (own_qs | base_qs.filter(id__in=extra_ids)).distinct()
 
     def get_permissions(self):
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
@@ -124,6 +146,106 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
         )
         return Response(ProjectLayerFolderSerializer(new_version).data, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=['post'], url_path='new-layer',
+            permission_classes=[CanEditProject])
+    def new_layer(self, request, pk=None):
+        """
+        POST /api/projects/{pk}/new-layer/
+        Create a new drawing layer and wire it to a survey area.
+
+        Body (JSON):
+          layer_name      string  required — name for the new layer
+          geometry_type   string  required — POINT | LINE | POLYGON
+          survey_area_id  int     optional — use an existing DRAFT/RETURNED survey area
+          new_area_name   string  optional — create a new survey area with this name
+          new_area_code   string  optional — short code for the new area
+          fields          list    optional — attribute schema [{name, type, label, required}]
+
+        Returns:
+          { survey_area_id, survey_area_name, folder_id, layer_name, geometry_type }
+        """
+        from django.db import IntegrityError
+        from apps.accounts.models import User
+
+        project = self.get_object()
+        user = request.user
+
+        if user.role not in (User.SDO, User.SURVEYOR, User.SUPERADMIN):
+            raise PermissionDenied('Only SDO / Surveyor can create layers.')
+
+        layer_name = (request.data.get('layer_name') or '').strip()
+        geometry_type = (request.data.get('geometry_type') or 'POLYGON').upper()
+        survey_area_id = request.data.get('survey_area_id')
+        new_area_name = (request.data.get('new_area_name') or '').strip()
+        new_area_code = (request.data.get('new_area_code') or '').strip()
+        fields = request.data.get('fields', [])
+
+        if not layer_name:
+            return Response({'detail': 'layer_name is required.'}, status=400)
+        if geometry_type not in ('POINT', 'LINE', 'POLYGON'):
+            return Response({'detail': 'geometry_type must be POINT, LINE, or POLYGON.'}, status=400)
+        if not survey_area_id and not new_area_name:
+            return Response({'detail': 'Provide survey_area_id or new_area_name.'}, status=400)
+
+        # ── Resolve / create survey area ─────────────────────────────
+        if new_area_name:
+            try:
+                area = SurveyArea.objects.create(
+                    project=project, name=new_area_name, area_code=new_area_code,
+                    status=SurveyArea.DRAFT, created_by=user,
+                )
+            except Exception:
+                return Response(
+                    {'detail': f'A survey area named "{new_area_name}" already exists in this project.'},
+                    status=400,
+                )
+        else:
+            try:
+                area = SurveyArea.objects.get(id=survey_area_id, project=project)
+            except SurveyArea.DoesNotExist:
+                return Response({'detail': 'Survey area not found.'}, status=404)
+            if area.status not in (SurveyArea.DRAFT, SurveyArea.RETURNED):
+                return Response(
+                    {'detail': 'Survey area is locked. Cannot add layers to submitted/approved areas.'},
+                    status=400,
+                )
+
+        # ── Ensure survey area has a root folder ──────────────────────
+        if not area.folder_id:
+            root_folder = ProjectLayerFolder.objects.create(
+                project=project, name=area.name,
+                folder_type=ProjectLayerFolder.ZONE, created_by=user, order=0,
+            )
+            _add_survey_area_subfolders(root_folder, user)
+            area.folder = root_folder
+            area.save(update_fields=['folder'])
+
+        # ── Resolve the "Shape Files" subfolder ───────────────────────
+        shapefile_folder, _ = ProjectLayerFolder.objects.get_or_create(
+            project=project, parent=area.folder,
+            folder_type=ProjectLayerFolder.SHAPEFILE,
+            defaults={'name': 'Shape Files', 'created_by': user, 'order': 0},
+        )
+
+        # ── Optionally persist attribute schema ───────────────────────
+        if fields:
+            AttributeTemplate.objects.update_or_create(
+                organisation=user.organisation, layer_name=layer_name,
+                defaults={
+                    'fields': fields,
+                    'created_by': user,
+                    'description': f'Schema for {layer_name}',
+                },
+            )
+
+        return Response({
+            'survey_area_id': area.id,
+            'survey_area_name': area.name,
+            'folder_id': shapefile_folder.id,
+            'layer_name': layer_name,
+            'geometry_type': geometry_type,
+        }, status=201)
+
     @action(detail=True, methods=['get'], url_path='export')
     def export(self, request, pk=None):
         """Export project features in various formats."""
@@ -150,11 +272,27 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
     pagination_class = None  # map must load all features; pagination breaks the map layer
 
     def get_queryset(self):
-        return org_queryset_filter(
-            self.request.user,
-            GISFeature.objects.select_related('project__organisation', 'created_by'),
-            org_field='project__organisation'
-        ).filter(is_deleted=False)
+        from django.db.models import Q
+        user = self.request.user
+        base_qs = GISFeature.objects.select_related('project__organisation', 'created_by')
+        own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation').filter(is_deleted=False)
+        if user.is_superadmin or user.role == 'PDDE_VIEWER':
+            return own_qs
+        # Include features from approved cross-org areas (in their folder subtrees)
+        approved_area_ids = get_approved_area_ids(user)
+        shared_project_ids = get_shared_project_ids(user)
+        if not approved_area_ids and not shared_project_ids:
+            return own_qs
+        # For approved areas: features in the area's folder subtree
+        from apps.survey_projects.models import SurveyArea as _SA
+        approved_folder_ids: list[int] = []
+        for area in _SA.objects.filter(id__in=approved_area_ids).select_related('folder'):
+            if area.folder_id:
+                approved_folder_ids.extend(_get_subtree_folder_ids(area.folder_id))
+        extra_q = Q(project_id__in=shared_project_ids)
+        if approved_folder_ids:
+            extra_q |= Q(folder_id__in=approved_folder_ids)
+        return (own_qs | base_qs.filter(extra_q, is_deleted=False)).distinct()
 
     def get_permissions(self):
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
@@ -1006,6 +1144,412 @@ def _safe_val(v):
     return str(v)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Survey Report Generator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_survey_report(area, user, include_features=True, include_photos=True, include_workflow=True):
+    """
+    Generate a .docx survey report for a SurveyArea, save it to the area's Doc folder,
+    optionally convert to PDF via LibreOffice headless, and return download URLs.
+    """
+    import io, os, shutil, subprocess, tempfile
+    from datetime import date
+    from django.core.files.base import ContentFile
+    from django.db.models import Count, Sum
+    from django.contrib.gis.db.models.functions import Area, Length, Transform
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+    from docx.oxml.ns import qn
+    from apps.documents.models import Document
+    from apps.workflow.models import WorkflowStep
+
+    project = area.project
+    org     = project.organisation
+
+    # ── Ensure area has a folder tree ────────────────────────────────────────
+    if not area.folder_id:
+        root_folder = ProjectLayerFolder.objects.create(
+            project=project, name=area.name,
+            folder_type=ProjectLayerFolder.ZONE, created_by=user, order=0,
+        )
+        _add_survey_area_subfolders(root_folder, user)
+        area.folder = root_folder
+        area.save(update_fields=['folder'])
+
+    # Find the DOC subfolder
+    doc_folder, _ = ProjectLayerFolder.objects.get_or_create(
+        project=project, parent=area.folder,
+        folder_type=ProjectLayerFolder.DOC,
+        defaults={'name': 'Doc', 'created_by': user, 'order': 2},
+    )
+
+    # ── Collect data ──────────────────────────────────────────────────────────
+    features_qs = GISFeature.objects.filter(
+        project=project, is_deleted=False,
+    ).filter(
+        folder__in=_get_subtree_folder_ids(area.folder)
+    )
+
+    # Layer summary: count, total area (polygon), total length (line)
+    layer_stats = {}
+    for f in features_qs.values('layer_name', 'geometry_type'):
+        key = (f['layer_name'], f['geometry_type'])
+        layer_stats.setdefault(key, 0)
+        layer_stats[key] += 1
+
+    # Compute areas and lengths per layer
+    layer_metrics = {}
+    for (ln, gtype), cnt in layer_stats.items():
+        lq = features_qs.filter(layer_name=ln, geometry_type=gtype)
+        total_area_ha = None
+        total_len_km = None
+        if gtype == GISFeature.POLYGON:
+            try:
+                proj_geoms = lq.annotate(geom_proj=Transform('geometry', 32643))
+                total_m2 = sum(
+                    f.geom_proj.area for f in proj_geoms
+                    if f.geom_proj and not f.geom_proj.empty
+                )
+                total_area_ha = round(total_m2 / 10000, 4)
+            except Exception:
+                pass
+        elif gtype == GISFeature.LINE:
+            try:
+                proj_geoms = lq.annotate(geom_proj=Transform('geometry', 32643))
+                total_m = sum(
+                    f.geom_proj.length for f in proj_geoms
+                    if f.geom_proj and not f.geom_proj.empty
+                )
+                total_len_km = round(total_m / 1000, 3)
+            except Exception:
+                pass
+        layer_metrics[(ln, gtype)] = {
+            'count': cnt, 'area_ha': total_area_ha, 'len_km': total_len_km,
+        }
+
+    # Workflow steps
+    workflow_steps = list(
+        WorkflowStep.objects.filter(survey_area=area)
+        .select_related('actor')
+        .order_by('timestamp')
+    ) if include_workflow else []
+
+    # Photos from doc folder
+    photos = list(
+        Document.objects.filter(folder=doc_folder, category=Document.PHOTO)
+        .order_by('uploaded_at')
+    ) if include_photos else []
+
+    # ── Build Document ────────────────────────────────────────────────────────
+    doc = DocxDocument()
+
+    # Page margins (2 cm all around)
+    for section in doc.sections:
+        section.top_margin    = Cm(2)
+        section.bottom_margin = Cm(2)
+        section.left_margin   = Cm(2.5)
+        section.right_margin  = Cm(2.5)
+
+    def _centered_para(text, bold=False, size=11, color=None, space_before=0, space_after=4):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_before = Pt(space_before)
+        p.paragraph_format.space_after  = Pt(space_after)
+        run = p.add_run(text)
+        run.bold = bold
+        run.font.size = Pt(size)
+        if color:
+            run.font.color.rgb = RGBColor(*color)
+        return p
+
+    def _add_section_heading(text):
+        p = doc.add_heading(text, level=2)
+        p.paragraph_format.space_before = Pt(10)
+        p.paragraph_format.space_after  = Pt(4)
+        return p
+
+    def _info_table(rows):
+        """Two-column label/value table."""
+        tbl = doc.add_table(rows=len(rows), cols=2)
+        tbl.style = 'Table Grid'
+        tbl.alignment = WD_TABLE_ALIGNMENT.LEFT
+        for i, (label, value) in enumerate(rows):
+            lc = tbl.cell(i, 0)
+            vc = tbl.cell(i, 1)
+            lc.width = Cm(5.5)
+            lr = lc.paragraphs[0].add_run(label)
+            lr.bold = True
+            lr.font.size = Pt(10)
+            vr = vc.paragraphs[0].add_run(str(value) if value is not None else '—')
+            vr.font.size = Pt(10)
+        return tbl
+
+    def _set_col_widths(tbl, widths_cm):
+        for i, row in enumerate(tbl.rows):
+            for j, cell in enumerate(row.cells):
+                if j < len(widths_cm):
+                    cell.width = Cm(widths_cm[j])
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    _centered_para('GOVERNMENT OF INDIA', bold=True, size=13, color=(0, 0, 128), space_after=2)
+    _centered_para('DEFENCE ESTATES DEPARTMENT', bold=True, size=12, color=(0, 0, 128), space_after=2)
+    _centered_para(f'{org.name}  ({org.get_level_display()})', bold=True, size=11, space_after=2)
+    if org.address:
+        _centered_para(org.address, size=10, space_after=2)
+    if org.office_id:
+        _centered_para(f'Office Code: {org.office_id}', size=10, space_after=6)
+    doc.add_paragraph().paragraph_format.space_after = Pt(2)
+
+    _centered_para('SURVEY AREA REPORT', bold=True, size=16,
+                   color=(139, 0, 0), space_before=4, space_after=8)
+
+    ref_no = f'SR/{project.project_number}/{area.id}'
+    _centered_para(f'Reference No: {ref_no}   |   Date: {date.today().strftime("%d %B %Y")}',
+                   size=10, space_after=10)
+    doc.add_paragraph()
+
+    # ── 1. Project Information ─────────────────────────────────────────────────
+    _add_section_heading('1. PROJECT INFORMATION')
+    proj_rows = [
+        ('Project Number',  project.project_number),
+        ('Project Name',    project.name),
+        ('Survey Type',     project.get_survey_type_display()),
+        ('Priority',        project.get_priority_display()),
+        ('Status',          project.get_status_display()),
+        ('State',           project.state.name if project.state else '—'),
+        ('District',        project.district.name if project.district else '—'),
+        ('Taluk',           project.taluk.name if project.taluk else '—'),
+        ('Village',         project.village.name if project.village else '—'),
+        ('Total Area',      f'{project.total_area_hectares} ha' if project.total_area_hectares else '—'),
+        ('Start Date',      project.start_date.strftime('%d-%b-%Y') if project.start_date else '—'),
+        ('Target Date',     project.target_date.strftime('%d-%b-%Y') if project.target_date else '—'),
+        ('Description',     project.description or '—'),
+    ]
+    _info_table(proj_rows)
+    doc.add_paragraph()
+
+    # ── 2. Survey Area Details ────────────────────────────────────────────────
+    _add_section_heading('2. SURVEY AREA DETAILS')
+    area_rows = [
+        ('Area Name',      area.name),
+        ('Area Code',      area.area_code or '—'),
+        ('Status',         area.get_status_display()),
+        ('Assigned To',    area.assigned_to.get_full_name() if area.assigned_to else '—'),
+        ('Created By',     area.created_by.get_full_name() if area.created_by else '—'),
+        ('Created On',     area.created_at.strftime('%d-%b-%Y') if area.created_at else '—'),
+        ('Last Updated',   area.updated_at.strftime('%d-%b-%Y') if area.updated_at else '—'),
+        ('Description',    area.description or '—'),
+    ]
+    _info_table(area_rows)
+    doc.add_paragraph()
+
+    # ── 3. Feature Summary ────────────────────────────────────────────────────
+    if include_features and layer_metrics:
+        _add_section_heading('3. FEATURE SUMMARY')
+        headers = ['Layer Name', 'Type', 'Count', 'Total Area (ha)', 'Total Length (km)']
+        data_rows = [
+            (ln, gtype, m['count'],
+             str(m['area_ha']) if m['area_ha'] is not None else '—',
+             str(m['len_km'])  if m['len_km']  is not None else '—')
+            for (ln, gtype), m in sorted(layer_metrics.items())
+        ]
+        tbl = doc.add_table(rows=1 + len(data_rows), cols=5)
+        tbl.style = 'Table Grid'
+        # Header row
+        hdr = tbl.rows[0]
+        for i, h in enumerate(headers):
+            run = hdr.cells[i].paragraphs[0].add_run(h)
+            run.bold = True
+            run.font.size = Pt(10)
+        # Data rows
+        for ri, row_data in enumerate(data_rows, start=1):
+            for ci, val in enumerate(row_data):
+                tbl.rows[ri].cells[ci].paragraphs[0].add_run(str(val)).font.size = Pt(9)
+        _set_col_widths(tbl, [5.5, 2.5, 1.5, 3.0, 3.0])
+        total = sum(m['count'] for m in layer_metrics.values())
+        p = doc.add_paragraph(f'\nTotal: {total} feature(s) across {len(layer_metrics)} layer(s)')
+        p.paragraph_format.space_after = Pt(8)
+
+    # ── 4. Feature Attribute Details ──────────────────────────────────────────
+    if include_features and layer_metrics:
+        _add_section_heading('4. FEATURE ATTRIBUTE DETAILS')
+        for (ln, gtype), m in sorted(layer_metrics.items()):
+            layer_feats = list(
+                features_qs.filter(layer_name=ln, geometry_type=gtype).order_by('id')[:50]
+            )
+            if not layer_feats:
+                continue
+            p = doc.add_paragraph()
+            r = p.add_run(f'{ln}  ({gtype} — {m["count"]} feature(s))')
+            r.bold = True
+            r.font.size = Pt(10)
+
+            # Collect all attribute keys across features
+            all_keys = []
+            seen = set()
+            for feat in layer_feats:
+                for k in (feat.attributes or {}):
+                    if k not in seen:
+                        seen.add(k)
+                        all_keys.append(k)
+            all_keys = all_keys[:12]  # cap columns to keep doc readable
+
+            col_headers = ['#', 'Feature ID'] + all_keys
+            attr_tbl = doc.add_table(rows=1 + len(layer_feats), cols=len(col_headers))
+            attr_tbl.style = 'Table Grid'
+            for ci, h in enumerate(col_headers):
+                run = attr_tbl.rows[0].cells[ci].paragraphs[0].add_run(h)
+                run.bold = True
+                run.font.size = Pt(8)
+            for ri, feat in enumerate(layer_feats, start=1):
+                row = attr_tbl.rows[ri]
+                row.cells[0].paragraphs[0].add_run(str(ri)).font.size = Pt(8)
+                row.cells[1].paragraphs[0].add_run(feat.feature_id or str(feat.id)).font.size = Pt(8)
+                for ci, k in enumerate(all_keys, start=2):
+                    val = (feat.attributes or {}).get(k, '')
+                    row.cells[ci].paragraphs[0].add_run(str(val)[:60]).font.size = Pt(8)
+
+            if m['count'] > 50:
+                doc.add_paragraph(
+                    f'  (Showing first 50 of {m["count"]} features)'
+                ).paragraph_format.space_after = Pt(6)
+            doc.add_paragraph()
+
+    # ── 5. Photographs ────────────────────────────────────────────────────────
+    if include_photos and photos:
+        _add_section_heading('5. PHOTOGRAPHS')
+        for photo in photos:
+            try:
+                img_path = photo.file.path
+                if os.path.exists(img_path):
+                    doc.add_picture(img_path, width=Cm(14))
+                    cap = doc.add_paragraph(photo.title)
+                    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    cap.paragraph_format.space_after = Pt(8)
+                    run = cap.runs[0]
+                    run.italic = True
+                    run.font.size = Pt(9)
+            except Exception:
+                pass
+        doc.add_paragraph()
+
+    # ── 6. Workflow History ───────────────────────────────────────────────────
+    if include_workflow:
+        _add_section_heading(f'{"6" if include_photos and photos else "5"}. WORKFLOW HISTORY')
+        if workflow_steps:
+            wf_tbl = doc.add_table(rows=1 + len(workflow_steps), cols=4)
+            wf_tbl.style = 'Table Grid'
+            for ci, h in enumerate(['Date & Time', 'Action', 'By', 'Remarks']):
+                run = wf_tbl.rows[0].cells[ci].paragraphs[0].add_run(h)
+                run.bold = True
+                run.font.size = Pt(10)
+            for ri, step in enumerate(workflow_steps, start=1):
+                row = wf_tbl.rows[ri]
+                row.cells[0].paragraphs[0].add_run(
+                    step.timestamp.strftime('%d-%b-%Y %H:%M')
+                ).font.size = Pt(9)
+                row.cells[1].paragraphs[0].add_run(step.get_action_display()).font.size = Pt(9)
+                row.cells[2].paragraphs[0].add_run(
+                    step.actor.get_full_name() or step.actor.username
+                ).font.size = Pt(9)
+                row.cells[3].paragraphs[0].add_run(step.remarks or '').font.size = Pt(9)
+            _set_col_widths(wf_tbl, [3.5, 5.0, 3.5, 4.0])
+        else:
+            doc.add_paragraph('No workflow actions recorded for this area.')
+        doc.add_paragraph()
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    from django.utils import timezone
+    now_str = timezone.now().strftime('%d-%b-%Y %H:%M')
+    _centered_para('─' * 60, size=9, space_before=8, space_after=2)
+    _centered_para(
+        f'Report generated on: {now_str}   |   By: {user.get_full_name() or user.username} ({user.get_role_display()})',
+        size=9, space_after=2,
+    )
+    _centered_para('RakshaGIS — Defence Estates GIS Survey Platform', size=8, color=(150, 150, 150))
+
+    # ── Save .docx to Doc folder ──────────────────────────────────────────────
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+
+    report_title = f'Survey Report — {area.name}'
+    safe_name = area.name.replace('/', '_').replace(' ', '_')
+    docx_filename = f'survey_report_{safe_name}_{date.today().isoformat()}.docx'
+
+    db_doc = Document.objects.create(
+        project=project,
+        folder=doc_folder,
+        title=report_title,
+        category=Document.SURVEY_REPORT,
+        file_size=buf.getbuffer().nbytes,
+        mime_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        uploaded_by=user,
+    )
+    db_doc.file.save(docx_filename, ContentFile(buf.read()), save=True)
+
+    result = {
+        'doc_id':   db_doc.id,
+        'file_url': db_doc.file.url,
+        'title':    report_title,
+        'pdf_doc_id': None,
+        'pdf_url':  None,
+    }
+
+    # ── Convert to PDF (LibreOffice headless) ─────────────────────────────────
+    lo_bin = shutil.which('libreoffice') or shutil.which('soffice')
+    if lo_bin:
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                docx_tmp = os.path.join(tmpdir, docx_filename)
+                with open(docx_tmp, 'wb') as fh:
+                    buf.seek(0)
+                    fh.write(buf.read())
+
+                subprocess.run(
+                    [lo_bin, '--headless', '--convert-to', 'pdf', '--outdir', tmpdir, docx_tmp],
+                    timeout=60, capture_output=True, check=True,
+                )
+                pdf_tmp = docx_tmp.replace('.docx', '.pdf')
+                if os.path.exists(pdf_tmp):
+                    pdf_filename = docx_filename.replace('.docx', '.pdf')
+                    with open(pdf_tmp, 'rb') as pfh:
+                        pdf_content = pfh.read()
+                    pdf_doc = Document.objects.create(
+                        project=project,
+                        folder=doc_folder,
+                        title=f'{report_title} (PDF)',
+                        category=Document.SURVEY_REPORT,
+                        file_size=len(pdf_content),
+                        mime_type='application/pdf',
+                        uploaded_by=user,
+                        parent=db_doc,
+                    )
+                    pdf_doc.file.save(pdf_filename, ContentFile(pdf_content), save=True)
+                    result['pdf_doc_id'] = pdf_doc.id
+                    result['pdf_url']    = pdf_doc.file.url
+        except Exception:
+            pass  # PDF conversion optional — docx is always generated
+
+    return result
+
+
+def _get_subtree_folder_ids(root_folder_id):
+    """Return a list of folder IDs for root + all descendants."""
+    from collections import deque
+    all_ids = []
+    queue = deque([root_folder_id])
+    while queue:
+        cur = queue.popleft()
+        all_ids.append(cur)
+        for child_id in ProjectLayerFolder.objects.filter(parent_id=cur).values_list('id', flat=True):
+            queue.append(child_id)
+    return all_ids
+
+
 class SurveyAreaViewSet(viewsets.ModelViewSet):
     """
     CRUD for SurveyArea objects.
@@ -1017,16 +1561,24 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
     search_fields = ['name', 'area_code', 'description']
 
     def get_queryset(self):
-        return org_queryset_filter(
-            self.request.user,
-            SurveyArea.objects.select_related(
-                'project__organisation', 'assigned_to', 'created_by', 'folder'
-            ),
-            org_field='project__organisation',
+        from django.db.models import Q
+        user = self.request.user
+        base_qs = SurveyArea.objects.select_related(
+            'project__organisation', 'assigned_to', 'created_by', 'folder'
         )
+        own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation')
+        if user.is_superadmin or user.role == 'PDDE_VIEWER':
+            return own_qs
+        # Also include survey areas shared via ProjectShare or SurveyAreaAccessRequest
+        shared_project_ids = get_shared_project_ids(user)
+        approved_area_ids  = get_approved_area_ids(user)
+        if not shared_project_ids and not approved_area_ids:
+            return own_qs
+        extra_q = Q(project_id__in=shared_project_ids) | Q(id__in=approved_area_ids)
+        return (own_qs | base_qs.filter(extra_q)).distinct()
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
+        if self.action in ['list', 'retrieve', 'discovery']:
             return [permissions.IsAuthenticated()]
         return [permissions.IsAuthenticated(), CanEditProject()]
 
@@ -1039,7 +1591,36 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
             raise PermissionDenied('Only SDO/Surveyor can create survey areas.')
         if user.role != User.SUPERADMIN and project.organisation != user.organisation:
             raise PermissionDenied('Permission denied.')
-        serializer.save(created_by=user)
+        area = serializer.save(created_by=user)
+        # Auto-create the default folder tree so features are always area-scoped
+        root_folder = ProjectLayerFolder.objects.create(
+            project=project, name=area.name,
+            folder_type=ProjectLayerFolder.ZONE, created_by=user, order=0,
+        )
+        _add_survey_area_subfolders(root_folder, user)
+        area.folder = root_folder
+        area.save(update_fields=['folder'])
+
+    @action(detail=True, methods=['post'], url_path='ensure-folder',
+            permission_classes=[permissions.IsAuthenticated])
+    def ensure_folder(self, request, pk=None):
+        """
+        POST /api/projects/survey-areas/{id}/ensure-folder/
+        Idempotent: create folder tree if missing, return updated SurveyArea.
+        Called automatically by the map frontend when an area without a folder is selected.
+        """
+        area = self.get_object()
+        if area.status not in (SurveyArea.DRAFT, SurveyArea.RETURNED):
+            return Response({'detail': 'Area is locked — cannot create folders.'}, status=400)
+        if not area.folder_id:
+            root_folder = ProjectLayerFolder.objects.create(
+                project=area.project, name=area.name,
+                folder_type=ProjectLayerFolder.ZONE, created_by=request.user, order=0,
+            )
+            _add_survey_area_subfolders(root_folder, request.user)
+            area.folder = root_folder
+            area.save(update_fields=['folder'])
+        return Response(SurveyAreaSerializer(area).data)
 
     def perform_update(self, serializer):
         from apps.accounts.models import User
@@ -1056,6 +1637,338 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
             raise PermissionDenied('Cannot delete a submitted survey area.')
         instance.delete()
 
+    @action(detail=True, methods=['post'], url_path='generate-report',
+            permission_classes=[permissions.IsAuthenticated])
+    def generate_report(self, request, pk=None):
+        """
+        POST /api/projects/survey-areas/{id}/generate-report/
+        Generate a Word (.docx) survey report for this area, save it to the Doc folder,
+        and optionally convert to PDF using LibreOffice headless.
+        Returns: { doc_id, file_url, pdf_doc_id, pdf_url, title }
+        """
+        area = self.get_object()
+        user = request.user
+        include_features = request.data.get('include_features', True)
+        include_photos   = request.data.get('include_photos',   True)
+        include_workflow = request.data.get('include_workflow',  True)
+
+        try:
+            result = _build_survey_report(area, user, include_features, include_photos, include_workflow)
+            return Response(result, status=201)
+        except ImportError:
+            return Response(
+                {'detail': 'python-docx is not installed. Run: pip install python-docx'},
+                status=500,
+            )
+        except Exception as exc:
+            import traceback
+            return Response({'detail': f'Report generation failed: {exc}', 'trace': traceback.format_exc()}, status=500)
+
+    @action(detail=True, methods=['post'], url_path='create-online-report',
+            permission_classes=[permissions.IsAuthenticated])
+    def create_online_report(self, request, pk=None):
+        """
+        POST /api/projects/survey-areas/{id}/create-online-report/
+
+        Create a blank structured Word document for this survey area and return a
+        Document ID so the caller can open it immediately in OnlyOffice.
+        The document is placed in the area's Doc sub-folder (created if absent).
+        """
+        import io
+        import os
+        from django.core.files.base import ContentFile
+        from apps.documents.models import Document as Doc
+
+        area = self.get_object()
+        user = request.user
+        title = request.data.get('title') or f'Survey Report — {area.name}'
+
+        try:
+            from docx import Document as DocxDocument
+            from docx.shared import Pt, Inches
+            from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+            doc = DocxDocument()
+
+            # Cover heading
+            heading = doc.add_heading(title, level=0)
+            heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            doc.add_heading('Survey Area Details', level=1)
+            table = doc.add_table(rows=4, cols=2)
+            table.style = 'Table Grid'
+            data = [
+                ('Survey Area', area.name),
+                ('Area Code', area.area_code or '—'),
+                ('Project', area.project.project_number),
+                ('Organisation', area.project.organisation.name if area.project.organisation_id else '—'),
+            ]
+            for i, (k, v) in enumerate(data):
+                table.rows[i].cells[0].text = k
+                table.rows[i].cells[1].text = v
+
+            doc.add_heading('Scope of Survey', level=1)
+            doc.add_paragraph('')
+
+            doc.add_heading('Findings', level=1)
+            doc.add_paragraph('')
+
+            doc.add_heading('Recommendations', level=1)
+            doc.add_paragraph('')
+
+            doc.add_heading('Conclusion', level=1)
+            doc.add_paragraph('')
+
+            buf = io.BytesIO()
+            doc.save(buf)
+            buf.seek(0)
+
+        except ImportError:
+            return Response(
+                {'detail': 'python-docx is not installed. Run: pip install python-docx'},
+                status=500,
+            )
+
+        # Find or create the Doc sub-folder under the area's root folder
+        doc_folder = None
+        if area.folder_id:
+            doc_folder = ProjectLayerFolder.objects.filter(
+                project=area.project,
+                parent=area.folder,
+                folder_type=ProjectLayerFolder.DOC,
+            ).first()
+
+        safe_name = ''.join(c if c.isalnum() or c in '-_ ' else '_' for c in area.name)
+        filename = f'report_{safe_name}.docx'
+
+        db_doc = Doc(
+            project=area.project,
+            folder=doc_folder,
+            title=title,
+            category='REPORT',
+            uploaded_by=user,
+        )
+        db_doc.file.save(filename, ContentFile(buf.read()), save=True)
+
+        return Response({
+            'doc_id': db_doc.id,
+            'file_url': request.build_absolute_uri(db_doc.file.url) if db_doc.file else None,
+            'title': db_doc.title,
+        }, status=201)
+
+    @action(detail=True, methods=['post'], url_path='request-access',
+            permission_classes=[permissions.IsAuthenticated])
+    def request_access(self, request, pk=None):
+        """
+        DEO/CEO/ADEO user requests read-only access to this survey area.
+        The target org's admin must approve via SurveyAreaAccessRequestViewSet.
+        """
+        area = self.get_object()
+        user = request.user
+        requesting_org = user.organisation
+        if not requesting_org:
+            return Response({'detail': 'Your account has no organisation.'}, status=400)
+        if area.project.organisation_id == requesting_org.id:
+            return Response({'detail': 'This area already belongs to your organisation.'}, status=400)
+
+        from .serializers import SurveyAreaAccessRequestSerializer
+        existing = SurveyAreaAccessRequest.objects.filter(
+            survey_area=area, requesting_org=requesting_org
+        ).first()
+        if existing:
+            if existing.status == SurveyAreaAccessRequest.APPROVED:
+                return Response({'detail': 'Access already granted.'}, status=400)
+            if existing.status == SurveyAreaAccessRequest.PENDING:
+                return Response({'detail': 'A request is already pending review.'}, status=400)
+            # Rejected — allow re-submission
+            existing.status = SurveyAreaAccessRequest.PENDING
+            existing.reason = request.data.get('reason', existing.reason)
+            existing.reviewed_by = None
+            existing.reviewed_at = None
+            existing.review_remarks = ''
+            existing.save()
+            return Response(SurveyAreaAccessRequestSerializer(existing).data, status=200)
+
+        req = SurveyAreaAccessRequest.objects.create(
+            survey_area=area,
+            requested_by=user,
+            requesting_org=requesting_org,
+            reason=request.data.get('reason', ''),
+        )
+        return Response(SurveyAreaAccessRequestSerializer(req).data, status=201)
+
+    @action(detail=False, methods=['get'], url_path='discovery',
+            permission_classes=[permissions.IsAuthenticated])
+    def discovery(self, request):
+        """
+        Returns basic metadata of survey areas visible within the user's PDDE jurisdiction
+        (siblings under same PDDE) that are NOT in the user's own org.
+        Useful for cross-org access discovery — no GIS data is exposed.
+        """
+        user = request.user
+        org = user.organisation
+        if not org:
+            return Response([])
+
+        # Determine PDDE parent
+        from apps.accounts.models import Organisation
+        if org.level == Organisation.PDDE:
+            pdde = org
+        elif org.parent and org.parent.level == Organisation.PDDE:
+            pdde = org.parent
+        else:
+            pdde = None
+
+        if pdde:
+            sibling_ids = list(
+                Organisation.objects.filter(parent=pdde)
+                .exclude(id=org.id)
+                .values_list('id', flat=True)
+            )
+        else:
+            sibling_ids = []
+
+        if not sibling_ids:
+            return Response([])
+
+        # Get approved request IDs for this org (to show status)
+        approved_ids = set(get_approved_area_ids(user))
+        pending_ids = set(
+            SurveyAreaAccessRequest.objects.filter(
+                requesting_org=org, status=SurveyAreaAccessRequest.PENDING
+            ).values_list('survey_area_id', flat=True)
+        )
+        rejected_ids = set(
+            SurveyAreaAccessRequest.objects.filter(
+                requesting_org=org, status=SurveyAreaAccessRequest.REJECTED
+            ).values_list('survey_area_id', flat=True)
+        )
+
+        areas = SurveyArea.objects.filter(
+            project__organisation_id__in=sibling_ids
+        ).select_related('project__organisation').order_by('project__organisation__name', 'name')
+
+        result = []
+        for a in areas:
+            if a.id in approved_ids:
+                access = 'APPROVED'
+            elif a.id in pending_ids:
+                access = 'PENDING'
+            elif a.id in rejected_ids:
+                access = 'REJECTED'
+            else:
+                access = 'NONE'
+            result.append({
+                'id': a.id,
+                'name': a.name,
+                'area_code': a.area_code,
+                'status': a.status,
+                'project_id': a.project_id,
+                'project_name': a.project.name,
+                'org_id': a.project.organisation_id,
+                'org_name': a.project.organisation.name,
+                'org_level': a.project.organisation.level,
+                'access_status': access,
+            })
+        return Response(result)
+
+
+class SurveyAreaAccessRequestViewSet(viewsets.GenericViewSet):
+    """
+    Admins see incoming access requests for their org's survey areas.
+    They can approve or reject them.
+    """
+    from .serializers import SurveyAreaAccessRequestSerializer
+    serializer_class = SurveyAreaAccessRequestSerializer
+
+    def get_serializer_class(self):
+        from .serializers import SurveyAreaAccessRequestSerializer
+        return SurveyAreaAccessRequestSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_superadmin:
+            return SurveyAreaAccessRequest.objects.select_related(
+                'survey_area__project__organisation', 'requested_by', 'requesting_org', 'reviewed_by'
+            ).all()
+        from apps.accounts.models import User
+        if user.role in User.ADMIN_ROLES:
+            # Admin sees requests targeting their org's survey areas
+            return SurveyAreaAccessRequest.objects.filter(
+                survey_area__project__organisation=user.organisation
+            ).select_related(
+                'survey_area__project__organisation', 'requested_by', 'requesting_org', 'reviewed_by'
+            )
+        # Non-admins see requests they submitted
+        return SurveyAreaAccessRequest.objects.filter(
+            requesting_org=user.organisation
+        ).select_related(
+            'survey_area__project__organisation', 'requested_by', 'requesting_org', 'reviewed_by'
+        )
+
+    def get_permissions(self):
+        return [permissions.IsAuthenticated()]
+
+    def list(self, request):
+        qs = self.get_queryset()
+        status_filter = request.query_params.get('status')
+        direction = request.query_params.get('direction')  # 'incoming' or 'outgoing'
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        if direction == 'incoming' and not request.user.is_superadmin:
+            qs = qs.filter(survey_area__project__organisation=request.user.organisation)
+        elif direction == 'outgoing':
+            qs = qs.filter(requesting_org=request.user.organisation)
+        from .serializers import SurveyAreaAccessRequestSerializer
+        return Response(SurveyAreaAccessRequestSerializer(qs, many=True).data)
+
+    def retrieve(self, request, pk=None):
+        obj = self.get_queryset().filter(pk=pk).first()
+        if not obj:
+            return Response({'detail': 'Not found.'}, status=404)
+        from .serializers import SurveyAreaAccessRequestSerializer
+        return Response(SurveyAreaAccessRequestSerializer(obj).data)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        obj = self.get_queryset().filter(pk=pk).first()
+        if not obj:
+            return Response({'detail': 'Not found.'}, status=404)
+        user = request.user
+        from apps.accounts.models import User
+        if not user.is_superadmin and user.role not in User.ADMIN_ROLES:
+            return Response({'detail': 'Only admins can approve requests.'}, status=403)
+        if not user.is_superadmin and obj.survey_area.project.organisation != user.organisation:
+            return Response({'detail': 'You can only approve requests for your org\'s areas.'}, status=403)
+        from django.utils import timezone
+        obj.status = SurveyAreaAccessRequest.APPROVED
+        obj.reviewed_by = user
+        obj.reviewed_at = timezone.now()
+        obj.review_remarks = request.data.get('remarks', '')
+        obj.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'review_remarks'])
+        from .serializers import SurveyAreaAccessRequestSerializer
+        return Response(SurveyAreaAccessRequestSerializer(obj).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        obj = self.get_queryset().filter(pk=pk).first()
+        if not obj:
+            return Response({'detail': 'Not found.'}, status=404)
+        user = request.user
+        from apps.accounts.models import User
+        if not user.is_superadmin and user.role not in User.ADMIN_ROLES:
+            return Response({'detail': 'Only admins can reject requests.'}, status=403)
+        if not user.is_superadmin and obj.survey_area.project.organisation != user.organisation:
+            return Response({'detail': 'You can only reject requests for your org\'s areas.'}, status=403)
+        from django.utils import timezone
+        obj.status = SurveyAreaAccessRequest.REJECTED
+        obj.reviewed_by = user
+        obj.reviewed_at = timezone.now()
+        obj.review_remarks = request.data.get('remarks', '')
+        obj.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'review_remarks'])
+        from .serializers import SurveyAreaAccessRequestSerializer
+        return Response(SurveyAreaAccessRequestSerializer(obj).data)
+
 
 class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectLayerFolderSerializer
@@ -1063,15 +1976,31 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
     filterset_fields = ['project', 'parent', 'folder_type', 'is_final']
 
     def get_queryset(self):
-        return org_queryset_filter(
-            self.request.user,
-            ProjectLayerFolder.objects.select_related('project__organisation', 'parent', 'created_by'),
-            org_field='project__organisation',
-        )
+        from django.db.models import Q
+        user = self.request.user
+        base_qs = ProjectLayerFolder.objects.select_related('project__organisation', 'parent', 'created_by')
+        own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation')
+        if user.is_superadmin or user.role == 'PDDE_VIEWER':
+            return own_qs
+        approved_area_ids = get_approved_area_ids(user)
+        shared_project_ids = get_shared_project_ids(user)
+        if not approved_area_ids and not shared_project_ids:
+            return own_qs
+        from apps.survey_projects.models import SurveyArea as _SA
+        approved_folder_ids: list[int] = []
+        for area in _SA.objects.filter(id__in=approved_area_ids).select_related('folder'):
+            if area.folder_id:
+                approved_folder_ids.extend(_get_subtree_folder_ids(area.folder_id))
+        extra_q = Q(project_id__in=shared_project_ids)
+        if approved_folder_ids:
+            extra_q |= Q(id__in=approved_folder_ids)
+        return (own_qs | base_qs.filter(extra_q)).distinct()
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'import_gis_file', 'tree', 'upload_doc', 'files']:
+        if self.action in ['list', 'retrieve', 'tree', 'upload_doc', 'files']:
             return [permissions.IsAuthenticated()]
+        if self.action == 'import_gis_file':
+            return [permissions.IsAuthenticated(), CanEditProject()]
         return [CanEditProject()]
 
     def perform_create(self, serializer):
@@ -1997,6 +2926,7 @@ def _parse_temp_layer_file(file_obj):
     """
     import os, tempfile, zipfile, json, shutil
     from django.contrib.gis.gdal import DataSource
+    from .models import TemporaryLayer
 
     name = file_obj.name.lower()
     ext = name.rsplit('.', 1)[-1] if '.' in name else ''
@@ -2124,11 +3054,30 @@ class TemporaryLayerViewSet(viewsets.ModelViewSet):
         if feature_count == 0:
             return Response({'detail': 'No valid features found in the uploaded file.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Validate mandatory new fields
+        purpose_type = request.data.get('purpose_type', '').strip()
+        purpose_other = request.data.get('purpose_other', '').strip()
+        land_rights_type = request.data.get('land_rights_type', '').strip()
+        land_rights_other = request.data.get('land_rights_other', '').strip()
+
+        if not purpose_type:
+            return Response({'detail': 'Purpose is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if purpose_type == 'OTHER' and not purpose_other:
+            return Response({'detail': 'Please specify the other purpose.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not land_rights_type:
+            return Response({'detail': 'Land Rights Type is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if land_rights_type == 'OTHER' and not land_rights_other:
+            return Response({'detail': 'Please specify the other land rights type.'}, status=status.HTTP_400_BAD_REQUEST)
+
         # Reset file pointer and save again for the FileField
         file_obj.seek(0)
         layer = TemporaryLayer(
             name=name,
             purpose=request.data.get('purpose', ''),
+            purpose_type=purpose_type,
+            purpose_other=purpose_other,
+            land_rights_type=land_rights_type,
+            land_rights_other=land_rights_other,
             description=request.data.get('description', ''),
             file_format=file_format,
             file=file_obj,
@@ -2139,5 +3088,74 @@ class TemporaryLayerViewSet(viewsets.ModelViewSet):
         layer.save()
         serializer = TemporaryLayerSerializer(layer)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='analyse')
+    def analyse(self, request, pk=None):
+        """
+        POST /api/projects/temp-layers/{id}/analyse/
+
+        Runs spatial analysis: checks whether the uploaded layer intersects or
+        is within 1 km of any DefenceParcel boundary.  Caches the result on
+        the layer record and returns a JSON summary.
+        """
+        from .models import DefenceParcel
+        from apps.survey_projects.analysis import run_defence_analysis
+
+        layer = self.get_object()
+        if not layer.geojson:
+            return Response({'detail': 'No geometry data in this layer.'}, status=400)
+
+        try:
+            result = run_defence_analysis(layer)
+        except Exception as exc:
+            logger.exception('Defence analysis failed for temp layer %s', layer.id)
+            return Response({'detail': f'Analysis failed: {exc}'}, status=500)
+
+        layer.analysis_result = result
+        layer.save(update_fields=['analysis_result'])
+        return Response(result)
+
+    @action(detail=True, methods=['get'], url_path='analyse/report')
+    def analyse_report(self, request, pk=None):
+        """
+        GET /api/projects/temp-layers/{id}/analyse/report/
+
+        Generates and streams an ArcGIS-style PDF proximity analysis report.
+        Runs analysis if no cached result exists.
+        """
+        from apps.survey_projects.analysis import run_defence_analysis, generate_analysis_report_html
+        import httpx
+
+        layer = self.get_object()
+        if not layer.geojson:
+            return Response({'detail': 'No geometry data in this layer.'}, status=400)
+
+        result = layer.analysis_result
+        if not result:
+            try:
+                result = run_defence_analysis(layer)
+                layer.analysis_result = result
+                layer.save(update_fields=['analysis_result'])
+            except Exception as exc:
+                return Response({'detail': f'Analysis failed: {exc}'}, status=500)
+
+        try:
+            html = generate_analysis_report_html(layer, result)
+            pw_response = httpx.post(
+                'http://print-service:3001/render',
+                json={'html': html, 'paper_size': 'A4', 'orientation': 'portrait', 'scale': 1.5},
+                timeout=120,
+            )
+            pw_response.raise_for_status()
+        except httpx.ConnectError:
+            return Response({'detail': 'Print service unavailable.'}, status=503)
+        except Exception as exc:
+            return Response({'detail': str(exc)}, status=500)
+
+        from django.http import HttpResponse as DjangoHttpResponse
+        safe_name = ''.join(c if c.isalnum() or c in '-_ ' else '_' for c in layer.name)
+        pdf_resp = DjangoHttpResponse(pw_response.content, content_type='application/pdf')
+        pdf_resp['Content-Disposition'] = f'attachment; filename="defence_analysis_{safe_name}.pdf"'
+        return pdf_resp
 
     http_method_names = ['get', 'post', 'delete', 'head', 'options']

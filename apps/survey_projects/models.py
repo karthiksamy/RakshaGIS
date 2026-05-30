@@ -586,6 +586,51 @@ class QGISUploadLog(models.Model):
         return f"{self.filename} → {self.project.project_number} [{self.status}]"
 
 
+class SurveyAreaAccessRequest(models.Model):
+    """
+    A DEO/CEO/ADEO user requests read-only access to a specific survey area
+    that belongs to another org (sibling under the same PDDE).
+    The target org's admin approves or rejects.
+    """
+    PENDING  = 'PENDING'
+    APPROVED = 'APPROVED'
+    REJECTED = 'REJECTED'
+
+    STATUS_CHOICES = [
+        (PENDING,  'Pending Review'),
+        (APPROVED, 'Approved'),
+        (REJECTED, 'Rejected'),
+    ]
+
+    survey_area    = models.ForeignKey(
+        SurveyArea, on_delete=models.CASCADE, related_name='access_requests'
+    )
+    requested_by   = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='area_access_requests_sent'
+    )
+    requesting_org = models.ForeignKey(
+        'accounts.Organisation', on_delete=models.CASCADE,
+        related_name='area_access_requests_sent'
+    )
+    reason         = models.TextField(blank=True, help_text='Why access is needed')
+    status         = models.CharField(max_length=10, choices=STATUS_CHOICES, default=PENDING)
+    reviewed_by    = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='area_access_requests_reviewed'
+    )
+    reviewed_at    = models.DateTimeField(null=True, blank=True)
+    review_remarks = models.TextField(blank=True)
+    created_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('survey_area', 'requesting_org')]
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.requesting_org.code} → {self.survey_area} [{self.status}]"
+
+
 class TemporaryLayer(models.Model):
     """User-uploaded scratch layers (KML/KMZ/GeoJSON/Shapefile ZIP) for ad-hoc map viewing.
     Stored separately from project GISFeature data — no project association required.
@@ -602,14 +647,41 @@ class TemporaryLayer(models.Model):
         (SHAPEFILE, 'Shapefile (ZIP)'),
     ]
 
-    name          = models.CharField(max_length=200)
-    purpose       = models.CharField(max_length=500, blank=True)
-    description   = models.TextField(blank=True)
-    file_format   = models.CharField(max_length=20, choices=FORMAT_CHOICES)
-    file          = models.FileField(upload_to='temp_layers/')
-    geojson       = models.JSONField(null=True, blank=True)
-    feature_count = models.IntegerField(default=0)
-    uploaded_by   = models.ForeignKey(
+    # Purpose choices
+    PURPOSE_NOC   = 'NOC_WORKING_PERMISSION'
+    PURPOSE_PM    = 'PM_GATI_SHAKTI'
+    PURPOSE_OTHER = 'OTHER'
+    PURPOSE_CHOICES = [
+        (PURPOSE_NOC,   'NOC Working Permission'),
+        (PURPOSE_PM,    'PM GatiShakti'),
+        (PURPOSE_OTHER, 'Other'),
+    ]
+
+    # Land rights choices
+    LR_LICENSE    = 'LICENSE'
+    LR_LEASE      = 'LEASE'
+    LR_PERMANENT  = 'PERMANENT_TRANSFER'
+    LR_OTHER      = 'OTHER'
+    LAND_RIGHTS_CHOICES = [
+        (LR_LICENSE,   'License'),
+        (LR_LEASE,     'Lease'),
+        (LR_PERMANENT, 'Permanent Transfer'),
+        (LR_OTHER,     'Other'),
+    ]
+
+    name             = models.CharField(max_length=200)
+    purpose          = models.CharField(max_length=500, blank=True)   # legacy free-text, kept for compat
+    purpose_type     = models.CharField(max_length=50, blank=True, choices=PURPOSE_CHOICES)
+    purpose_other    = models.CharField(max_length=500, blank=True)
+    land_rights_type = models.CharField(max_length=50, blank=True, choices=LAND_RIGHTS_CHOICES)
+    land_rights_other= models.CharField(max_length=500, blank=True)
+    description      = models.TextField(blank=True)
+    file_format      = models.CharField(max_length=20, choices=FORMAT_CHOICES)
+    file             = models.FileField(upload_to='temp_layers/')
+    geojson          = models.JSONField(null=True, blank=True)
+    feature_count    = models.IntegerField(default=0)
+    analysis_result  = models.JSONField(null=True, blank=True)
+    uploaded_by      = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
         related_name='temp_layers'
     )
@@ -620,3 +692,15 @@ class TemporaryLayer(models.Model):
 
     def __str__(self):
         return f"{self.name} [{self.file_format}] by {self.uploaded_by}"
+
+    @property
+    def effective_purpose(self):
+        if self.purpose_type == self.PURPOSE_OTHER:
+            return self.purpose_other
+        return dict(self.PURPOSE_CHOICES).get(self.purpose_type, self.purpose or '')
+
+    @property
+    def effective_land_rights(self):
+        if self.land_rights_type == self.LR_OTHER:
+            return self.land_rights_other
+        return dict(self.LAND_RIGHTS_CHOICES).get(self.land_rights_type, '')

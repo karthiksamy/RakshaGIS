@@ -23,7 +23,6 @@ DARK_TEXT = '1A1A2E'
 
 
 def rgb(hex_str: str) -> RGBColor:
-    """Convert 6-char hex string to RGBColor."""
     return RGBColor(int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16))
 
 
@@ -38,7 +37,6 @@ def set_cell_bg(cell, hex_color: str):
 
 
 def add_h_rule(doc, color=NAVY, thick='6'):
-    """Add a full-width horizontal rule paragraph."""
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after  = Pt(8)
@@ -63,7 +61,6 @@ def add_heading(doc, text, level=1):
     if level == 1:
         run.font.size = Pt(15)
         run.font.color.rgb = rgb(NAVY)
-        # underline rule
         pPr = p._p.get_or_add_pPr()
         pBdr = OxmlElement('w:pBdr')
         bottom = OxmlElement('w:bottom')
@@ -161,7 +158,6 @@ def add_table(doc, rows, header=None, col_widths=None):
 # ─────────────────────────────────────────────────────────────────────────────
 doc = Document()
 
-# Page margins
 for section in doc.sections:
     section.top_margin    = Cm(2.0)
     section.bottom_margin = Cm(2.0)
@@ -218,9 +214,10 @@ doc.add_paragraph()
 add_body(doc,
     'RakshaGIS is a full-stack, self-hosted enterprise GIS platform developed for the Directorate '
     'General of Defence Estates (DGDE) to digitise, manage, review, and publish defence land surveys '
-    'across India. The system consolidates field surveying, internal approval workflows, AI-assisted '
-    'document processing, and map publishing into a single role-gated application — hosted entirely '
-    'on-premise with no dependency on commercial cloud services.')
+    'across India. The system consolidates field surveying, internal approval workflows, in-browser '
+    'document editing, AI-assisted document processing, and map publishing into a single role-gated '
+    'application — hosted entirely on-premise with zero dependency on commercial cloud services or '
+    'internet access after initial installation.')
 
 # ── 2. Objective ──────────────────────────────────────────────────────────────
 add_heading(doc, '2. Objective of the Project', level=1)
@@ -234,18 +231,25 @@ for label, detail in [
     ('Digitise land surveys',
      'Replace paper-based field surveys with an interactive web GIS that lets authorised surveyors draw, '
      'annotate, and submit georeferenced features directly from their workstations.'),
-    ('Enforce a formal approval chain',
+    ('Enforce a formal, survey-area-wise approval chain',
      'Implement a role-based state machine (Draft → Submitted → Under Review → Approved → Published) '
-     'so that no survey data reaches the public record without passing through Checker and Approver review.'),
+     'operating at the survey-area (pocket) level, so different pockets within the same project can '
+     'progress independently through Checker and Approver review.'),
     ('Maintain data sovereignty',
      'Keep all spatial data, documents, and AI inference within DGDE infrastructure — '
-     'no data ever leaves the on-premise deployment.'),
+     'no data ever leaves the on-premise deployment. The system operates fully offline after '
+     'initial installation on a dedicated secure line.'),
+    ('Organisation-wise data isolation',
+     'Enforce strict row-level data isolation so each office (DEO/CEO/ADEO) sees only its own data, '
+     'while PDDE offices see their command jurisdiction and DGDE has all-India visibility. '
+     'Controlled cross-org access is available via a formal request-and-approval mechanism.'),
     ('Provide spatial analytics',
-     'Enable buffer analysis, topology checking, and version comparison in the browser, '
+     'Enable buffer analysis, topology checking, version comparison, and COG raster overlay in the browser, '
      'eliminating the need for separate GIS software licences such as ArcGIS.'),
     ('AI-assisted reporting',
-     'Automatically summarise uploaded survey documents and generate structured PDF reports '
-     'using a local large language model (Ollama) — without internet access or API subscriptions.'),
+     'Automatically summarise uploaded survey documents and generate structured reports '
+     'using a local large language model (Ollama / LocalAI) — without internet access or API subscriptions. '
+     'Generated reports open directly in an integrated online document editor.'),
     ('Scalable multi-organisation support',
      'Support a five-level organisational hierarchy (DGDE → PDDE → DEO → CEO → ADEO) '
      'with per-organisation row-level data isolation and delegated administration.'),
@@ -259,6 +263,9 @@ add_heading(doc, '3. Key Features / Work Done', level=1)
 add_heading(doc, '3.1  Interactive Map & Spatial Analysis', level=2)
 for text in [
     'Multi-basemap support — OSM, XYZ tile layers, WMS/WMTS, and Bhuvan (ISRO) satellite imagery.',
+    'Local offline raster tile server — India OSM tiles served by overv/openstreetmap-tile-server after '
+    'one-time import (./build.sh --import-osm, ~800 MB India PBF from Geofabrik). '
+    'No internet required after import; tiles cached with 7-day immutable headers.',
     'Feature drawing with snapping: Point, Line, and Polygon tools with snap-to-vertex and live area/perimeter feedback while drawing.',
     'Edit existing features — move and reshape vertices; changes are automatically persisted to the database.',
     'Box Select tool — drag a rectangle to highlight features; selected count shown in an overlay badge.',
@@ -275,65 +282,140 @@ for text in [
     'Per-layer symbology — colour picker per layer name; label toggle renders feature IDs as map text.',
     'Admin boundary tile overlay from pg_tileserv (MapVector Tile) showing District boundaries.',
     'Undo last drawn feature — removes from map source and calls DELETE on the backend.',
+    'Auto-load: the map remembers the last active project across browser sessions so layers are visible immediately on open without manual project selection.',
 ]:
     add_plain_bullet(doc, text)
 
 # 3.2
-add_heading(doc, '3.2  Survey Workflow & Versioning', level=2)
+add_heading(doc, '3.2  Survey Workflow — Survey-Area-Wise Approval', level=2)
+add_body(doc,
+    'A key architectural principle of RakshaGIS is that workflow operates at the survey-area (pocket) level, '
+    'not at the project level. This means different sections of the same project can progress through '
+    'Checker and Approver review independently.')
 for text in [
-    'State machine: DRAFT → SUBMITTED → UNDER_REVIEW → APPROVED → PUBLISHED with RETURNED return paths at each stage.',
-    'Role-based transitions: only the correct role can advance or return a project at each stage.',
-    'Versioned layer folders: Phase → Zone → Year → Ver-I / Ver-II / … / Final, auto-created on first use.',
-    'Auto-versioning: active version detected or created automatically when an SDO opens a project; one-click next-version creation.',
-    'Final folder auto-created and populated (features copied) when a project is approved.',
-    'Version comparison: split-screen map view comparing two VERSION folders side-by-side with shared pan/zoom.',
+    'Survey Areas: SDOs/Surveyors create named survey areas within a project and link each area to a '
+    'project folder; the workflow tracks that pocket individually.',
+    'State machine per area: DRAFT → SUBMITTED → UNDER_REVIEW → APPROVED → PUBLISHED, with RETURNED return paths at each stage.',
+    'Role-based transitions: SDO/Surveyor submits to Checker; Checker sends to Approver or returns to SDO with mandatory remarks; Approver approves or returns from review; DEO Admin publishes.',
+    'Mandatory remarks on return: Return transitions require a remarks field so the submitter understands what to correct.',
+    'Folder lock on submission: when a survey area is submitted, its linked folder and all descendant sub-folders (Doc, Shapefile, Raster) are immediately read-only — no draw, edit, delete, upload, or import operations are allowed until the area is returned for revision.',
+    'Visual lock indicators: locked folders display a gold lock icon in the folder tree; the map toolbar hides all write tools and shows a banner.',
+    'Per-area audit log: every transition, with actor, remarks, and timestamp, is displayed inline on each survey area card in the project detail page.',
+    'In-app notifications: all affected users are notified on every state transition.',
+    'Versioned layer folders: Phase → Zone → Year → Ver-I / Ver-II / … / Final, auto-created on first use. Active version is detected or created automatically; Final folder is auto-created and features are copied when a survey area is approved.',
     'Project sharing: grant read access to specific users outside the creating organisation.',
-    'Full audit log: every state transition, feature edit, and admin action recorded with actor, timestamp, and comment.',
-    'In-app notifications: users are notified when a project is submitted, returned, or approved.',
 ]:
     add_plain_bullet(doc, text)
 
 # 3.3
-add_heading(doc, '3.3  User & Organisation Management', level=2)
+add_heading(doc, '3.3  Version Comparison — Split-Screen Map', level=2)
 for text in [
-    'Five-level organisation hierarchy: DGDE → PDDE → DEO → CEO → ADEO.',
-    'Eight distinct roles with fine-grained permission classes on every API endpoint.',
-    'Organisation records extended with Office ID, Officer Name, contact fields, and State/District linkage with cascade-validated dropdowns.',
-    'Admin-role protection: DEO/CEO/ADEO/SUPERADMIN accounts cannot be deleted or deactivated — prevents lockout.',
-    'Force-logout action sets is_active=False; JWT tokens become invalid immediately without token blacklist overhead.',
-    'Password management: users change own password with current-password verification; admins set any non-admin user\'s password.',
+    'Split-screen map view comparing any two VERSION folders within a project side-by-side.',
+    'Shared OpenLayers View instance — panning or zooming one panel automatically mirrors the other.',
+    'Version A features rendered in blue; Version B in orange for instant visual diff.',
+    'Version selectors: dropdowns listing only VERSION-type folders in the project.',
 ]:
     add_plain_bullet(doc, text)
 
 # 3.4
-add_heading(doc, '3.4  Master Data Management (SuperAdmin)', level=2)
+add_heading(doc, '3.4  Organisation-Wise Data Isolation & Cross-Org Access', level=2)
+add_body(doc,
+    'All data in RakshaGIS is scoped strictly to the user\'s organisation. '
+    'A controlled request-and-approval mechanism allows DEO offices to request read access '
+    'to specific survey areas from neighbouring CEO/ADEO offices under the same PDDE command.')
 for text in [
-    'Full CRUD for State, District, Taluk, and Village with cascading dropdowns.',
-    'PostGIS geometry fields on each hierarchy level — boundaries can be visualised on the map.',
-    'SUPERADMIN-only access enforced at API and UI level.',
+    'Strict data isolation: each organisation (DEO/CEO/ADEO) can only see its own projects, survey areas, features, folders, and documents.',
+    'DGDE (SUPERADMIN/VIEWER): all-India access — reads all organisations\' data.',
+    'PDDE (PDDE_VIEWER): command-level access — reads all data within own jurisdiction subtree.',
+    'DEO / CEO / ADEO: own-organisation data only by default.',
+    'Cross-org access requests: DEO browses a discovery list of sibling-org survey areas (metadata only — name, organisation, status; no GIS data) and submits a formal access request with reason.',
+    'Approval flow: request goes to the target org\'s admin; once approved, requesting org can view features, folders, and documents for that survey area.',
+    'Access Requests page: three-tab UI — Discover Areas (sibling orgs under same PDDE), My Requests (outgoing with status), Incoming Requests (admin-only with Approve/Reject and mandatory remarks).',
+    'Pending badge: sidebar "Data Access" item shows a live count of pending incoming requests for admins, refreshed every 60 seconds.',
+    'ProjectShare: projects can also be shared directly to specific users for read access.',
 ]:
     add_plain_bullet(doc, text)
 
 # 3.5
-add_heading(doc, '3.5  Documents & AI Assistant', level=2)
+add_heading(doc, '3.5  Online Document Editing (OnlyOffice)', level=2)
+add_body(doc,
+    'RakshaGIS integrates OnlyOffice Community Document Server as a self-hosted, fully offline '
+    'document editor. Users can view and edit Word, Excel, PowerPoint, and PDF files directly '
+    'in the browser without any external service.')
 for text in [
-    'Per-project document upload (PDF, images) with MIME-type validation using python-magic.',
-    'Background AI processing via Ollama — text extracted by pdfplumber, summarised by the local LLM.',
-    'Auto-generated structured PDF survey report per project.',
-    'Interactive chat interface: users ask free-text questions; the local LLM answers with project document context.',
-    'All AI inference runs on-premise — no data leaves the deployment host.',
+    'OnlyOffice Community Document Server 8.2.2 runs as a Docker service within the internal network — no licence, no registration, no internet connection.',
+    'Supports .docx, .odt, .xls, .xlsx, .pptx, .ppt, .pdf — full editing capability for all office formats.',
+    'JWT-signed configuration: Django generates a PyJWT-signed editor config for each document open; OnlyOffice validates the token before serving the editor.',
+    'Edit callback: when a user saves a document in OnlyOffice, the updated file is automatically downloaded by Django and saved back (version incremented, file overwritten).',
+    'AI-generated survey reports open directly in OnlyOffice for review and annotation without downloading.',
+    'Any document in a project\'s folder tree can be opened with a single click on the OnlyOffice icon next to supported file types.',
+    'Full-screen embedded editor (95vw × 90vh modal) with fallback download button if the editor cannot load.',
+    'OnlyOffice spell-check and telemetry are disabled for fully offline operation.',
 ]:
     add_plain_bullet(doc, text)
 
 # 3.6
-add_heading(doc, '3.6  Infrastructure & DevOps', level=2)
+add_heading(doc, '3.6  User & Organisation Management', level=2)
 for text in [
-    'Fully containerised via Docker Compose: PostgreSQL/PostGIS, Redis, Celery workers, Gunicorn, Nginx, pg_tileserv, Ollama, Prometheus, Grafana.',
+    'Five-level organisation hierarchy: DGDE → PDDE → DEO → CEO → ADEO.',
+    'Ten distinct roles: SUPERADMIN, PDDE_VIEWER, VIEWER, DEO_ADMIN, CEO_ADMIN, ADEO_ADMIN, SDO, SURVEYOR, CHECKER, APPROVER — with fine-grained permission classes on every API endpoint.',
+    'Organisation records extended with Office ID (5-character alphanumeric code), Officer Name, mobile, landline, email, address, pincode, State and District linkage with cascade-validated dropdowns.',
+    'Admin-role protection: DEO/CEO/ADEO/SUPERADMIN accounts cannot be deleted or deactivated — prevents accidental system lockout.',
+    'Force-logout action sets is_active=False; JWT tokens become invalid immediately on the next request without any token blacklist database overhead.',
+    'Password management: users change own password with current-password verification; admins can set any non-admin user\'s password; separate "Change My Password" endpoint in the header dropdown.',
+]:
+    add_plain_bullet(doc, text)
+
+# 3.7
+add_heading(doc, '3.7  Master Data Management (SuperAdmin)', level=2)
+for text in [
+    'Full CRUD for State, District, Taluk, and Village with cascading dropdowns (selecting a State filters Districts, selecting a District filters Taluks, and so on).',
+    'PostGIS geometry fields on each hierarchy level — boundaries can be stored and visualised on the map.',
+    'SUPERADMIN-only access enforced at API and UI level.',
+    'Dedicated master data pages: /master/states, /master/districts, /master/taluks, /master/villages.',
+]:
+    add_plain_bullet(doc, text)
+
+# 3.8
+add_heading(doc, '3.8  Documents & AI Assistant', level=2)
+for text in [
+    'Per-project document upload (PDF, images) with MIME-type validation using python-magic.',
+    'Background AI processing via Ollama — text extracted by pdfplumber, summarised by the local LLM.',
+    'Auto-generated structured survey report per project; report opens directly in the OnlyOffice editor for review and annotation.',
+    'Interactive chat interface: users ask free-text questions; the local LLM answers with project document context.',
+    'Multiple AI backend options selectable via Docker Compose profiles: Ollama, LocalAI (AIO CPU/GPU), llama.cpp (CPU/GPU), AnythingLLM — all on-premise, all offline.',
+    'AI model downloads are a one-time SuperAdmin task after installation; no internet access required thereafter.',
+    'All AI inference runs on-premise — no data leaves the deployment host.',
+]:
+    add_plain_bullet(doc, text)
+
+# 3.9
+add_heading(doc, '3.9  UI Themes', level=2)
+for text in [
+    'Six built-in themes: Dark, Light, Navy, Forest, Midnight, Saffron.',
+    'All UI surfaces — header, sidebar, drawers, map panels — use CSS custom properties (--bg-base, --bg-card, --accent, etc.) ensuring complete theme coverage.',
+    'Theme selection persisted in localStorage across sessions.',
+]:
+    add_plain_bullet(doc, text)
+
+# 3.10
+add_heading(doc, '3.10  Infrastructure, DevOps & Offline Operation', level=2)
+add_body(doc,
+    'RakshaGIS is designed for fully offline operation on a dedicated secure line after initial installation. '
+    'No service requires internet access during normal operation.')
+for text in [
+    'Fully containerised via Docker Compose: PostgreSQL/PostGIS 16, Redis 7, Celery workers, Gunicorn, Nginx 1.27, pg_tileserv, OnlyOffice 8.2.2.',
+    'Two-network Docker design: raksha-net (internal: true) blocks outbound internet from all backend containers; raksha-edge (external) is attached to nginx only, enabling port 80/443 publishing to clients.',
+    'All Docker image versions pinned — build.sh --save-images bundles all images into a single archive for air-gapped deployment; --load-images restores them on the target machine without any internet access.',
+    'Local offline raster tile server (overv/openstreetmap-tile-server:2.3.0) in compose profile "osm" — started automatically after build.sh --import-osm; serves India OSM tiles at /osm-tiles/{z}/{x}/{y}.png.',
+    'India PBF import (./build.sh --import-osm): downloads india-latest.osm.pbf from Geofabrik (~800 MB, one-time), runs osm2pgsql import inside the tile server container (2–4 hours), then starts the osm-tiles service.',
+    'Certbot (HTTPS) in profile "https" — not started on dedicated/intranet deployments; suitable for public-domain SSL activation when needed.',
+    'Prometheus + Grafana in profile "monitoring" — not started by default; enable for Phase 5 dashboard setup.',
     'build.sh — smart Docker image build that skips rebuilding when Dockerfile and requirements are unchanged (SHA-256 hash comparison).',
     'RakshaGIS.sh — one-command service manager: start, stop, status, logs, backup, restore, Django management commands.',
-    'Prometheus + Grafana dashboards for request rates, error rates, and database query counts.',
-    'Certbot integration in docker-compose for automatic HTTPS certificate renewal.',
     'Layer exports: GeoJSON, Shapefile, CSV, KML, GeoPackage via Fiona/Shapely.',
+    'django-prometheus metrics exposed at /metrics/ for Prometheus scraping.',
+    'extra_hosts: host.docker.internal:host-gateway — allows containers to reach Ollama running on the host machine even with internal networking.',
 ]:
     add_plain_bullet(doc, text)
 
@@ -341,34 +423,37 @@ for text in [
 add_heading(doc, '4. Technologies / Tools Used', level=1)
 
 tech_rows = [
-    ('Backend framework',    'Python 3.11 + Django 4.2',         'REST API, ORM, authentication'),
-    ('REST API layer',       'Django REST Framework 3.15',        'Serialisers, viewsets, permissions'),
-    ('Spatial database',     'PostgreSQL 16 + PostGIS 3.4',       'Geometry storage, spatial queries, topology'),
-    ('Async task queue',     'Celery 5.3 + Redis 7',              'COG conversion, shapefile import, AI tasks'),
-    ('Map tile server',      'pg_tileserv',                       'MVT admin boundary tiles from PostGIS'),
-    ('AI / LLM inference',   'Ollama (local — e.g. Llama 3.2)',  'Document summarisation, chat, report generation'),
-    ('PDF text extraction',  'pdfplumber 0.11',                   'Extracts text from uploaded survey PDFs'),
-    ('GIS import/export',    'Fiona 1.9 + Shapely 2.0',          'Shapefile I/O, GeoJSON, KML, GeoPackage'),
-    ('HTTP client',          'httpx 0.27',                        'Ollama API calls from Django'),
-    ('Frontend framework',   'React 18 + TypeScript + Vite',     'SPA, type safety, fast HMR builds'),
-    ('Map library',          'OpenLayers 10.2',                   'Interactive map, vector/raster/MVT layers'),
-    ('UI component library', 'Ant Design 5.20',                   'Tables, forms, modals, drawers, pickers'),
-    ('State management',     'Zustand 4.5 + TanStack Query 5',   'Global UI state, server-state caching'),
-    ('PDF generation',       'jsPDF 4.2 + jspdf-autotable 5',    'Print layout, buffer analysis PDF export'),
-    ('Excel export',         'SheetJS (xlsx) 0.18',              'Buffer analysis Excel workbook'),
-    ('Map canvas capture',   'html2canvas 1.4',                   'OL canvas to image for PDF embedding'),
-    ('COG display',          'geotiff.js 3.0.5',                  'WebGLTileLayer Cloud-Optimized GeoTIFF'),
-    ('Authentication',       'SimpleJWT 5.3',                     'Short-lived access + rotating refresh tokens'),
-    ('Monitoring',           'Prometheus + Grafana',              'Metrics collection, dashboards, alerting'),
-    ('Web server',           'Nginx + Gunicorn (4 workers)',      'Reverse proxy, static file serving, HTTPS'),
-    ('Containerisation',     'Docker 24 + Docker Compose v2',    'Isolated, reproducible on-premise deployment'),
-    ('API documentation',    'drf-spectacular 0.27',              'OpenAPI 3 schema + Swagger UI'),
-    ('File validation',      'python-magic 0.4',                  'MIME-type check on all uploaded files'),
+    ('Backend framework',     'Python 3.11 + Django 4.2',              'REST API, ORM, authentication'),
+    ('REST API layer',        'Django REST Framework 3.15',             'Serialisers, viewsets, permissions'),
+    ('Spatial database',      'PostgreSQL 16 + PostGIS 3.4',            'Geometry storage, spatial queries, topology'),
+    ('Async task queue',      'Celery 5.3 + Redis 7',                   'COG conversion, shapefile import, AI tasks'),
+    ('Vector tile server',    'pg_tileserv',                            'MVT admin boundary tiles from PostGIS'),
+    ('Raster tile server',    'overv/openstreetmap-tile-server 2.3.0',  'Offline India OSM raster tiles'),
+    ('Document editor',       'OnlyOffice Community Server 8.2.2',      'In-browser Word/Excel/PPT/PDF editing'),
+    ('AI / LLM inference',    'Ollama, LocalAI, llama.cpp, AnythingLLM','Local document summarisation and chat (profile-selectable)'),
+    ('PDF text extraction',   'pdfplumber 0.11',                        'Extracts text from uploaded survey PDFs'),
+    ('GIS import/export',     'Fiona 1.9 + Shapely 2.0',               'Shapefile I/O, GeoJSON, KML, GeoPackage'),
+    ('HTTP client',           'httpx 0.27',                             'Ollama / LocalAI API calls from Django'),
+    ('Frontend framework',    'React 18 + TypeScript + Vite',          'SPA, type safety, fast HMR builds'),
+    ('Map library',           'OpenLayers 10.2',                        'Interactive map, vector/raster/MVT layers'),
+    ('UI component library',  'Ant Design 5.20',                        'Tables, forms, modals, drawers, pickers'),
+    ('State management',      'Zustand 4.5 + TanStack Query 5',        'Global UI state, server-state caching'),
+    ('PDF generation',        'jsPDF 4.2 + jspdf-autotable 5',         'Print layout, buffer analysis PDF export'),
+    ('Excel export',          'SheetJS (xlsx) 0.18',                   'Buffer analysis Excel workbook'),
+    ('Map canvas capture',    'html2canvas 1.4',                        'OL canvas to image for PDF embedding'),
+    ('COG display',           'geotiff.js 3.0.5',                       'WebGLTileLayer Cloud-Optimized GeoTIFF'),
+    ('JWT authentication',    'SimpleJWT 5.3',                          'Short-lived access + rotating refresh tokens'),
+    ('JWT document signing',  'PyJWT 2.x',                             'OnlyOffice editor config + callback signing'),
+    ('Monitoring',            'Prometheus v2.55.1 + Grafana 11.4.2',   'Metrics collection, dashboards, alerting'),
+    ('Web server',            'Nginx 1.27 + Gunicorn (4 workers)',      'Reverse proxy, static file serving'),
+    ('Containerisation',      'Docker 24 + Docker Compose v2',         'Isolated, reproducible on-premise deployment'),
+    ('API documentation',     'drf-spectacular 0.27',                   'OpenAPI 3 schema + Swagger UI'),
+    ('File validation',       'python-magic 0.4',                       'MIME-type check on all uploaded files'),
 ]
 
 add_table(doc, tech_rows,
           header=('Category', 'Technology / Version', 'Purpose'),
-          col_widths=[1.6, 2.2, 2.8])
+          col_widths=[1.6, 2.4, 2.6])
 
 # ── 5. Expected Outcomes / Benefits ──────────────────────────────────────────
 add_heading(doc, '5. Expected Outcomes / Benefits', level=1)
@@ -377,27 +462,38 @@ for label, detail in [
     ('End-to-end digital survey workflow',
      'Eliminates paper-based submission and manual data entry. Surveys are drawn, reviewed, and published '
      'entirely within the platform — reducing processing time from weeks to days.'),
+    ('Granular, pocket-level approval',
+     'The survey-area-wise workflow means different sections of the same project can progress independently '
+     'through Checker and Approver sign-off, avoiding bottlenecks where a single large project blocks all work.'),
     ('Accurate, versioned spatial data',
      'Every edit is tied to a named version (Ver-I, Ver-II, Final); no data is overwritten, '
      'enabling full roll-back and side-by-side version comparison.'),
     ('Enforced approval chain',
      'The state machine prevents publication without Checker and Approver sign-off, '
      'reducing the risk of unauthorised or incomplete surveys entering the public record.'),
-    ('Data sovereignty and security',
-     'All data, including AI inference, remains within DGDE infrastructure. '
-     'Role-based access and row-level isolation prevent cross-organisation data leakage.'),
+    ('Data integrity through folder locking',
+     'Once a survey area is submitted, its entire folder tree is read-only — preventing concurrent edits '
+     'that could corrupt the submitted dataset during review.'),
+    ('Strict data sovereignty',
+     'All data, including AI inference and document editing, remains within DGDE infrastructure. '
+     'Row-level data isolation prevents cross-organisation data leakage. '
+     'The system runs fully offline after installation on a dedicated secure line.'),
+    ('Controlled cross-org collaboration',
+     'The access request mechanism allows DEO offices to formally request and receive read access to '
+     'specific survey areas from neighbouring CEO/ADEO offices — enabling data sharing without '
+     'compromising isolation for other areas.'),
+    ('Seamless document workflows',
+     'OnlyOffice integration eliminates the download-edit-re-upload cycle. AI-generated reports '
+     'open directly in the editor for review, annotation, and sign-off within the same browser tab.'),
     ('Reduced GIS software dependency',
      'Buffer analysis, topology checking, feature editing, print-to-PDF, and attribute management — '
      'capabilities previously requiring ArcGIS licences — are now available in any modern browser.'),
     ('AI-assisted productivity',
      'Automatic document summarisation and report generation reduce the time an Approver needs '
      'to review a project from hours to minutes.'),
-    ('Operational visibility',
-     'Prometheus and Grafana dashboards give IT staff real-time insight into system health; '
-     'the audit log provides a complete chain of custody for every record.'),
     ('Low operational overhead',
-     'Docker Compose deployment, the smart build script, and the single-command service manager '
-     'allow a small IT team to maintain the platform without specialist DevOps knowledge.'),
+     'Docker Compose deployment, smart build script, air-gapped image archive, and single-command service '
+     'manager allow a small IT team to maintain the platform without specialist DevOps knowledge.'),
 ]:
     add_bullet(doc, label, detail, ACCENT)
 
@@ -412,12 +508,21 @@ for label, detail in [
     ('Mobile field surveying app',
      'A Progressive Web App (PWA) or React Native client for GPS-assisted feature capture '
      'in the field with offline sync on reconnection.'),
+    ('HTTPS with internal CA',
+     'Activate Nginx TLS using a DGDE internal Certificate Authority certificate. '
+     'The docker-compose "https" profile and certbot service are already prepared.'),
+    ('Prometheus / Grafana dashboards',
+     'Configure Prometheus scrape targets and import DGDE-specific Grafana dashboards '
+     'for request rates, error rates, PostGIS query counts, and Celery queue depth.'),
     ('Automated boundary dispute detection',
      'Cross-project spatial analysis to flag when newly submitted features overlap with '
      'PUBLISHED features from other organisations — surfaced as a pre-submission check.'),
     ('Advanced AI integration',
      'Fine-tuning the local LLM on historical DGDE survey documents for domain-specific accuracy; '
      'adding vision models to auto-extract parcel boundaries from scanned paper maps.'),
+    ('Admin boundary data load',
+     'Import state, district, taluk, and village shapefiles into the master data tables '
+     'to enable spatial filtering and boundary overlay on the map.'),
     ('3D terrain and elevation overlay',
      'Integration of SRTM/Cartosat DEM data for 3D map views and slope/aspect analysis '
      'using Cesium.js or OpenLayers 3D extensions.'),
@@ -434,8 +539,8 @@ for label, detail in [
      'Integration with DGDE\'s internal PKI for mutual TLS client certificate login, '
      'replacing password-based authentication for high-security operations.'),
     ('Automated disaster-recovery backups',
-     'Scheduled encrypted PostgreSQL dumps pushed to NIC Meghraj cloud object storage '
-     'for off-site recovery without manual intervention.'),
+     'Scheduled encrypted PostgreSQL dumps with automated rotation and optional push '
+     'to NIC Meghraj cloud object storage for off-site recovery.'),
     ('Regulatory report automation',
      'Pre-built report templates that automatically compile survey statistics, ownership summaries, '
      'and encroachment analysis into ministry-prescribed formats.'),

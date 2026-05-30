@@ -413,3 +413,251 @@ def process_shapefile_ai(self, task_id: int):
     finally:
         task.completed_at = timezone.now()
         task.save(update_fields=['status', 'result', 'error_message', 'completed_at'])
+
+
+# ── RAG: Document Embedding ───────────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=1, name='ai_assistant.embed_document')
+def embed_document(self, task_id: int):
+    """
+    Chunk a document's extracted text and generate embeddings via Ollama.
+    Stores DocumentChunk records for RAG retrieval.
+    """
+    from apps.ai_assistant.models import AITask, DocumentChunk
+    from apps.ai_assistant.services import LLMService, chunk_text
+    from apps.documents.models import Document
+
+    task = AITask.objects.get(id=task_id)
+    task.status = AITask.RUNNING
+    task.save(update_fields=['status'])
+
+    try:
+        doc_id   = task.input_data['document_id']
+        model    = task.input_data.get('embed_model', 'nomic-embed-text')
+        doc      = Document.objects.select_related('project').get(id=doc_id)
+        text     = doc.ai_extracted_text or ''
+
+        if not text.strip():
+            task.status = AITask.DONE
+            task.result = {'chunks': 0, 'reason': 'No extracted text found. Run AI processing first.'}
+            task.completed_at = timezone.now()
+            task.save(update_fields=['status', 'result', 'completed_at'])
+            return
+
+        chunks = chunk_text(text, chunk_size=500, overlap=60)
+        svc    = LLMService()
+
+        # Delete existing chunks for this document
+        DocumentChunk.objects.filter(document=doc).delete()
+
+        created = 0
+        for idx, chunk_text_str in enumerate(chunks):
+            embedding = svc.get_embedding(chunk_text_str, model=model)
+            DocumentChunk.objects.create(
+                document=doc,
+                project=doc.project,
+                chunk_index=idx,
+                text=chunk_text_str,
+                embedding=embedding,
+                embed_model=model,
+            )
+            created += 1
+
+        task.status = AITask.DONE
+        task.result = {'chunks_created': created, 'model': model, 'doc_title': doc.title}
+    except Exception as exc:
+        task.status = AITask.FAILED
+        task.error_message = str(exc)
+    finally:
+        task.completed_at = timezone.now()
+        task.save(update_fields=['status', 'result', 'error_message', 'completed_at'])
+
+
+# ── Vision: Boundary Extraction ───────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=0, name='ai_assistant.extract_map_boundaries')
+def extract_map_boundaries(self, job_id: int):
+    """
+    Send a scanned map image to a vision LLM (LLaVA / Ollama) and parse
+    the response into parcel metadata + draft GeoJSON features.
+    """
+    import base64
+    from datetime import timezone as dt_tz
+    from datetime import datetime
+
+    from apps.ai_assistant.models import BoundaryExtractionJob
+    from apps.ai_assistant.services import LLMService
+
+    job = BoundaryExtractionJob.objects.select_related('source_document', 'project').get(id=job_id)
+    job.status = BoundaryExtractionJob.RUNNING
+    job.save(update_fields=['status'])
+
+    EXTRACTION_PROMPT = """You are analysing a scanned paper land survey / cadastral map from India
+(DGDE Defence Estates). Extract all visible parcel and boundary information.
+
+Return a JSON object with this exact structure:
+{
+  "map_info": {
+    "title": "survey title or null",
+    "scale": "e.g. 1:2000 or null",
+    "district": "district name or null",
+    "taluk": "taluk/tehsil name or null",
+    "village": "village name or null",
+    "date": "date on the map or null",
+    "surveyor": "surveyor name or null",
+    "north_arrow": "up/down/left/right/tilted or null"
+  },
+  "parcels": [
+    {
+      "survey_number": "plot/survey number visible on map",
+      "area_text": "area as written on map (e.g. '2.5 ha' or '0.35 acres')",
+      "shape": "rectangular/irregular/triangular/L-shaped/etc",
+      "owner_text": "any ownership text visible",
+      "adjacent_surveys": ["list of adjacent survey numbers"],
+      "notes": "any other text inside this parcel"
+    }
+  ],
+  "boundary_notes": "any notes about boundary line types, disputed areas, etc.",
+  "scale_bar_visible": true,
+  "grid_lines_visible": false,
+  "overall_notes": "general observations about the map quality and content"
+}
+
+Return ONLY valid JSON. No explanation text before or after the JSON."""
+
+    try:
+        # Get image bytes
+        image_bytes = None
+        if job.source_document and job.source_document.file:
+            with open(job.source_document.file.path, 'rb') as f:
+                image_bytes = f.read()
+        elif job.source_image:
+            with open(job.source_image.path, 'rb') as f:
+                image_bytes = f.read()
+
+        if not image_bytes:
+            raise ValueError('No image file found for this extraction job.')
+
+        image_b64 = base64.b64encode(image_bytes).decode()
+
+        svc = LLMService()
+        raw = svc.vision_analyze(image_b64, EXTRACTION_PROMPT, model=job.vision_model)
+        job.raw_response = raw
+
+        # Parse JSON from the response
+        parsed = _parse_json_from_text(raw)
+        job.parsed_result = parsed
+
+        # Build draft GeoJSON features from parcel descriptions
+        # Since we have no coordinate data from scanned maps, we create point features
+        # at the project's centroid area — user must georeference manually
+        draft = []
+        if parsed and 'parcels' in parsed:
+            for i, parcel in enumerate(parsed['parcels']):
+                draft.append({
+                    'type': 'Feature',
+                    'geometry': None,  # No coordinates — requires manual georeferencing
+                    'properties': {
+                        'survey_number': parcel.get('survey_number', f'parcel_{i+1}'),
+                        'area_text': parcel.get('area_text', ''),
+                        'shape': parcel.get('shape', ''),
+                        'owner_text': parcel.get('owner_text', ''),
+                        'adjacent_surveys': parcel.get('adjacent_surveys', []),
+                        'notes': parcel.get('notes', ''),
+                        'source': 'vision_extraction',
+                        'needs_georeferencing': True,
+                    },
+                })
+        job.draft_features = draft
+
+        job.status = BoundaryExtractionJob.DONE
+    except Exception as exc:
+        job.status = BoundaryExtractionJob.FAILED
+        job.error_log = str(exc)
+    finally:
+        job.completed_at = datetime.now(tz=dt_tz.utc)
+        job.save(update_fields=['status', 'raw_response', 'parsed_result',
+                                'draft_features', 'error_log', 'completed_at'])
+
+
+def _parse_json_from_text(text: str) -> dict:
+    """Extract JSON from a model response that may have surrounding text."""
+    text = text.strip()
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Find first { and last }
+    start = text.find('{')
+    end   = text.rfind('}')
+    if start != -1 and end != -1:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            pass
+    return {}
+
+
+# ── Training Dataset Export ───────────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=0, name='ai_assistant.export_training_dataset')
+def export_training_dataset(self, task_id: int):
+    """
+    Export project documents as instruction/response JSONL pairs suitable
+    for Ollama / llama.cpp LoRA fine-tuning.
+    Output file: /data/training/<project_id>_training.jsonl
+    """
+    import os
+    from django.conf import settings as dj_settings
+    from apps.ai_assistant.models import AITask
+    from apps.ai_assistant.services import DGDE_SYSTEM_PROMPT
+
+    task = AITask.objects.get(id=task_id)
+    task.status = AITask.RUNNING
+    task.save(update_fields=['status'])
+
+    try:
+        project_id = task.input_data['project_id']
+        from apps.survey_projects.models import SurveyProject
+        from apps.documents.models import Document
+
+        project = SurveyProject.objects.get(id=project_id)
+        docs = Document.objects.filter(project=project, ai_processed=True).exclude(ai_extracted_text='')
+
+        records = []
+        for doc in docs:
+            text = (doc.ai_extracted_text or '')[:3000]
+            if not text.strip():
+                continue
+            records.append({
+                'system': DGDE_SYSTEM_PROMPT,
+                'instruction': f"Summarise this survey document from project {project.project_number}: {doc.title}",
+                'response': doc.ai_summary or text[:500],
+            })
+            records.append({
+                'system': DGDE_SYSTEM_PROMPT,
+                'instruction': f"What key survey information is in this document?\n\n{text[:2000]}",
+                'response': doc.ai_summary or 'No summary available.',
+            })
+
+        output_dir = os.path.join(dj_settings.MEDIA_ROOT, 'training')
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f'{project_id}_training.jsonl')
+
+        with open(output_path, 'w') as f:
+            for rec in records:
+                f.write(json.dumps(rec) + '\n')
+
+        task.status = AITask.DONE
+        task.result = {
+            'record_count': len(records),
+            'output_file': output_path,
+            'note': 'Use this JSONL with `ollama create` or llama.cpp fine-tuning scripts.',
+        }
+    except Exception as exc:
+        task.status = AITask.FAILED
+        task.error_message = str(exc)
+    finally:
+        task.completed_at = timezone.now()
+        task.save(update_fields=['status', 'result', 'error_message', 'completed_at'])

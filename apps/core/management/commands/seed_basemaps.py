@@ -31,6 +31,18 @@ BASEMAPS = [
         'attribution': 'NRSC / ISRO Bhuvan',
         'is_system': True,
     },
+    {
+        # Served by the local openstreetmap-tile-server container.
+        # Requires one-time import: ./build.sh --import-osm
+        # Tiles are served at /osm-tiles/{z}/{x}/{y}.png via nginx proxy.
+        # Enable this basemap after running --import-osm.
+        'name': 'Local OSM (Offline)',
+        'provider': BasemapConfig.XYZ,
+        'url_template': '/osm-tiles/{z}/{x}/{y}.png',
+        'attribution': '© OpenStreetMap contributors (local tile server)',
+        'is_system': True,
+        'is_active': False,   # activate after running ./build.sh --import-osm
+    },
 ]
 
 

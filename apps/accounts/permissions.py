@@ -53,7 +53,7 @@ class CanEditProject(BasePermission):
         return request.user.is_authenticated and request.user.can_forward
 
     def has_object_permission(self, request, view, obj):
-        from apps.survey_projects.models import SurveyProject, ProjectLayerFolder, GISFeature
+        from apps.survey_projects.models import SurveyProject, ProjectLayerFolder, GISFeature, SurveyArea
         if request.method in SAFE_METHODS:
             return True
         user = request.user
@@ -66,6 +66,9 @@ class CanEditProject(BasePermission):
             return obj.project.organisation_id == user.organisation_id
         # GISFeature: org is via project
         if isinstance(obj, GISFeature):
+            return obj.project.organisation_id == user.organisation_id
+        # SurveyArea: org is via project (status guard is in perform_destroy/perform_update)
+        if isinstance(obj, SurveyArea):
             return obj.project.organisation_id == user.organisation_id
         # SurveyProject and other org-direct models
         editable_statuses = (SurveyProject.DRAFT, SurveyProject.RETURNED)
@@ -127,3 +130,23 @@ def org_queryset_filter(user, qs, org_field='organisation'):
     if user.role == User.PDDE_VIEWER:
         return qs.filter(**{f'{org_field}_id__in': user.organisation.get_subtree_ids()})
     return qs.filter(**{org_field: user.organisation})
+
+
+def get_shared_project_ids(user) -> list:
+    """Return IDs of projects shared to the user's org via ProjectShare grants."""
+    from apps.survey_projects.models import ProjectShare
+    return list(
+        ProjectShare.objects.filter(granted_to=user.organisation)
+        .values_list('project_id', flat=True)
+    )
+
+
+def get_approved_area_ids(user) -> list:
+    """Return IDs of survey areas this user's org has approved cross-org access to."""
+    from apps.survey_projects.models import SurveyAreaAccessRequest
+    return list(
+        SurveyAreaAccessRequest.objects.filter(
+            requesting_org=user.organisation,
+            status=SurveyAreaAccessRequest.APPROVED,
+        ).values_list('survey_area_id', flat=True)
+    )

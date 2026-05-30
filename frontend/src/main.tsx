@@ -7,6 +7,16 @@ import App from './App'
 import { ThemeProvider, useTheme } from './context/ThemeContext'
 import { BrandingProvider } from './context/BrandingContext'
 import './index.css'
+import './i18n'  // initialise i18next before any component uses useTranslation
+
+import { useTranslation } from 'react-i18next'
+import enUS from 'antd/locale/en_US'
+import hiIN from 'antd/locale/hi_IN'
+import type { Locale } from 'antd/lib/locale'
+
+const ANTD_LOCALE_MAP: Record<string, Locale> = {
+  hi: hiIN,
+}
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -16,8 +26,12 @@ const queryClient = new QueryClient({
 
 function ThemedApp() {
   const { theme } = useTheme()
+  const { i18n } = useTranslation()
+  const antdLocale: Locale = ANTD_LOCALE_MAP[i18n.language] ?? enUS
+
   return (
     <ConfigProvider
+      locale={antdLocale}
       theme={{
         algorithm: theme.algorithm,
         token: {

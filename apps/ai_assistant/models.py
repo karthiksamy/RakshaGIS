@@ -95,12 +95,19 @@ class AITask(models.Model):
     GIS_INDEXING = 'GIS_INDEXING'
     MODEL_PULL = 'MODEL_PULL'
 
+    DOCUMENT_EMBEDDING  = 'DOCUMENT_EMBEDDING'
+    BOUNDARY_EXTRACTION = 'BOUNDARY_EXTRACTION'
+    TRAINING_EXPORT     = 'TRAINING_EXPORT'
+
     TASK_TYPE_CHOICES = [
-        (REPORT_GENERATION, 'Report Generation'),
-        (PDF_EXTRACTION, 'PDF Text Extraction & Summary'),
+        (REPORT_GENERATION,  'Report Generation'),
+        (PDF_EXTRACTION,     'PDF Text Extraction & Summary'),
         (ATTRIBUTE_VALIDATION, 'Attribute Validation'),
-        (GIS_INDEXING, 'GIS File Indexing'),
-        (MODEL_PULL, 'Model Pull / Download'),
+        (GIS_INDEXING,       'GIS File Indexing'),
+        (MODEL_PULL,         'Model Pull / Download'),
+        (DOCUMENT_EMBEDDING, 'Document Embedding (RAG)'),
+        (BOUNDARY_EXTRACTION,'Boundary Extraction from Scanned Map'),
+        (TRAINING_EXPORT,    'Training Dataset Export'),
     ]
 
     task_type = models.CharField(max_length=30, choices=TASK_TYPE_CHOICES)
@@ -119,3 +126,75 @@ class AITask(models.Model):
 
     def __str__(self):
         return f"{self.get_task_type_display()} — {self.status}"
+
+
+class DocumentChunk(models.Model):
+    """
+    One chunk of text extracted from a Document, with its embedding vector.
+    Used by the RAG pipeline to provide context-aware answers.
+    """
+    document   = models.ForeignKey(
+        'documents.Document', on_delete=models.CASCADE, related_name='chunks'
+    )
+    project    = models.ForeignKey(
+        'survey_projects.SurveyProject', on_delete=models.CASCADE,
+        related_name='doc_chunks', null=True, blank=True,
+    )
+    chunk_index = models.PositiveIntegerField(default=0)
+    text        = models.TextField()
+    # Embedding stored as a JSON list of floats. Dimension depends on model
+    # (768 for nomic-embed-text, 1024 for mxbai-embed-large, etc.)
+    embedding   = models.JSONField(default=list)
+    embed_model = models.CharField(max_length=100, default='nomic-embed-text')
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['document', 'chunk_index']
+        unique_together = [('document', 'chunk_index')]
+
+    def __str__(self):
+        return f'Chunk {self.chunk_index} of doc {self.document_id}'
+
+
+class BoundaryExtractionJob(models.Model):
+    """Tracks a vision-model run that extracts parcel boundaries from a scanned map image."""
+    PENDING  = 'PENDING'
+    RUNNING  = 'RUNNING'
+    DONE     = 'DONE'
+    FAILED   = 'FAILED'
+    STATUS_CHOICES = [(s, s) for s in (PENDING, RUNNING, DONE, FAILED)]
+
+    # Source image — can be an uploaded document or a raw file field
+    source_document = models.ForeignKey(
+        'documents.Document', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='boundary_extractions',
+        help_text='Existing document record containing the scanned map image.',
+    )
+    source_image = models.ImageField(
+        upload_to='boundary_extraction/', null=True, blank=True,
+        help_text='Directly uploaded scanned map image.',
+    )
+    project  = models.ForeignKey(
+        'survey_projects.SurveyProject', on_delete=models.CASCADE,
+        related_name='boundary_extractions',
+    )
+    vision_model = models.CharField(max_length=100, default='llava:7b')
+    status   = models.CharField(max_length=10, choices=STATUS_CHOICES, default=PENDING)
+    # Raw text response from the vision model
+    raw_response = models.TextField(blank=True)
+    # Parsed result: map_info dict + parcels list
+    parsed_result = models.JSONField(null=True, blank=True)
+    # GIS features created from this extraction (JSON: list of GeoJSON features)
+    draft_features = models.JSONField(default=list)
+    error_log    = models.TextField(blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='+'
+    )
+    created_at   = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'BoundaryExtraction({self.project_id}, {self.status})'

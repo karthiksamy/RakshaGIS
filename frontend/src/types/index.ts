@@ -217,6 +217,40 @@ export interface WorkflowStep {
   timestamp: string
 }
 
+export interface SurveyAreaDiscovery {
+  id: number
+  name: string
+  area_code: string
+  status: string
+  project_id: number
+  project_name: string
+  org_id: number
+  org_name: string
+  org_level: string
+  access_status: 'NONE' | 'PENDING' | 'APPROVED' | 'REJECTED'
+}
+
+export interface SurveyAreaAccessRequest {
+  id: number
+  survey_area: number
+  survey_area_name: string
+  project_name: string
+  project_id: number
+  requested_by: number
+  requested_by_name: string
+  requesting_org: number
+  requesting_org_name: string
+  target_org_name: string
+  reason: string
+  status: 'PENDING' | 'APPROVED' | 'REJECTED'
+  status_display: string
+  reviewed_by: number | null
+  reviewed_by_name: string | null
+  reviewed_at: string | null
+  review_remarks: string
+  created_at: string
+}
+
 export interface BrandingConfig {
   app_title: string
   app_subtitle: string

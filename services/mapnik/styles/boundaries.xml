@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE Map>
+<Map srs="+proj=merc +a=6378137 +b=6378137 +over" background-color="#b3d9ff">
+
+  <!-- Metadata -->
+  <Parameters>
+    <Parameter name="name">RakshaGIS Boundaries</Parameter>
+    <Parameter name="description">Survey and administrative boundaries</Parameter>
+  </Parameters>
+
+  <!-- NOTE: Update database credentials below with your actual values -->
+  <!-- Get credentials from .env: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME -->
+
+  <!-- Layer: State Boundaries -->
+  <Layer name="state_boundaries" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
+    <StyleName>state_style</StyleName>
+    <Datasource>
+      <Parameter name="type">postgis</Parameter>
+      <Parameter name="dbname">rakshagis</Parameter>
+      <Parameter name="host">host.docker.internal</Parameter>
+      <Parameter name="port">5432</Parameter>
+      <Parameter name="user">raksha</Parameter>
+      <Parameter name="password">raksha_dev_pass</Parameter>
+      <Parameter name="table">
+        (SELECT id, name, geometry FROM gis_layers_boundary
+         WHERE boundary_type = 'STATE' AND geometry IS NOT NULL
+         ORDER BY id) AS state_boundaries
+      </Parameter>
+      <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="use_spatial_index">true</Parameter>
+    </Datasource>
+  </Layer>
+
+  <!-- Layer: District Boundaries -->
+  <Layer name="district_boundaries" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
+    <StyleName>district_style</StyleName>
+    <Datasource>
+      <Parameter name="type">postgis</Parameter>
+      <Parameter name="dbname">rakshagis</Parameter>
+      <Parameter name="host">host.docker.internal</Parameter>
+      <Parameter name="port">5432</Parameter>
+      <Parameter name="user">raksha</Parameter>
+      <Parameter name="password">raksha_dev_pass</Parameter>
+      <Parameter name="table">
+        (SELECT id, name, geometry FROM gis_layers_boundary
+         WHERE boundary_type = 'DISTRICT' AND geometry IS NOT NULL
+         ORDER BY id) AS district_boundaries
+      </Parameter>
+      <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="use_spatial_index">true</Parameter>
+    </Datasource>
+  </Layer>
+
+  <!-- Layer: Survey Areas -->
+  <Layer name="survey_areas" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
+    <StyleName>survey_style</StyleName>
+    <Datasource>
+      <Parameter name="type">postgis</Parameter>
+      <Parameter name="dbname">rakshagis</Parameter>
+      <Parameter name="host">host.docker.internal</Parameter>
+      <Parameter name="port">5432</Parameter>
+      <Parameter name="user">raksha</Parameter>
+      <Parameter name="password">raksha_dev_pass</Parameter>
+      <Parameter name="table">
+        (SELECT id, name, status, geometry FROM survey_projects_surveyarea
+         WHERE geometry IS NOT NULL
+         ORDER BY id) AS survey_areas
+      </Parameter>
+      <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="use_spatial_index">true</Parameter>
+    </Datasource>
+  </Layer>
+
+  <!-- Styles -->
+  <Style name="state_style">
+    <Rule>
+      <MaxScaleDenominator>250000</MaxScaleDenominator>
+      <LineSymbolizer stroke="#333333" stroke-width="2" stroke-opacity="0.9"/>
+    </Rule>
+  </Style>
+
+  <Style name="district_style">
+    <Rule>
+      <MaxScaleDenominator>100000</MaxScaleDenominator>
+      <LineSymbolizer stroke="#666666" stroke-width="1.5" stroke-opacity="0.7"/>
+    </Rule>
+  </Style>
+
+  <Style name="survey_style">
+    <Rule>
+      <PolygonSymbolizer fill="#4ecdc4" fill-opacity="0.25"/>
+      <LineSymbolizer stroke="#4ecdc4" stroke-width="1.5" stroke-opacity="0.8"/>
+    </Rule>
+  </Style>
+
+</Map>

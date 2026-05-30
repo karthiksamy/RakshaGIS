@@ -10,7 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 
-from .models import ChatSession, ChatMessage, AITask, LLMConfig
+from .models import ChatSession, ChatMessage, AITask, LLMConfig, BoundaryExtractionJob, DocumentChunk
 from .serializers import (
     ChatSessionSerializer, ChatMessageSerializer,
     ChatInputSerializer, AITaskSerializer, LLMConfigSerializer,
@@ -77,14 +77,9 @@ class ChatSessionViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         user_message = serializer.validated_data['message']
+        project_id   = request.data.get('project_id')  # optional: triggers RAG
 
         ChatMessage.objects.create(session=session, role=ChatMessage.USER, content=user_message)
-
-        history = list(session.messages.values('role', 'content').order_by('timestamp'))
-        ollama_messages = [
-            {'role': msg['role'].lower(), 'content': msg['content']}
-            for msg in history
-        ]
 
         service = OllamaService()
         if not service.is_available():
@@ -98,8 +93,25 @@ class ChatSessionViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
+
+        rag_sources = []
         try:
-            reply = service.chat(ollama_messages)
+            if project_id:
+                # RAG mode: retrieve relevant chunks + inject as context
+                has_chunks = DocumentChunk.objects.filter(
+                    project_id=project_id
+                ).exclude(embedding=[]).exists()
+                if has_chunks:
+                    reply, rag_sources = service.answer_with_rag(user_message, int(project_id))
+                else:
+                    # No embeddings yet — fall back to plain chat
+                    history = list(session.messages.values('role', 'content').order_by('timestamp'))
+                    messages = [{'role': m['role'].lower(), 'content': m['content']} for m in history]
+                    reply = service.chat(messages)
+            else:
+                history = list(session.messages.values('role', 'content').order_by('timestamp'))
+                messages = [{'role': m['role'].lower(), 'content': m['content']} for m in history]
+                reply = service.chat(messages)
         except Exception as exc:
             return Response(
                 {'detail': f'AI inference failed ({service.base_url}, model={service.model}): {exc}'},
@@ -107,10 +119,12 @@ class ChatSessionViewSet(viewsets.ModelViewSet):
             )
 
         assistant_msg = ChatMessage.objects.create(session=session, role=ChatMessage.ASSISTANT, content=reply)
-
         session.save(update_fields=['updated_at'])
 
-        return Response(ChatMessageSerializer(assistant_msg).data)
+        data = ChatMessageSerializer(assistant_msg).data
+        data['rag_sources'] = rag_sources
+        data['rag_active']  = bool(rag_sources)
+        return Response(data)
 
 
 class AITaskViewSet(viewsets.ReadOnlyModelViewSet):
@@ -511,3 +525,197 @@ def _installed_models(cfg, hub: str) -> list:
             return []
 
     return []
+
+
+# ── RAG: Embedding management ─────────────────────────────────────────────────
+
+class EmbeddingViewSet(viewsets.ViewSet):
+    """Manage document embeddings for RAG."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    @action(detail=False, methods=['post'], url_path='embed-project/(?P<project_pk>[^/.]+)')
+    def embed_project(self, request, project_pk=None):
+        """Queue embedding tasks for all AI-processed documents in a project."""
+        from apps.documents.models import Document
+        from .tasks import embed_document
+
+        embed_model = request.data.get('embed_model', 'nomic-embed-text')
+        docs = Document.objects.filter(project_id=project_pk, ai_processed=True).exclude(ai_extracted_text='')
+        if not docs.exists():
+            return Response({'detail': 'No processed documents found. Run AI processing first.'}, status=400)
+
+        task_ids = []
+        for doc in docs:
+            task = AITask.objects.create(
+                task_type=AITask.DOCUMENT_EMBEDDING,
+                requested_by=request.user,
+                input_data={'document_id': doc.id, 'embed_model': embed_model},
+            )
+            embed_document.delay(task.id)
+            task_ids.append(task.id)
+
+        return Response({'queued': len(task_ids), 'task_ids': task_ids, 'embed_model': embed_model})
+
+    @action(detail=False, methods=['get'], url_path='embed-status/(?P<project_pk>[^/.]+)')
+    def embed_status(self, request, project_pk=None):
+        """Return RAG embedding status for a project."""
+        from apps.documents.models import Document
+
+        total_docs = Document.objects.filter(project_id=project_pk, ai_processed=True).count()
+        embedded_docs = DocumentChunk.objects.filter(project_id=project_pk).values('document_id').distinct().count()
+        total_chunks  = DocumentChunk.objects.filter(project_id=project_pk).count()
+
+        pending_tasks = AITask.objects.filter(
+            task_type=AITask.DOCUMENT_EMBEDDING,
+            input_data__document_id__in=list(
+                Document.objects.filter(project_id=project_pk).values_list('id', flat=True)
+            ),
+            status__in=(AITask.PENDING, AITask.RUNNING),
+        ).count()
+
+        return Response({
+            'total_docs': total_docs,
+            'embedded_docs': embedded_docs,
+            'total_chunks': total_chunks,
+            'pending_tasks': pending_tasks,
+            'rag_ready': embedded_docs > 0 and pending_tasks == 0,
+        })
+
+    @action(detail=False, methods=['delete'], url_path='clear-embeddings/(?P<project_pk>[^/.]+)')
+    def clear_embeddings(self, request, project_pk=None):
+        """Delete all embeddings for a project."""
+        count, _ = DocumentChunk.objects.filter(project_id=project_pk).delete()
+        return Response({'deleted_chunks': count})
+
+    @action(detail=False, methods=['post'], url_path='create-dgde-model')
+    def create_dgde_model(self, request):
+        """
+        Create a DGDE-domain-expert Ollama model from a Modelfile.
+        The model uses the comprehensive DGDE system prompt baked in.
+        After creation, register it as an LLMConfig.
+        """
+        from .services import DGDE_SYSTEM_PROMPT, LLMService
+        import subprocess, tempfile
+
+        base_model = request.data.get('base_model', 'llama3.2')
+        model_name = request.data.get('model_name', 'dgde-expert')
+        temperature = float(request.data.get('temperature', '0.3'))
+
+        modelfile = f"""FROM {base_model}
+SYSTEM \"\"\"{DGDE_SYSTEM_PROMPT}\"\"\"
+PARAMETER temperature {temperature}
+PARAMETER top_p 0.9
+PARAMETER num_ctx 4096
+"""
+        svc = LLMService()
+        try:
+            # Write modelfile to temp, then call ollama create via API
+            # Ollama doesn't have a direct "create from modelfile" REST API yet,
+            # so we POST to /api/create
+            import httpx
+            r = httpx.post(
+                f"{svc.base_url}/api/create",
+                json={'name': model_name, 'modelfile': modelfile},
+                timeout=300,
+            )
+            r.raise_for_status()
+
+            # Register as LLMConfig
+            LLMConfig.objects.filter(model_name=model_name, provider=LLMConfig.OLLAMA).delete()
+            cfg = LLMConfig.objects.create(
+                name=f'DGDE Expert ({base_model} base)',
+                provider=LLMConfig.OLLAMA,
+                base_url=svc.base_url,
+                model_name=model_name,
+                notes=f'Domain-specific model created from {base_model} with DGDE system prompt.',
+                updated_by=request.user,
+            )
+            return Response({'detail': f'Model "{model_name}" created.', 'config_id': cfg.id})
+        except Exception as exc:
+            return Response({'detail': f'Model creation failed: {exc}'}, status=500)
+
+
+# ── Vision: Boundary Extraction ───────────────────────────────────────────────
+
+class BoundaryExtractionViewSet(viewsets.ViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    @action(detail=False, methods=['post'], url_path='submit')
+    def submit(self, request):
+        """
+        Submit a scanned map image for vision-based boundary extraction.
+        Body (multipart): project_id, vision_model, image (file) OR source_document_id
+        """
+        from apps.survey_projects.models import SurveyProject
+        from apps.documents.models import Document
+        from .tasks import extract_map_boundaries
+
+        project_id        = request.data.get('project_id')
+        vision_model      = request.data.get('vision_model', 'llava:7b')
+        source_doc_id     = request.data.get('source_document_id')
+        uploaded_image    = request.FILES.get('image')
+
+        if not project_id:
+            return Response({'detail': 'project_id required.'}, status=400)
+        if not source_doc_id and not uploaded_image:
+            return Response({'detail': 'Provide either source_document_id or an image file.'}, status=400)
+
+        try:
+            project = SurveyProject.objects.get(pk=project_id)
+        except SurveyProject.DoesNotExist:
+            return Response({'detail': 'Project not found.'}, status=404)
+
+        job = BoundaryExtractionJob(
+            project=project,
+            vision_model=vision_model,
+            requested_by=request.user,
+        )
+        if source_doc_id:
+            job.source_document_id = source_doc_id
+        if uploaded_image:
+            job.source_image = uploaded_image
+        job.save()
+
+        extract_map_boundaries.delay(job.id)
+        return Response({'job_id': job.id, 'status': job.status}, status=201)
+
+    @action(detail=False, methods=['get'], url_path='status/(?P<job_pk>[^/.]+)')
+    def job_status(self, request, job_pk=None):
+        try:
+            job = BoundaryExtractionJob.objects.get(pk=job_pk, project__organisation=request.user.organisation)
+        except BoundaryExtractionJob.DoesNotExist:
+            return Response({'detail': 'Not found.'}, status=404)
+        return Response({
+            'id': job.id,
+            'status': job.status,
+            'vision_model': job.vision_model,
+            'parsed_result': job.parsed_result,
+            'draft_features': job.draft_features,
+            'raw_response': job.raw_response[:500] if job.raw_response else '',
+            'error_log': job.error_log,
+            'created_at': job.created_at,
+            'completed_at': job.completed_at,
+        })
+
+    @action(detail=False, methods=['get'], url_path='list/(?P<project_pk>[^/.]+)')
+    def list_jobs(self, request, project_pk=None):
+        jobs = BoundaryExtractionJob.objects.filter(project_id=project_pk).order_by('-created_at')[:20]
+        return Response([{
+            'id': j.id, 'status': j.status, 'vision_model': j.vision_model,
+            'parcel_count': len(j.parsed_result.get('parcels', [])) if j.parsed_result else 0,
+            'created_at': j.created_at,
+        } for j in jobs])
+
+    @action(detail=False, methods=['post'], url_path='export-training/(?P<project_pk>[^/.]+)')
+    def export_training(self, request, project_pk=None):
+        """Export project documents as JSONL training data for local fine-tuning."""
+        from .tasks import export_training_dataset
+
+        task = AITask.objects.create(
+            task_type=AITask.TRAINING_EXPORT,
+            requested_by=request.user,
+            input_data={'project_id': project_pk},
+        )
+        export_training_dataset.delay(task.id)
+        return Response({'task_id': task.id, 'detail': 'Training export queued.'})

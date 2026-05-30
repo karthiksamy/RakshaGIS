@@ -5,6 +5,7 @@ from .models import (
     SurveyProject, SurveyArea, GISFeature, DefenceParcel, AttributeTemplate,
     ShapefileImport, ProjectLayerFolder, ProjectShare, GeoTiffLayer,
     FeatureAttachment, ProjectMilestone, QGISUploadLog, TemporaryLayer,
+    SurveyAreaAccessRequest,
 )
 
 
@@ -266,16 +267,59 @@ class QGISUploadLogSerializer(serializers.ModelSerializer):
 
 
 class TemporaryLayerSerializer(serializers.ModelSerializer):
-    uploaded_by_name = serializers.CharField(source='uploaded_by.get_full_name', read_only=True)
+    uploaded_by_name    = serializers.CharField(source='uploaded_by.get_full_name', read_only=True)
     file_format_display = serializers.CharField(source='get_file_format_display', read_only=True)
+    purpose_type_display     = serializers.CharField(source='get_purpose_type_display', read_only=True)
+    land_rights_type_display = serializers.CharField(source='get_land_rights_type_display', read_only=True)
+    effective_purpose        = serializers.CharField(read_only=True)
+    effective_land_rights    = serializers.CharField(read_only=True)
 
     class Meta:
         model  = TemporaryLayer
         fields = [
-            'id', 'name', 'purpose', 'description',
+            'id', 'name', 'purpose',
+            'purpose_type', 'purpose_type_display', 'purpose_other',
+            'land_rights_type', 'land_rights_type_display', 'land_rights_other',
+            'effective_purpose', 'effective_land_rights',
+            'description',
             'file_format', 'file_format_display',
             'file', 'geojson', 'feature_count',
+            'analysis_result',
             'uploaded_by', 'uploaded_by_name', 'created_at',
         ]
-        read_only_fields = ['id', 'file_format', 'geojson', 'feature_count',
-                            'uploaded_by', 'uploaded_by_name', 'created_at']
+        read_only_fields = [
+            'id', 'file_format', 'geojson', 'feature_count',
+            'analysis_result',
+            'uploaded_by', 'uploaded_by_name', 'created_at',
+            'purpose_type_display', 'land_rights_type_display',
+            'effective_purpose', 'effective_land_rights',
+        ]
+
+
+class SurveyAreaAccessRequestSerializer(serializers.ModelSerializer):
+    requested_by_name  = serializers.CharField(source='requested_by.get_full_name',  read_only=True)
+    reviewed_by_name   = serializers.CharField(source='reviewed_by.get_full_name',   read_only=True)
+    requesting_org_name = serializers.CharField(source='requesting_org.name',        read_only=True)
+    survey_area_name   = serializers.CharField(source='survey_area.name',            read_only=True)
+    project_name       = serializers.CharField(source='survey_area.project.name',    read_only=True)
+    project_id         = serializers.IntegerField(source='survey_area.project_id',   read_only=True)
+    target_org_name    = serializers.CharField(
+        source='survey_area.project.organisation.name', read_only=True
+    )
+    status_display     = serializers.CharField(source='get_status_display',          read_only=True)
+
+    class Meta:
+        model  = SurveyAreaAccessRequest
+        fields = [
+            'id', 'survey_area', 'survey_area_name', 'project_name', 'project_id',
+            'requested_by', 'requested_by_name',
+            'requesting_org', 'requesting_org_name',
+            'target_org_name',
+            'reason', 'status', 'status_display',
+            'reviewed_by', 'reviewed_by_name', 'reviewed_at', 'review_remarks',
+            'created_at',
+        ]
+        read_only_fields = [
+            'id', 'requested_by', 'requesting_org', 'status',
+            'reviewed_by', 'reviewed_at', 'created_at',
+        ]

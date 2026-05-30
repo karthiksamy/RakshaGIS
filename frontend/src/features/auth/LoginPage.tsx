@@ -12,6 +12,8 @@ import { useAppStore } from '@/app/store'
 import { qk } from '@/services/queryKeys'
 import api from '@/services/api'
 import { useBranding } from '@/context/BrandingContext'
+import { useTranslation } from 'react-i18next'
+import LanguageSwitcher from '@/components/LanguageSwitcher'
 import type { User } from '@/types'
 
 interface LoginForm {
@@ -52,6 +54,7 @@ export default function LoginPage() {
   const setUser = useAppStore((s) => s.setUser)
   const qc = useQueryClient()
   const branding = useBranding()
+  const { t } = useTranslation()
 
   const [step, setStep] = useState<'credentials' | '2fa'>('credentials')
   const [preAuthKey, setPreAuthKey] = useState('')
@@ -250,12 +253,12 @@ export default function LoginPage() {
             <Form layout="vertical" onFinish={mutation.mutate} size="large">
               <Form.Item
                 name="username"
-                label={<span style={{ color: '#8ab0d0', fontSize: 13 }}>Username</span>}
-                rules={[{ required: true, message: 'Enter your username' }]}
+                label={<span style={{ color: '#8ab0d0', fontSize: 13 }}>{t('auth.username')}</span>}
+                rules={[{ required: true, message: t('auth.username') }]}
               >
                 <Input
                   prefix={<UserOutlined style={{ color: '#446688' }} />}
-                  placeholder="Enter username"
+                  placeholder={t('auth.username')}
                   autoComplete="username"
                   style={{ background: '#0d1526', borderColor: '#1e3050', color: '#dde8f8' }}
                 />
@@ -263,12 +266,12 @@ export default function LoginPage() {
 
               <Form.Item
                 name="password"
-                label={<span style={{ color: '#8ab0d0', fontSize: 13 }}>Password</span>}
-                rules={[{ required: true, message: 'Enter your password' }]}
+                label={<span style={{ color: '#8ab0d0', fontSize: 13 }}>{t('auth.password')}</span>}
+                rules={[{ required: true, message: t('auth.password') }]}
               >
                 <Input.Password
                   prefix={<LockOutlined style={{ color: '#446688' }} />}
-                  placeholder="Enter password"
+                  placeholder={t('auth.password')}
                   autoComplete="current-password"
                   style={{ background: '#0d1526', borderColor: '#1e3050', color: '#dde8f8' }}
                 />
@@ -286,7 +289,7 @@ export default function LoginPage() {
                     border: 'none',
                   }}
                 >
-                  Sign In to RakshaGIS
+                  {t('auth.login')}
                 </Button>
               </Form.Item>
             </Form>
@@ -343,10 +346,11 @@ export default function LoginPage() {
           </Space>
         )}
 
-        <div style={{ marginTop: 40, paddingTop: 20, borderTop: '1px solid #0f1c2e', textAlign: 'center' }}>
+        <div style={{ marginTop: 32, paddingTop: 16, borderTop: '1px solid #0f1c2e', textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <Typography.Text style={{ color: '#24374a', fontSize: 11 }}>
-            RakshaGIS v2.0 — Ministry of Defence, India
+            RakshaGIS v2.0 — {t('auth.login_subtitle', 'Ministry of Defence, India')}
           </Typography.Text>
+          <LanguageSwitcher />
         </div>
       </div>
 

@@ -2,22 +2,70 @@
 
 **A full-stack, self-hosted Geographic Information System for the Directorate General of Defence Estates (DGDE), Government of India.**
 
+Everything runs on-premise. No commercial cloud services, no internet dependency after first installation.
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Key Features](#key-features)
+3. [Technology Stack](#technology-stack)
+4. [System Requirements](#system-requirements)
+5. [Prerequisites](#prerequisites)
+6. [Installation](#installation)
+   - [Quick Start (Production)](#quick-start-production)
+   - [Development Setup](#development-setup)
+   - [Air-Gapped / Offline Installation](#air-gapped--offline-installation)
+7. [Environment Variables](#environment-variables)
+8. [Service Management](#service-management)
+9. [First-Time Setup After Install](#first-time-setup-after-install)
+10. [Optional Add-Ons](#optional-add-ons)
+    - [Offline OSM Tile Server](#offline-osm-tile-server)
+    - [Local AI (Ollama / LocalAI / LlamaCpp / AnythingLLM)](#local-ai)
+    - [3D Terrain Server (SRTM/Cartosat)](#3d-terrain-server)
+    - [HTTPS / TLS](#https--tls)
+    - [Monitoring (Prometheus + Grafana)](#monitoring-prometheus--grafana)
+11. [Admin Boundary Data Load](#admin-boundary-data-load)
+12. [Real-Time Collaboration](#real-time-collaboration)
+13. [Backup & Recovery](#backup--recovery)
+14. [Multi-Language UI](#multi-language-ui)
+15. [AI Features](#ai-features)
+16. [API Reference](#api-reference)
+17. [Roles & Permissions](#roles--permissions)
+18. [Data Access Rules](#data-access-rules)
+19. [Project Structure](#project-structure)
+20. [Architecture](#architecture)
+21. [Troubleshooting](#troubleshooting)
+22. [Licence](#licence)
+
 ---
 
 ## Overview
 
-RakshaGIS is an enterprise-grade web GIS platform purpose-built for the DGDE to digitise, manage, and publish defence land surveys. It replaces paper-based and siloed workflows with a single, role-gated system that covers field surveying, survey-area-wise internal review and approval routing, AI-assisted document processing, and public-facing layer publishing — all hosted on-premise with no dependency on commercial cloud services.
+RakshaGIS is an enterprise-grade web GIS platform purpose-built for DGDE to digitise, manage, and publish defence land surveys. It replaces paper-based and siloed workflows with a single, role-gated system covering:
+
+- Field surveying and GIS feature editing
+- Survey-area-wise internal review and approval routing
+- AI-assisted document processing and boundary extraction from scanned maps
+- In-browser document editing (OnlyOffice)
+- Real-time collaborative editing by multiple surveyors
+- 3D terrain and elevation analysis (Cesium.js + SRTM/Cartosat DEM)
+- Automated encrypted backups with rotation
+- Multi-language UI (English, Hindi, Tamil, Telugu, Bengali, Kannada, Marathi)
+- Public-facing layer publishing — all hosted on-premise with **zero cloud dependency**
 
 ---
 
 ## Key Features
 
 ### Map & Spatial Analysis
-- Interactive map built on OpenLayers 10 with multi-basemap support (OSM, XYZ, WMS/WMTS, Bhuvan)
+- Interactive map (OpenLayers 10) with multi-basemap support (OSM, XYZ, WMS/WMTS, Bhuvan)
+- **Local offline raster tile server** — India OSM tiles served by `overv/openstreetmap-tile-server` after one-time import; no internet required during operation
 - Draw and edit Point, Line, and Polygon features with snapping and live area/perimeter feedback
 - Edit existing features (move vertices) with automatic backend sync
 - Box-select and identify tools
-- Buffer analysis: N configurable rings (meters/kilometers), spatial intersection with defence parcels, results downloadable as Excel and PDF
+- Buffer analysis (N configurable rings in metres/kilometres), spatial intersection with defence parcels, results downloadable as Excel and PDF
 - Topology checker: detects invalid geometries and overlapping parcels via PostGIS
 - Measure tool with real-time length/area display
 - Cloud-Optimized GeoTIFF (COG) layer overlay with per-layer opacity and visibility controls
@@ -25,218 +73,1007 @@ RakshaGIS is an enterprise-grade web GIS platform purpose-built for the DGDE to 
 - Attribute table panel with inline editing, field calculator, find & replace, CSV export
 - Print-to-PDF with north arrow, scale bar, legend, and coordinate grid
 - Map bookmarks (saved extents) and Go-to coordinate
-- Per-layer colour picker and label toggle (feature_id rendered as text)
+- Per-layer colour picker and label toggle
 - Admin boundary tile overlay via pg_tileserv (MVT)
-- **Auto-load**: map remembers the last active project across sessions — layers are visible immediately on open without manual project selection
+- **Auto-load**: map remembers the last active project across sessions
 
 ### Survey Workflow (Survey-Area-Wise)
 - A single project can contain multiple **Survey Areas** (pockets), each with its own independent workflow
-- Each survey area is linked to a project folder; the workflow tracks that pocket individually
 - Status machine per area: `DRAFT → SUBMITTED → UNDER_REVIEW → APPROVED → PUBLISHED` with `RETURNED` paths at each stage
-- Role-based transitions:
-  - **SDO / Surveyor** — Submit area to Checker; re-submit after Checker returns it
-  - **Checker** — Send area to Approver or return to SDO with mandatory remarks
-  - **Approver** — Approve area or return from review with mandatory remarks
-  - **DEO Admin** — Publish approved areas
-- **Folder lock on submission**: when a survey area is submitted, its linked folder and all sub-folders (Doc, Shapefile, Raster) are immediately read-only — no draw, edit, delete, upload, or import operations are allowed until the area is returned for revision
-- Lock indicator: locked folders display a gold lock icon in the folder tree; the map toolbar hides all write tools and shows a banner
+- Role-based transitions: SDO/Surveyor → Checker → Approver → DEO Admin (publish)
+- **Folder lock on submission**: when a survey area is submitted, its linked folder tree is immediately read-only
 - Versioned layer folders: Phase → Zone → Year → Ver-I / Ver-II / … / Final, auto-created on first use
-- Auto-versioning: active version detected or created automatically when an SDO opens a project
-- Final folder auto-created and features copied on approval
-- Project sharing: grant read access to specific users
-- Full per-area audit log (actor, remarks, timestamp) visible inline on each survey area card
+- Full per-area audit log visible inline on each survey area card
 - In-app notifications for every state transition
+
+### Automated Boundary Dispute Detection
+- Cross-project PostGIS `ST_Overlaps` check: flags when newly submitted features overlap published features from other organisations
+- Pre-submission check returns HTTP 409 with conflict details
+- Surveyor can review the overlap report and acknowledge before force-submitting
+- Standalone "Check Disputes" button on each DRAFT/RETURNED survey area card
+- All dispute checks stored as `DisputeReport` records for audit
+
+### Real-Time Collaborative Editing
+- WebSocket-based (Django Channels + Redis) — multiple surveyors work on the same project simultaneously
+- Feature-level locking: when one surveyor starts editing a feature, others see it highlighted as locked
+- Live presence indicator in the map toolbar (coloured avatars)
+- Broadcasts: `feature_created`, `feature_updated`, `feature_deleted`, `feature_locked`, `feature_unlocked`
+- Auto-reconnect with exponential backoff; locks auto-released on disconnect
+
+### 3D Terrain & Elevation Overlay
+- Full Cesium.js 3D globe at `/terrain`
+- Load project GIS features as 3D extruded polygons/lines/points
+- **Elevation query**: click any point to see lat/lon/elevation
+- **Elevation profile**: draw a multi-segment line, see SVG elevation chart with min/max/length
+- **Slope analysis**: click 2 corners to define an area, sample 15×15 grid, see min/avg/max slope in degrees
+- Terrain sources: Ellipsoid (flat, default) · Local SRTM/Cartosat server (profile `terrain`) · Cesium ION (set token)
+- Offline SRTM DEM setup via `./setup_terrain.sh`
 
 ### Version Comparison
 - Split-screen map view comparing any two VERSION folders side-by-side
 - Shared OL `View` instance — pan/zoom syncs both panels simultaneously
 
+### Organisation-Wise Data Isolation & Cross-Org Access
+- **Strict data isolation**: each organisation sees only its own projects, survey areas, features, folders, and documents
+- **DGDE** — reads all data across all organisations (all-India)
+- **PDDE** — reads all data within its command jurisdiction (subtree)
+- Cross-org access request workflow: DEO can request read access to another org's survey area
+
+### Online Document Editing (OnlyOffice)
+- OnlyOffice Community Document Server integrated as a Docker service — no licence required, fully offline
+- View and edit `.docx`, `.odt`, `.xls`, `.xlsx`, `.pptx`, `.pdf` in the browser
+- JWT-signed configuration; edit callback saves changes back to Django
+- **Create blank report online**: generates a structured `.docx` in the project Doc folder and opens it immediately in OnlyOffice
+- **Open any document**: click the OnlyOffice icon next to any document in the folder tree or Documents page
+
+### AI Features (All Local — No Data Leaves the Server)
+- **RAG (Retrieval-Augmented Generation)**: chunk project documents → embed via `nomic-embed-text` → cosine similarity retrieval → context-injected answers in AI Chat
+- **AI Chat with project context**: select a project in the chat UI to enable RAG-powered Q&A
+- **Vision boundary extraction**: upload a scanned paper map → LLaVA/Ollama vision model → extracted parcel JSON (survey numbers, areas, shapes, adjacent parcels, map metadata)
+- **DGDE domain model**: `POST /api/ai/rag/create-dgde-model/` creates an Ollama model with a comprehensive DGDE system prompt baked in
+- **Training dataset export**: exports project documents as JSONL instruction/response pairs for local LoRA fine-tuning
+- AI-generated survey reports (`.docx` + PDF) from project features and documents
+- Background AI document processing: pdfplumber extraction + Ollama summarisation
+
+### Automated Backup & Recovery
+- **Full DB backup**: Django `dumpdata` → gzip → optional AES-128 Fernet encryption
+- **Command-level backup (PDDE subtree)**: exports all orgs/users/projects/features/documents/workflow under a PDDE command as a structured ZIP
+- **Office-level backup (DEO/CEO/ADEO)**: same but scoped to a single office
+- PDDE/DEO/CEO/ADEO admins can **download their own org's backups**; SuperAdmin manages all
+- Celery Beat automated schedules: daily/weekly/monthly with configurable retention
+- Automatic rotation of expired backup files
+- Encryption key auto-generated and stored in `BACKUP_DIR/.backup_key` if `BACKUP_ENCRYPTION_KEY` not set
+
+### Admin Boundary Data Load
+- Management command: `manage.py load_admin_boundaries` — import state/district/taluk/village shapefiles into PostGIS
+- Supports GADM, Census of India, Survey of India, and Bhuvan shapefile conventions
+- Web-based upload via SuperAdmin → Master Data → Boundary Import (background Celery task)
+- Auto-reprojects to EPSG:4326, forces MultiPolygon, supports `--clear`, `--dry-run`, `--spatial-parent`
+
+### Multi-Language UI
+- Fully localised into 7 Indian languages: **English, Hindi, Tamil, Telugu, Bengali, Kannada, Marathi**
+- Language switcher in header and login page — persists to `localStorage`
+- Ant Design component strings translated for Hindi (`antd/locale/hi_IN`)
+- All untranslated keys fall back to English — no broken UI
+
 ### User & Organisation Management
 - Hierarchical organisations: DGDE → PDDE → DEO → CEO → ADEO
-- Roles: SUPERADMIN, DEO/CEO/ADEO_ADMIN, SDO, SURVEYOR, CHECKER, APPROVER, VIEWER, PDDE_VIEWER
-- Admin-role protection: cannot delete or deactivate admin users
-- Force-logout (deactivate) — effective immediately via SimpleJWT `is_active` check
-- Per-user password change; admin-initiated password reset
+- 10 roles: SUPERADMIN, PDDE_VIEWER, VIEWER, DEO_ADMIN, CEO_ADMIN, ADEO_ADMIN, SDO, SURVEYOR, CHECKER, APPROVER
+- Force-logout, per-user password change, admin-initiated password reset
+- Two-factor authentication (TOTP) for admin roles
 
 ### Master Data (SuperAdmin)
-- CRUD management for State, District, Taluk, Village with cascading dropdowns
-- Organisation records extended with Office ID, officer name, contact details, state/district linkage
-
-### Documents & AI Assistant
-- Per-project document upload (PDF, images) with MIME-type validation
-- Background AI processing via Ollama (local LLM — no external API calls)
-- Auto-generated survey report from project features and documents
-- Interactive chat interface for project-specific Q&A against document context
-
-### UI Themes
-- Six built-in themes: Dark, Light, Navy, Forest, Midnight, Saffron
-- All UI surfaces use CSS custom properties (`--bg-base`, `--bg-card`, `--accent`, etc.) ensuring full theme coverage across the header, sidebar, drawers, and map panels
-
-### Exports
-- GeoJSON, Shapefile, CSV, KML, GeoPackage export per layer
-- Attribute table CSV export
-- Buffer analysis Excel (one sheet per ring) and PDF
-- AI-generated PDF survey report
+- CRUD for State, District, Taluk, Village with cascading dropdowns
+- PostGIS geometry fields on each level — boundaries visualised on the map and served as MVT tiles
 
 ---
 
 ## Technology Stack
 
-| Layer | Technology |
+| Layer | Technology | Version |
+|---|---|---|
+| **Backend** | Python / Django | 3.11 / 4.2 |
+| **REST API** | Django REST Framework | 3.15 |
+| **Spatial** | GeoDjango, PostGIS | — / 16-3.4 |
+| **Database** | PostgreSQL | 16 |
+| **Cache / Queue** | Redis, Celery | 7 / 5.3 |
+| **WebSocket** | Django Channels, Daphne | 4.1 / 4.1 |
+| **Map Tiles (vector)** | pg_tileserv | latest |
+| **Map Tiles (raster)** | openstreetmap-tile-server | 2.3.0 |
+| **Document Editing** | OnlyOffice Community | 8.2.2 |
+| **AI / LLM** | Ollama, LocalAI, llama.cpp, AnythingLLM | — |
+| **PDF Extraction** | pdfplumber | 0.11 |
+| **Backup Encryption** | cryptography (Fernet) | 43.0 |
+| **Frontend** | React 18, TypeScript, Vite | 18 / 5 / 5.4 |
+| **Map Library** | OpenLayers | 10.2 |
+| **3D Globe** | Cesium.js | 1.141 |
+| **UI Components** | Ant Design | 5.20 |
+| **State Management** | Zustand, TanStack Query | 4.5 / 5 |
+| **i18n** | i18next, react-i18next | — |
+| **PDF / Excel** | jsPDF, SheetJS | — |
+| **GeoTIFF** | geotiff.js (COG via OL WebGLTileLayer) | 3.0 |
+| **Auth** | SimpleJWT | 5.3 |
+| **GIS Import/Export** | Fiona, Shapely | 1.9 / 2.0 |
+| **Monitoring** | Prometheus + Grafana | — |
+| **Web Server** | nginx, Daphne (ASGI) | 1.27 / 4.1 |
+| **Containerisation** | Docker Compose | v2 |
+
+---
+
+## System Requirements
+
+### Minimum (Functional — No AI)
+| Component | Minimum |
 |---|---|
-| **Backend** | Python 3.11, Django 4.2, Django REST Framework 3.15 |
-| **Spatial** | GeoDjango, PostGIS 16-3.4 (SRID 4326) |
-| **Database** | PostgreSQL 16 |
-| **Cache / Queue** | Redis 7, Celery 5.3 |
-| **Map Tiles** | pg_tileserv (MapLibre Vector Tile server) |
-| **AI / LLM** | Ollama (local inference), pdfplumber |
-| **Frontend** | React 18, TypeScript, Vite |
-| **Map Library** | OpenLayers 10.2 |
-| **UI Components** | Ant Design 5.20 |
-| **State Management** | Zustand 4.5, TanStack Query 5 |
-| **PDF / Excel** | jsPDF 4.2, jspdf-autotable, SheetJS (xlsx) |
-| **GeoTIFF** | geotiff.js 3.0.5 (COG display via OL WebGLTileLayer) |
-| **Auth** | SimpleJWT 5.3 (short-lived access + refresh tokens) |
-| **GIS Import/Export** | Fiona 1.9, Shapely 2.0 |
-| **Monitoring** | Prometheus + Grafana |
-| **Web Server** | Nginx (reverse proxy + static files), Gunicorn |
-| **Containerisation** | Docker Compose |
+| CPU | 4 cores (x86-64) |
+| RAM | 8 GB |
+| Disk | 40 GB (SSD preferred) |
+| OS | Ubuntu 22.04 LTS / Debian 12 / RHEL 9 |
+| Docker Engine | 24.0+ |
+| Docker Compose | v2.20+ |
+
+### Recommended (With Local AI)
+| Component | Recommended |
+|---|---|
+| CPU | 8+ cores |
+| RAM | 32 GB (16 GB minimum with small models) |
+| Disk | 200 GB SSD |
+| GPU | NVIDIA with 8+ GB VRAM (optional — CPU inference works, slower) |
+
+### For OSM Tile Server (Offline Map)
+- Additional 20 GB disk for India OSM data + tile cache
+- 2–4 hours import time on first run
+
+### For 3D Terrain (SRTM/Cartosat)
+- Additional 15 GB disk for India DEM tiles
+- 3–5 hours conversion time on first run
 
 ---
 
-## Architecture
+## Prerequisites
 
-```
-Browser
-  └── Nginx (:80/:443)
-        ├── /api/          → Gunicorn → Django (4 workers)
-        ├── /tiles/        → pg_tileserv
-        └── /              → React SPA (static files)
+Install these **on the host machine** before running RakshaGIS.
 
-Django
-  ├── apps/accounts          — Users, Organisations
-  ├── apps/survey_projects   — Projects, Survey Areas, Features, Folders, Parcels
-  ├── apps/gis_layers        — State/District/Taluk/Village master data
-  ├── apps/workflow          — Survey-area state machine, audit log, notifications
-  ├── apps/documents         — File upload + AI processing
-  ├── apps/ai_assistant      — Ollama chat + report generation
-  └── apps/core              — Basemap configuration
+### 1. Docker Engine
 
-Background Workers (Celery + Redis)
-  ├── COG conversion task (GeoTIFF → Cloud-Optimized)
-  ├── Shapefile import task
-  └── AI document processing task
-
-Data stores
-  ├── PostgreSQL/PostGIS  — all relational + spatial data
-  ├── Redis               — Celery broker + result backend
-  └── /data/media/        — uploaded files, COG tiles
-```
-
----
-
-## Quick Start
-
-### Prerequisites
-- Docker Engine 24+
-- Docker Compose v2
-- 8 GB RAM minimum (16 GB recommended for Ollama)
-
-### 1. Clone and configure
 ```bash
+# Ubuntu / Debian
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Verify
+docker --version        # should be 24.0+
+docker compose version  # should be v2.20+
+```
+
+### 2. Git
+
+```bash
+sudo apt-get install -y git
+```
+
+### 3. Required Ports (must be free on the host)
+| Port | Service |
+|---|---|
+| 80 | nginx (HTTP) |
+| 443 | nginx (HTTPS — optional) |
+| 5432 | PostgreSQL (internal) |
+| 6379 | Redis (internal) |
+| 8000 | Daphne/Django (internal, proxied by nginx) |
+| 9090 | Prometheus (optional monitoring) |
+| 3000 | Grafana (optional monitoring) |
+| 3001 | AnythingLLM (optional AI) |
+| 11434 | Ollama (optional AI — if running on host) |
+
+> **Tip:** Only port 80 (and 443 for HTTPS) need to be open externally. All others are internal Docker network ports.
+
+---
+
+## Installation
+
+### Quick Start (Production)
+
+```bash
+# 1. Clone the repository
 git clone <repo-url> RakshaGIS
 cd RakshaGIS
+
+# 2. Copy and edit the environment file
 cp .env.example .env
-# Edit .env — set SECRET_KEY, DB passwords, OLLAMA_MODEL
-```
+nano .env          # At minimum set: SECRET_KEY, DB_PASSWORD, ONLYOFFICE_JWT_SECRET
 
-### 2. Build and start
-```bash
-chmod +x build.sh RakshaGIS.sh
-./build.sh          # builds Docker image (skips rebuild if unchanged)
+# 3. Build the Docker image
+chmod +x build.sh RakshaGIS.sh setup_terrain.sh
+./build.sh
+
+# 4. Start all core services
 ./RakshaGIS.sh start
-```
 
-### 3. First-time setup
-```bash
+# 5. Run first-time setup (migrations + seed data + superuser)
 ./RakshaGIS.sh manage migrate
 ./RakshaGIS.sh manage createsuperuser
+./RakshaGIS.sh manage seed_basemaps
+
+# 6. Open the application
+# Web:       http://localhost  (or your server IP)
+# API docs:  http://localhost/api/schema/swagger-ui/
 ```
 
-### 4. Access
-| Service | URL |
-|---|---|
-| Web application | http://localhost |
-| API (browsable) | http://localhost/api/ |
-| Prometheus | http://localhost:9090 |
-| Grafana | http://localhost:3000 |
+> The application is now running. Log in with the superuser credentials you created in step 5.
 
-### Service management
+**Note on image naming**: Images should be tagged as `rakshagis:web` (not `<none>`). Verify:
 ```bash
-./RakshaGIS.sh start       # start all services
-./RakshaGIS.sh stop        # stop all services
-./RakshaGIS.sh status      # check service health
-./RakshaGIS.sh logs        # tail application logs
-./RakshaGIS.sh backup      # dump PostgreSQL to /data/backups/
-./RakshaGIS.sh restore <file>
+docker image ls | grep rakshagis:web
 ```
 
 ---
 
-## Project Structure
+### Development Setup
+
+For local development with hot-reload:
+
+```bash
+# 1. Start only backend services
+docker compose up db redis pg_tileserv -d
+
+# 2. Install Python dependencies (use a virtualenv)
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Set up environment
+cp .env.example .env
+export DJANGO_SETTINGS_MODULE=config.settings.development
+export DATABASE_URL=postgres://raksha:yourpassword@localhost:5432/rakshagis
+
+# 4. Create migrations (if you modified Django models)
+python manage.py makemigrations
+
+# 5. Run migrations
+python manage.py migrate
+python manage.py createsuperuser
+python manage.py seed_basemaps
+
+# 6. Start Django dev server
+python manage.py runserver 0.0.0.0:8000
+
+# 7. In another terminal: start Celery worker
+celery -A config worker --loglevel=info
+
+# 8. In another terminal: start frontend dev server
+cd frontend
+npm install
+npm run dev
+# Frontend available at http://localhost:5173
+# API proxied to http://localhost:8000
+```
+
+#### Build frontend for production
+
+```bash
+cd frontend
+npm run build
+# Copies index.html to templates/ automatically
+# Static assets output to ../static/frontend/
+```
+
+---
+
+### Air-Gapped / Offline Installation
+
+For deployment on networks **without internet access**:
+
+```bash
+# ── On a machine WITH internet ──────────────────────────────────────
+
+# 1. Clone the repo and configure .env
+git clone <repo-url> RakshaGIS && cd RakshaGIS
+cp .env.example .env
+
+# 2. Pull all Docker images and save them as a single archive
+./build.sh --save-images
+# Creates: RakshaGIS_images.tar.gz in the data directory
+
+# ── Transfer files to the air-gapped machine ───────────────────────
+# Transfer: the entire RakshaGIS/ directory + RakshaGIS_images.tar.gz
+
+# ── On the air-gapped machine ──────────────────────────────────────
+
+# 3. Load all images from the archive (no internet pull)
+./build.sh --load-images /path/to/RakshaGIS_images.tar.gz
+
+# 4. Build the app image from local source
+./build.sh --no-build     # skip pull, just build the web image
+
+# 5. Start
+./RakshaGIS.sh start
+./RakshaGIS.sh manage migrate
+./RakshaGIS.sh manage createsuperuser
+./RakshaGIS.sh manage seed_basemaps
+```
+
+---
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and set these values. Required fields are marked **\***.
+
+### Django Core
+
+| Variable | Default | Description |
+|---|---|---|
+| `SECRET_KEY` | — | **\* Required.** Long random string. Generate: `python -c "import secrets; print(secrets.token_hex(50))"` |
+| `DEBUG` | `False` | Set `True` only in development |
+| `ALLOWED_HOSTS` | `localhost,127.0.0.1` | Comma-separated hostnames / IPs |
+| `CORS_ALLOWED_ORIGINS` | — | Allowed frontend origins (production with separate frontend domain) |
+| `DJANGO_SETTINGS_MODULE` | `config.settings.production` | Use `config.settings.development` for dev |
+
+### Database
+
+| Variable | Default | Description |
+|---|---|---|
+| `DB_NAME` | `rakshagis` | PostgreSQL database name |
+| `DB_USER` | `raksha` | **\* Required.** PostgreSQL user |
+| `DB_PASSWORD` | — | **\* Required.** PostgreSQL password |
+| `DB_HOST` | `db` (Docker) / `localhost` (dev) | Database host |
+| `DB_PORT` | `5432` | Database port |
+| `DATA_DIR` | `/data/rakshagis` | Host path for all persistent data (PostgreSQL, media, backups) |
+
+### Redis / Celery
+
+| Variable | Default | Description |
+|---|---|---|
+| `REDIS_URL` | `redis://redis:6379/0` | Redis connection URL |
+| `CELERY_BROKER_URL` | `redis://redis:6379/1` | Celery broker URL |
+
+### OnlyOffice
+
+| Variable | Default | Description |
+|---|---|---|
+| `ONLYOFFICE_JWT_SECRET` | — | **\* Required.** Shared secret for OnlyOffice JWT signing. Generate: `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `ONLYOFFICE_INTERNAL_BASE_URL` | `http://nginx` | Internal URL OnlyOffice uses to reach Django (keep as `http://nginx` in Docker) |
+
+### Local AI
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_BASE_URL` | `http://ollama:11434` | Ollama API URL |
+| `OLLAMA_MODEL` | `llama3.2` | Default LLM model name |
+| `OLLAMA_HOST_URL` | `http://host.docker.internal:11434` | Ollama on Docker Desktop host |
+| `OLLAMA_LOCAL_URL` | `http://localhost:11434` | Ollama running directly on host |
+
+### 3D Terrain
+
+| Variable | Default | Description |
+|---|---|---|
+| `CESIUM_ION_TOKEN` | *(empty)* | Cesium ION access token for Cesium World Terrain. Free at [ion.cesium.com](https://ion.cesium.com). Leave empty to use local terrain server or flat terrain. |
+| `TERRAIN_TILE_URL` | *(empty)* | URL of local quantized-mesh terrain tile server. Set to `/terrain-tiles` when using the `terrain` Docker profile. |
+
+### Backup & Recovery
+
+| Variable | Default | Description |
+|---|---|---|
+| `BACKUP_ENCRYPTION_KEY` | *(auto-generated)* | Fernet encryption key for backup files. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. If not set, a key is auto-generated and stored in `BACKUP_DIR/.backup_key`. |
+| `BACKUP_DIR` | `<project>/data/backups` | Directory where backup files are stored |
+| `BACKUP_RETENTION_DAYS` | `30` | Default retention period for manual backups (days) |
+
+### Media & Static
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEDIA_ROOT` | `/data/media` | User upload directory |
+
+---
+
+## Service Management
+
+All service management is done via `./RakshaGIS.sh`:
+
+```bash
+./RakshaGIS.sh start       # Start all core services (nginx, web, celery, db, redis, pg_tileserv)
+./RakshaGIS.sh stop        # Stop all services
+./RakshaGIS.sh restart     # Restart all services
+./RakshaGIS.sh status      # Show service health and resource usage
+./RakshaGIS.sh logs        # Tail application logs
+./RakshaGIS.sh logs web    # Tail logs for a specific service
+./RakshaGIS.sh backup      # Create a raw PostgreSQL dump (pg_dump from db container)
+./RakshaGIS.sh restore <file>  # Restore from a .sql.gz backup file
+./RakshaGIS.sh update      # Pull latest images, rebuild, restart
+./RakshaGIS.sh info        # Show version and configuration summary
+```
+
+### Running Django Management Commands
+
+```bash
+./RakshaGIS.sh manage <command>
+
+# Examples:
+./RakshaGIS.sh manage migrate
+./RakshaGIS.sh manage createsuperuser
+./RakshaGIS.sh manage seed_basemaps
+./RakshaGIS.sh manage shell
+./RakshaGIS.sh manage dumpdata > backup.json
+```
+
+Or directly via Docker Compose:
+
+```bash
+docker compose run --rm web python manage.py <command>
+```
+
+---
+
+## First-Time Setup After Install
+
+After starting the services for the first time:
+
+### 1. Run Database Migrations
+
+```bash
+./RakshaGIS.sh manage migrate
+```
+
+### 2. Create a SuperAdmin Account
+
+```bash
+./RakshaGIS.sh manage createsuperuser
+# Enter: username, email, password
+```
+
+### 3. Seed Default Basemaps
+
+```bash
+./RakshaGIS.sh manage seed_basemaps
+# Creates: OpenStreetMap, CartoDB Dark, Esri Satellite basemaps
+```
+
+### 4. Access the Application
+
+| URL | Description |
+|---|---|
+| `http://localhost` | Main web application |
+| `http://localhost/api/` | REST API (browsable) |
+| `http://localhost/api/schema/swagger-ui/` | API documentation (Swagger UI) |
+| `http://localhost/onlyoffice/` | OnlyOffice server (internal) |
+
+### 5. Create Organisations and Users
+
+1. Log in as SuperAdmin
+2. Go to **Organisations** → create the PDDE, DEO/CEO hierarchy
+3. Go to **Users** → create users and assign them to organisations with appropriate roles
+
+---
+
+## Optional Add-Ons
+
+### Offline OSM Tile Server
+
+Serves India OpenStreetMap raster tiles entirely offline. **One-time internet download (~800 MB), then fully offline.**
+
+```bash
+# Step 1: Import India OSM data (requires internet once; takes 2–4 hours)
+./build.sh --import-osm
+
+# Step 2: Activate in the app
+# Settings → Basemaps → Enable "Local OSM (Offline)"
+```
+
+- Disk requirement: ~20 GB for PostGIS data + tile cache
+- After import, the service starts automatically with `./RakshaGIS.sh start`
+
+---
+
+### Local AI
+
+RakshaGIS supports multiple local LLM backends. All are optional and run fully on-premise.
+
+#### Option A: Ollama (Recommended)
+
+Best for most deployments. Supports Llama 3, Mistral, Gemma, DeepSeek, and many more.
+
+**Running Ollama on the host (recommended for GPU setups):**
+
+```bash
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull models
+ollama pull llama3.2          # 2.0 GB — general chat
+ollama pull nomic-embed-text  # 274 MB — RAG embeddings (REQUIRED for RAG)
+ollama pull llava:7b          # 4.7 GB — vision model for map boundary extraction
+ollama pull moondream         # 850 MB — lightweight vision model
+
+# Set in .env:
+# OLLAMA_LOCAL_URL=http://localhost:11434
+# OLLAMA_MODEL=llama3.2
+```
+
+**Running Ollama in Docker (CPU):**
+
+```bash
+docker compose --profile docker-ollama up -d ollama
+docker compose exec ollama ollama pull llama3.2
+```
+
+**Running Ollama in Docker (NVIDIA GPU):**
+
+```bash
+docker compose --profile docker-ollama-gpu up -d ollama
+docker compose exec ollama ollama pull llama3.2
+```
+
+#### Option B: LocalAI
+
+OpenAI-compatible API for GGUF/GGML models.
+
+```bash
+# CPU
+docker compose --profile localai up -d localai
+
+# NVIDIA GPU
+docker compose --profile localai-gpu up -d localai
+
+# Set in .env:
+# OLLAMA_BASE_URL=http://localai:8080
+```
+
+#### Option C: llama.cpp Server
+
+Lightweight, fast inference from GGUF files.
+
+```bash
+# CPU
+docker compose --profile llamacpp up -d llamacpp
+
+# NVIDIA GPU
+docker compose --profile llamacpp-gpu up -d llamacpp
+```
+
+#### Option D: AnythingLLM
+
+Full RAG workspace with document management.
+
+```bash
+# CPU
+docker compose --profile anythingllm up -d anythingllm
+
+# NVIDIA GPU
+docker compose --profile anythingllm-gpu up -d anythingllm
+
+# AnythingLLM UI: http://localhost:3001
+```
+
+#### Configuring the Active LLM
+
+After starting an AI backend:
+
+1. Log in as SuperAdmin
+2. Go to **AI Config** → **Add LLM Configuration**
+3. Set the provider URL and model name
+4. Click **Activate** to make it the default
+
+---
+
+### 3D Terrain Server
+
+Serves SRTM/Cartosat DEM tiles in Cesium's quantized-mesh format for the 3D Terrain viewer.
+
+#### Step 1: Download India SRTM DEM tiles
+
+```bash
+# Downloads ~250 MB of SRTM 5×5° tiles covering India from CGIAR-CSI
+./setup_terrain.sh --download
+```
+
+#### Step 2: Convert to quantized-mesh format
+
+```bash
+# Converts GeoTIFF DEM → Cesium quantized-mesh tiles using ctb-tile (Docker)
+# Takes 1–3 hours for full India coverage at zoom levels 0–14
+./setup_terrain.sh --convert
+
+# Or do both steps at once:
+./setup_terrain.sh --all
+```
+
+> **Requires Docker** for the `ctb-tile` and `osgeo/gdal` containers (pulled automatically).
+
+#### Step 3: Start the terrain server
+
+```bash
+docker compose --profile terrain up -d terrain-server
+```
+
+#### Step 4: Activate in `.env`
+
+```bash
+TERRAIN_TILE_URL=/terrain-tiles
+```
+
+Then restart the web service:
+
+```bash
+./RakshaGIS.sh restart
+```
+
+> **Without SRTM data:** The 3D viewer still works with flat (ellipsoid) terrain — features load in 3D, slope analysis shows 0°. Real elevation requires the terrain server.
+
+---
+
+### HTTPS / TLS
+
+For production deployments with a public domain name:
+
+```bash
+# Set your domain in .env:
+# ALLOWED_HOSTS=your-domain.com
+# CORS_ALLOWED_ORIGINS=https://your-domain.com
+
+# Uncomment the HTTPS redirect in deploy/nginx-docker.conf
+
+# Start Certbot for Let's Encrypt:
+docker compose --profile https up -d certbot
+
+# Renew certificates (run periodically via cron):
+docker compose --profile https run --rm certbot renew
+```
+
+---
+
+### Monitoring (Prometheus + Grafana)
+
+```bash
+docker compose --profile monitoring up -d prometheus grafana
+
+# Prometheus: http://localhost:9090
+# Grafana:    http://localhost:3000  (default login: admin / admin)
+
+# Django metrics endpoint: http://localhost/metrics/
+```
+
+---
+
+## Admin Boundary Data Load
+
+Load state, district, taluk, and village boundary shapefiles into the master data tables (required for the MVT boundary overlay on the map and for spatial filtering).
+
+### Method 1: Management Command (recommended for bulk loads)
+
+Uses GADM 4.1 India shapefiles by default. Download from [gadm.org](https://gadm.org/download_country.html):
+
+```bash
+# Load states (run first)
+./RakshaGIS.sh manage load_admin_boundaries \
+    --level state \
+    --file /path/to/gadm41_IND_1.shp \
+    --name-field NAME_1 \
+    --code-field GID_1
+
+# Load districts (requires states loaded first)
+./RakshaGIS.sh manage load_admin_boundaries \
+    --level district \
+    --file /path/to/gadm41_IND_2.shp \
+    --name-field NAME_2 \
+    --code-field GID_2 \
+    --parent-code-field GID_1
+
+# Load taluks/sub-districts
+./RakshaGIS.sh manage load_admin_boundaries \
+    --level taluk \
+    --file /path/to/gadm41_IND_3.shp \
+    --name-field NAME_3 \
+    --code-field GID_3 \
+    --parent-code-field GID_2
+
+# Load villages
+./RakshaGIS.sh manage load_admin_boundaries \
+    --level village \
+    --file /path/to/gadm41_IND_4.shp \
+    --name-field NAME_4 \
+    --code-field GID_4 \
+    --parent-code-field GID_3
+```
+
+#### All options:
+```
+--level           state | district | taluk | village
+--file            Path to .shp or .zip shapefile
+--name-field      Attribute column for record name (default: NAME)
+--code-field      Attribute column for unique code (default: CODE)
+--parent-code-field  Attribute whose value matches the parent's code
+--spatial-parent  Resolve parent by centroid-in-polygon (no parent-code-field needed)
+--clear           Delete all existing records for this level before importing
+--dry-run         Parse and validate without writing to the database
+--batch-size      Bulk-create batch size (default: 500)
+```
+
+### Method 2: Web UI (SuperAdmin)
+
+1. Log in as SuperAdmin
+2. Go to **Master Data → Boundary Import**
+3. Select level, upload a `.shp` or `.zip` file, set field names (GADM defaults pre-filled)
+4. Click **Start Import** — the task runs in the background via Celery
+5. Monitor progress in the Import History table
+
+---
+
+## Real-Time Collaboration
+
+Multiple surveyors can edit the same project simultaneously.
+
+### How it works
+
+- When you open a project on the Map page, a WebSocket connection is automatically established to `ws[s]://<host>/ws/project/<id>/`
+- The **presence indicator** (top-right of the map) shows coloured avatars of all connected users
+- When another user draws, edits, or deletes a feature, your map updates instantly
+- **Feature locking**: if another user is editing a feature, it shows as locked on your map
+
+### Prerequisites
+
+The WebSocket requires:
+- nginx with the `/ws/` proxy block (already configured in `deploy/nginx-docker.conf`)
+- Redis running (used as the channel layer)
+- Daphne ASGI server (default since v2.0 — replaces gunicorn)
+
+### Troubleshooting collaboration
+
+```bash
+# Check channel layer is connected to Redis
+docker compose exec web python manage.py shell -c "
+from channels.layers import get_channel_layer
+import asyncio
+cl = get_channel_layer()
+asyncio.run(cl.group_add('test', 'test'))
+print('Channel layer OK:', cl.__class__.__name__)
+"
+
+# Check WebSocket URL is reachable
+curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+    http://localhost/ws/project/1/?token=<jwt_token>
+```
+
+---
+
+## Backup & Recovery
+
+### Creating a Manual Backup
+
+1. Log in as **SuperAdmin**
+2. Go to **Backups** → **Manual Backup** tab
+3. Select backup type:
+   - **Full Database**: entire Django database (all apps, all organisations)
+   - **Command (PDDE)**: all data for a PDDE command and all subordinate orgs
+   - **Office (DEO/CEO/ADEO)**: all data for a single office
+4. Select the target organisation (for Command/Office types)
+5. Toggle **Encrypt** (on by default — AES-128 Fernet)
+6. Click **Start Backup** — runs in the background via Celery
+7. When status shows **Done**, click **Download** to get the file (automatically decrypted on download)
+
+### Downloading Backups (PDDE/DEO Admins)
+
+PDDE, DEO, CEO, and ADEO admins can download backups that cover their organisation:
+
+1. Log in with your admin account
+2. Go to **Backups** — you will see only backups covering your org/command
+3. Click **Download** on any **Done** backup
+
+### Automated Backup Schedules
+
+SuperAdmin can configure automated schedules:
+
+1. Go to **Backups → Schedules** tab
+2. Click **Add Schedule**, set:
+   - Name, Type (Full/Command/Office), Target org
+   - Frequency (Daily/Weekly/Monthly), UTC hour
+   - Retention days (default 30)
+   - Encrypt toggle
+3. Click **Add** — Celery Beat will trigger this automatically
+
+### Backup File Format
+
+| Type | Format | Contents |
+|---|---|---|
+| Full DB | `full_YYYYMMDD_HHMMSS.json.gz[.enc]` | Django dumpdata — all tables as JSON |
+| Command | `command_<CODE>_YYYYMMDD.zip[.enc]` | ZIP: organisations.json, users.json, projects.json, survey_areas.json, features.geojson, folders.json, workflow_steps.json, documents.json + document files |
+| Office | `office_<CODE>_YYYYMMDD.zip[.enc]` | Same as Command, single-org scope |
+
+### Restore a Full Backup
+
+```bash
+# Decrypt if encrypted (only needed if you want to inspect the file)
+python -c "
+from cryptography.fernet import Fernet
+key = open('/data/backups/.backup_key','rb').read().strip()
+f = Fernet(key)
+data = f.decrypt(open('backup.json.gz.enc','rb').read())
+open('backup.json.gz','wb').write(data)
+"
+
+# Decompress
+gunzip backup.json.gz
+
+# Restore (will overwrite existing data)
+./RakshaGIS.sh manage loaddata backup.json
+```
+
+### Command-Line Backup (Raw pg_dump)
+
+```bash
+./RakshaGIS.sh backup
+# Creates: /data/rakshagis/backups/rakshagis_backup_YYYYMMDD_HHMMSS.sql.gz
+```
+
+---
+
+## Multi-Language UI
+
+RakshaGIS supports 7 Indian languages out of the box.
+
+### Switching Language
+
+**In the app** (after login): Click the language button in the header toolbar (shows current language in native script).
+
+**On the login page**: Use the language button at the bottom of the login card.
+
+### Available Languages
+
+| Code | Language | Script |
+|---|---|---|
+| `en` | English | Latin |
+| `hi` | हिन्दी (Hindi) | Devanagari |
+| `ta` | தமிழ் (Tamil) | Tamil |
+| `te` | తెలుగు (Telugu) | Telugu |
+| `bn` | বাংলা (Bengali) | Bengali |
+| `kn` | ಕನ್ನಡ (Kannada) | Kannada |
+| `mr` | मराठी (Marathi) | Devanagari |
+
+Language selection is stored in the browser's `localStorage` key `raksha_language` and persists across sessions.
+
+### Adding or Updating Translations
+
+Edit the JSON files in `frontend/src/i18n/locales/`. Missing keys fall back to English automatically.
+
+```bash
+# After editing translation files, rebuild:
+cd frontend && npm run build
+./RakshaGIS.sh manage collectstatic --noinput
+./RakshaGIS.sh restart
+```
+
+---
+
+## AI Features
+
+All AI inference is **100% local** — no data leaves the deployment host.
+
+### RAG (Retrieval-Augmented Generation)
+
+Provides context-aware answers using your actual project documents.
 
 ```
-RakshaGIS/
-├── apps/                  # Django applications
-│   ├── accounts/          # Users, Organisations, authentication
-│   ├── ai_assistant/      # Ollama chat + report generation
-│   ├── core/              # Basemap configs
-│   ├── documents/         # File management + AI processing
-│   ├── gis_layers/        # Master GIS data (State/District/Taluk/Village)
-│   ├── survey_projects/   # Projects, Survey Areas, Features, Folders, Parcels, GeoTiff
-│   └── workflow/          # Survey-area approvals, audit log, notifications
-├── config/                # Django settings, URLs, WSGI
-├── frontend/              # React + TypeScript SPA
-│   └── src/
-│       ├── features/      # Page components by domain
-│       │   ├── map/       # MapPage, AttributeTable, Buffer, Print
-│       │   ├── projects/  # ProjectDetail, SurveyAreas, VersionCompare
-│       │   ├── master/    # State/District/Taluk/Village CRUD
-│       │   ├── users/     # User management
-│       │   └── …
-│       ├── app/           # Routes, Zustand store
-│       ├── services/      # Axios instance, query keys
-│       └── types/         # Shared TypeScript interfaces
-├── nginx/                 # Nginx config
-├── docker-compose.yml
-├── Dockerfile
-├── build.sh               # Smart build (hash-based skip)
-└── RakshaGIS.sh           # Service manager
+1. Upload documents to a project
+2. Run AI processing: Documents page → "Process AI" button
+3. Go to AI Vision page → click "Embed Docs for RAG" (select the project)
+   - Ollama embeds each document chunk using nomic-embed-text
+4. Open AI Chat → select the project from the "RAG Context" dropdown
+5. Ask questions — the system retrieves relevant chunks and injects them as context
+6. The response shows which document chunks were used as sources
+```
+
+**Required model:**
+```bash
+ollama pull nomic-embed-text   # 274 MB — embedding model for RAG
+```
+
+### Vision Boundary Extraction
+
+Extracts parcel information from scanned paper survey maps.
+
+```
+1. Go to AI Vision page
+2. Select a project
+3. Upload a scanned map image (JPEG/PNG/TIFF)
+4. Select vision model (llava:7b recommended)
+5. Click "Extract Boundaries"
+6. Review extracted results:
+   - Map metadata (title, scale, district, village, date, surveyor)
+   - Per-parcel: survey number, area, shape, adjacent parcels
+7. Use the extracted data to manually draw features on the Map page
+```
+
+**Required model:**
+```bash
+ollama pull llava:7b        # 4.7 GB — best quality
+# OR
+ollama pull moondream       # 850 MB — faster, lower detail
+```
+
+### DGDE Domain Model
+
+Creates an Ollama model specialised in DGDE/survey domain knowledge:
+
+```bash
+# Via API (SuperAdmin only):
+curl -X POST http://localhost/api/ai/rag/create-dgde-model/ \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"base_model": "llama3.2", "model_name": "dgde-expert"}'
+
+# Then activate it in AI Config → set "dgde-expert" as the active model
+```
+
+### Training Dataset Export
+
+Exports project documents as JSONL for local LoRA fine-tuning:
+
+```
+AI Vision page → "Export Training Data" button (per project)
+Output: /data/media/training/<project_id>_training.jsonl
 ```
 
 ---
 
 ## API Reference
 
-Interactive API documentation is available at `/api/schema/swagger-ui/` (drf-spectacular).
-
-Key endpoint groups:
+Interactive API documentation: `http://localhost/api/schema/swagger-ui/`
 
 | Prefix | Description |
 |---|---|
-| `/api/accounts/` | Users, Organisations |
-| `/api/projects/` | Survey projects, Features, Folders, Parcels |
-| `/api/projects/survey-areas/` | Survey areas + per-area workflow |
+| `/api/accounts/users/` | User CRUD, force-logout, change-password |
+| `/api/accounts/organisations/` | Organisation CRUD |
+| `/api/projects/` | Survey projects |
+| `/api/projects/survey-areas/` | Survey areas, workflow transitions, dispute check, reports |
+| `/api/projects/features/` | GIS features |
+| `/api/projects/folders/` | Project layer folders |
 | `/api/projects/buffer/` | Buffer analysis |
 | `/api/projects/topology/` | Topology check |
-| `/api/projects/{id}/active-version/` | Auto-version management |
-| `/api/gis/` | Master GIS layers (State/District/Taluk/Village) |
+| `/api/gis/states/` | State master data |
+| `/api/gis/districts/` | District master data |
+| `/api/gis/taluks/` | Taluk master data |
+| `/api/gis/villages/` | Village master data |
+| `/api/gis/boundary-imports/` | Admin boundary import jobs |
 | `/api/workflow/steps/` | Audit log |
-| `/api/workflow/steps/area-transition/{area_pk}/{transition}/` | Survey-area workflow transitions |
-| `/api/documents/` | File upload + AI processing |
-| `/api/ai/` | Chat sessions, report generation |
+| `/api/workflow/steps/area-transition/{area}/{transition}/` | Workflow transitions |
+| `/api/workflow/steps/dispute-check/{area_pk}/` | Boundary dispute check |
+| `/api/documents/` | File upload, OnlyOffice integration, AI processing |
+| `/api/documents/create-blank/` | Create blank online document |
+| `/api/ai/chat/` | AI chat sessions |
+| `/api/ai/tasks/` | AI background tasks |
+| `/api/ai/llm-configs/` | LLM configuration management |
+| `/api/ai/rag/embed-project/{id}/` | Queue RAG document embedding |
+| `/api/ai/rag/embed-status/{id}/` | RAG embedding status |
+| `/api/ai/rag/create-dgde-model/` | Create DGDE domain model |
+| `/api/ai/vision/submit/` | Vision boundary extraction job |
+| `/api/ai/vision/status/{id}/` | Vision job status + results |
+| `/api/backups/jobs/` | Backup job management |
+| `/api/backups/jobs/{id}/download/` | Download (and decrypt) backup file |
+| `/api/backups/schedules/` | Backup schedule management |
 | `/api/core/basemaps/` | Basemap configurations |
-| `/tiles/` | MVT tiles via pg_tileserv |
+| `/api/core/terrain-config/` | Terrain/Cesium configuration |
+| `/tiles/` | MVT vector tiles via pg_tileserv |
+| `/osm-tiles/{z}/{x}/{y}.png` | Offline India raster tiles |
+| `/terrain-tiles/` | SRTM/Cartosat quantized-mesh terrain tiles |
+| `/ws/project/{id}/` | WebSocket: real-time collaboration |
+
+### Authentication
+
+All API endpoints require a JWT Bearer token:
+
+```bash
+# Get token
+curl -X POST http://localhost/api/accounts/token/ \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "yourpassword"}'
+
+# Use token
+curl http://localhost/api/projects/ \
+  -H "Authorization: Bearer <access_token>"
+
+# Refresh token
+curl -X POST http://localhost/api/accounts/token/refresh/ \
+  -d '{"refresh": "<refresh_token>"}'
+```
 
 ---
 
@@ -244,32 +1081,262 @@ Key endpoint groups:
 
 | Role | Capabilities |
 |---|---|
-| SUPERADMIN | Full system access, master data management |
-| DEO_ADMIN / CEO_ADMIN / ADEO_ADMIN | Manage users and orgs within own hierarchy; publish approved survey areas |
-| SDO | Create/submit survey areas, draw/edit features in DRAFT/RETURNED areas |
-| SURVEYOR | Draw and edit features in DRAFT/RETURNED survey areas |
-| CHECKER | Review submitted areas, return or forward to approver |
-| APPROVER | Approve or return areas from review |
-| VIEWER / PDDE_VIEWER | Read-only map and report access |
+| **SUPERADMIN** | Full system access, master data, all backup operations, LLM config, create DGDE model |
+| **DEO_ADMIN / CEO_ADMIN / ADEO_ADMIN** | Manage users/orgs within own hierarchy; publish approved survey areas; approve/reject cross-org access requests; download own org backups |
+| **PDDE_VIEWER** | Read-only access to all data within own command jurisdiction; download command backups |
+| **SDO** | Create/submit survey areas; draw/edit features in DRAFT/RETURNED areas |
+| **SURVEYOR** | Draw and edit features in DRAFT/RETURNED survey areas |
+| **CHECKER** | Review submitted areas; return or forward to approver |
+| **APPROVER** | Approve or return areas from review |
+| **VIEWER** | Read-only map and report access |
 
 ---
 
-## Environment Variables
+## Data Access Rules
 
-| Variable | Description |
+| Actor | Visible data |
 |---|---|
-| `SECRET_KEY` | Django secret key |
-| `DEBUG` | Set `False` in production |
-| `DATABASE_URL` | PostgreSQL connection string |
-| `REDIS_URL` | Redis connection string |
-| `OLLAMA_BASE_URL` | Ollama service URL |
-| `OLLAMA_MODEL` | Model name (e.g., `llama3.2`, `gemma3`) |
-| `ALLOWED_HOSTS` | Comma-separated hostnames |
-| `CORS_ALLOWED_ORIGINS` | Allowed frontend origins |
-| `MEDIA_ROOT` | File upload directory |
+| DGDE | All organisations, all projects, all survey areas (India-wide) |
+| PDDE | All orgs within own command jurisdiction (subtree) |
+| DEO / CEO / ADEO | Own organisation's data only |
+| Any org (approved) | Survey areas approved via cross-org access request |
+| Any user | Projects explicitly shared to them via ProjectShare |
+
+---
+
+## Project Structure
+
+```
+RakshaGIS/
+├── apps/
+│   ├── accounts/          # Users, Organisations, RBAC, 2FA
+│   ├── ai_assistant/      # Ollama/LocalAI chat, RAG, vision extraction, report generation
+│   ├── backups/           # Backup jobs, schedules, Celery tasks, encryption
+│   ├── collaboration/     # WebSocket consumers, JWT middleware, routing
+│   ├── core/              # Basemap configs, terrain config, branding
+│   ├── documents/         # File upload, OnlyOffice integration, AI processing
+│   ├── gis_layers/        # State/District/Taluk/Village master data, boundary import
+│   ├── reports/           # Scheduled reports
+│   ├── survey_projects/   # Projects, Survey Areas, Features, Folders, Parcels, Access Requests
+│   ├── dashboard/         # Dashboard stats
+│   └── workflow/          # Survey-area state machine, dispute detection, audit log, notifications
+├── config/
+│   ├── asgi.py            # ASGI application (Channels + ProtocolTypeRouter)
+│   ├── wsgi.py            # WSGI fallback
+│   ├── celery.py          # Celery configuration
+│   ├── settings/
+│   │   ├── base.py        # Shared settings
+│   │   ├── development.py # Dev overrides (DEBUG=True, etc.)
+│   │   └── production.py  # Production settings
+│   └── urls.py            # Root URL configuration
+├── frontend/              # React 18 + TypeScript SPA (Vite)
+│   └── src/
+│       ├── features/
+│       │   ├── map/               # MapPage, CollabPresence, terrain/
+│       │   ├── terrain/           # Cesium 3D viewer, ElevationChart
+│       │   ├── projects/          # ProjectDetailPage, DisputeModal, etc.
+│       │   ├── ai-chat/           # AI chat page with RAG selector
+│       │   ├── ai-vision/         # Vision boundary extraction page
+│       │   ├── backups/           # Backup management page
+│       │   ├── master/            # State/District/Taluk/Village CRUD + Boundary Import
+│       │   ├── auth/              # LoginPage
+│       │   ├── users/             # User management
+│       │   └── organisations/     # Organisation management
+│       ├── hooks/
+│       │   └── useProjectWebSocket.ts  # Real-time collaboration hook
+│       ├── i18n/
+│       │   ├── index.ts           # i18next configuration
+│       │   └── locales/           # en.json, hi.json, ta.json, te.json, bn.json, kn.json, mr.json
+│       ├── components/
+│       │   ├── AppLayout.tsx      # Main layout, sidebar, header, language switcher
+│       │   └── LanguageSwitcher.tsx
+│       ├── app/                   # Routes, Zustand store
+│       ├── services/              # Axios instance, query keys
+│       └── types/                 # Shared TypeScript interfaces
+├── deploy/
+│   ├── nginx-docker.conf  # Nginx config (HTTP + WebSocket + tile proxies)
+│   ├── nginx-terrain.conf # Terrain tile server nginx config
+│   ├── prometheus.yml     # Prometheus scrape config
+│   └── gunicorn.conf.py   # Gunicorn config (legacy reference)
+├── docker-compose.yml     # All services + profiles
+├── Dockerfile             # Web application image
+├── requirements.txt       # Python dependencies
+├── entrypoint.sh          # Container entrypoint (migrations, collectstatic)
+├── build.sh               # Build + --import-osm + --save/load-images
+├── RakshaGIS.sh           # Service manager (start/stop/backup/restore)
+├── setup_terrain.sh       # SRTM DEM download + quantized-mesh conversion
+└── generate_writeup.py    # Generates project writeup .docx
+```
+
+---
+
+## Architecture
+
+```
+Browser / Client
+  └── nginx (:80/:443)  [raksha-edge network — port publishing]
+        ├── /api/          → Daphne (ASGI) → Django (4 workers)
+        ├── /ws/           → Daphne (ASGI) → Django Channels (WebSocket)
+        ├── /static/       → staticfiles volume (direct serve)
+        ├── /media/        → media volume (direct serve)
+        ├── /tiles/        → pg_tileserv  (MVT vector tiles)
+        ├── /osm-tiles/    → osm-tiles    (raster, offline India)
+        ├── /terrain-tiles/→ terrain-server (quantized-mesh DEM)
+        ├── /onlyoffice/   → OnlyOffice   (document server)
+        └── /              → React SPA (static files)
+
+Django Apps  [raksha-net network — internal, no outbound internet]
+  ├── accounts          — Users, Organisations, RBAC, 2FA
+  ├── core              — Basemap + terrain config + branding
+  ├── gis_layers        — State/District/Taluk/Village master + boundary import
+  ├── survey_projects   — Projects, Survey Areas, Features, Folders, Access Requests
+  ├── documents         — File upload, OnlyOffice, AI processing
+  ├── workflow          — State machine, dispute detection, audit log, notifications
+  ├── ai_assistant      — Ollama/LocalAI chat, RAG pipeline, vision extraction
+  ├── backups           — Encrypted backups, schedules, rotation
+  └── collaboration     — WebSocket consumers (real-time editing)
+
+Background Workers (Celery + Redis)
+  ├── COG conversion (GeoTIFF → Cloud-Optimized)
+  ├── Shapefile import
+  ├── AI document processing (pdfplumber + Ollama)
+  ├── RAG document embedding (Ollama /api/embed)
+  ├── Vision boundary extraction (Ollama /api/chat with images)
+  ├── Backup jobs (dumpdata + encrypt + zip)
+  ├── Backup rotation (delete expired files)
+  └── Scheduled backup runner (check BackupSchedule every hour)
+
+WebSocket (Django Channels + Redis channel layer)
+  └── ProjectRoomConsumer per project:
+        ├── JWT auth via query param (?token=...)
+        ├── Presence tracking (module-level dict)
+        ├── Feature locking (module-level dict, auto-release on disconnect)
+        └── Broadcasts: feature_created/updated/deleted/locked/unlocked/cursor
+
+Network isolation
+  ├── raksha-net  (internal: true) — all backend services; NO outbound internet
+  └── raksha-edge (external)       — nginx only; required for port 80/443
+
+Optional services (Docker profiles)
+  ├── --profile osm                → osm-tiles (India raster tiles)
+  ├── --profile terrain            → terrain-server (SRTM DEM tiles)
+  ├── --profile monitoring         → prometheus + grafana
+  ├── --profile https              → certbot (Let's Encrypt)
+  ├── --profile docker-ollama / docker-ollama-gpu  → Ollama container
+  ├── --profile localai / localai-gpu              → LocalAI container
+  ├── --profile llamacpp / llamacpp-gpu            → llama.cpp container
+  └── --profile anythingllm / anythingllm-gpu     → AnythingLLM container
+```
+
+---
+
+## Troubleshooting
+
+### Web container keeps restarting
+
+```bash
+# Check logs for the error
+docker compose logs web --tail=50
+
+# Common cause: database not ready
+./RakshaGIS.sh status
+
+# Try running migrations manually
+docker compose run --rm web python manage.py migrate
+```
+
+### OnlyOffice shows "document loading failed"
+
+```bash
+# Verify ONLYOFFICE_JWT_SECRET is set in .env
+grep ONLYOFFICE_JWT_SECRET .env
+
+# Check OnlyOffice is healthy
+docker compose ps onlyoffice
+
+# Check logs
+docker compose logs onlyoffice --tail=30
+```
+
+### AI Chat shows "Ollama not reachable"
+
+```bash
+# Check if Ollama is running
+curl http://localhost:11434/api/tags
+
+# If using Docker Ollama:
+docker compose ps ollama
+docker compose logs ollama --tail=20
+
+# If using host Ollama, verify URL in .env:
+# OLLAMA_HOST_URL=http://host.docker.internal:11434 (Docker Desktop / WSL2)
+# OLLAMA_LOCAL_URL=http://localhost:11434 (native Linux)
+```
+
+### WebSocket (real-time collaboration) not connecting
+
+```bash
+# Check Daphne is running (not gunicorn)
+docker compose logs web --tail=10 | grep -E "Daphne|daphne|Starting server"
+
+# Check Redis is running
+docker compose ps redis
+
+# Check channel layer
+docker compose exec web python manage.py shell -c "
+from channels.layers import get_channel_layer
+import asyncio
+cl = get_channel_layer()
+asyncio.run(cl.group_add('test', 'ch'))
+print('OK')
+"
+```
+
+### 3D Terrain viewer shows flat terrain
+
+The terrain viewer works without DEM data, but elevation queries will return 0. To enable real terrain:
+
+1. Run `./setup_terrain.sh --all` to download and convert SRTM data
+2. Start: `docker compose --profile terrain up -d terrain-server`
+3. Add to `.env`: `TERRAIN_TILE_URL=/terrain-tiles`
+4. Restart: `./RakshaGIS.sh restart`
+
+Alternatively, set `CESIUM_ION_TOKEN=<your_token>` in `.env` for online Cesium World Terrain.
+
+### Backup download fails with "Decryption failed"
+
+The encryption key may have changed. The key is stored at `$BACKUP_DIR/.backup_key`. If this file was deleted or the `BACKUP_ENCRYPTION_KEY` env var changed, older backups cannot be decrypted. Always back up the `.backup_key` file securely.
+
+### MapPage shows "Failed to load features"
+
+```bash
+# Check the API is accessible
+curl http://localhost/api/projects/ -H "Authorization: Bearer <token>"
+
+# Check PostGIS extension
+docker compose exec db psql -U raksha -d rakshagis -c "SELECT PostGIS_Version();"
+```
+
+### Build fails with "Permission denied" on migrations
+
+**WSL2 / Docker Desktop issue**: When `./build.sh` runs, the container user (raksha) cannot write to the migrations directory mounted from the host.
+
+**Solution**: Migrations are now created on the host before deployment:
+
+```bash
+# If you added new Django models:
+python manage.py makemigrations
+
+# Then run the build:
+./build.sh
+
+# The build will apply migrations automatically
+```
+
+For details, see [DOCKER_BUILD_FIXES.md](DOCKER_BUILD_FIXES.md).
 
 ---
 
 ## Licence
 
-Developed for DGDE — Government of India. All rights reserved.
+Developed for DGDE — Directorate General of Defence Estates, Government of India. All rights reserved.

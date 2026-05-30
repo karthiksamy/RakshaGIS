@@ -26,6 +26,8 @@ usage() {
   echo "  --save-images       Save all Docker images as tarballs in data-dir/images/"
   echo "  --load-images DIR   Load Docker images from tarballs in DIR"
   echo "  --no-build          Skip Docker image build (use existing images)"
+  echo "  --import-osm        Download India OSM data and import into local tile server"
+  echo "                      Requires internet once. Import takes 2-4 hours."
   echo "  -h, --help          Show this help"
   echo ""
 }
@@ -36,6 +38,7 @@ SAVE_IMAGES=false
 LOAD_IMAGES_DIR=""
 NO_BUILD=false
 FORCE_BUILD=false
+IMPORT_OSM=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -53,6 +56,8 @@ while [[ $# -gt 0 ]]; do
       NO_BUILD=true; shift ;;
     --force-build)
       FORCE_BUILD=true; shift ;;
+    --import-osm)
+      IMPORT_OSM=true; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -346,6 +351,9 @@ AI_BACKENDS=${AI_BACKENDS_DOCKER}
 DJANGO_SETTINGS_MODULE=config.settings.production
 
 GRAFANA_PASSWORD=$(openssl rand -base64 12 | tr -d '=+/')
+ONLYOFFICE_JWT_SECRET=$(openssl rand -base64 32 | tr -d '=+/')
+# Internal base URL so OnlyOffice container fetches documents via nginx
+ONLYOFFICE_INTERNAL_BASE_URL=http://nginx
 EOF
   echo "    ✓ .env created"
 else
@@ -363,8 +371,13 @@ else
   _upsert_env LOCALAI_BASE_URL    "${LOCALAI_BASE_URL_VAL}"
   _upsert_env LLAMACPP_BASE_URL   "${LLAMACPP_BASE_URL_VAL}"
   _upsert_env ANYTHINGLLM_BASE_URL "${ANYTHINGLLM_BASE_URL_VAL}"
-  _upsert_env AI_BACKEND_GPU      "${GPU_MODE}"
-  _upsert_env AI_BACKENDS         "${AI_BACKENDS_DOCKER}"
+  _upsert_env AI_BACKEND_GPU         "${GPU_MODE}"
+  _upsert_env AI_BACKENDS            "${AI_BACKENDS_DOCKER}"
+  # Add OnlyOffice secrets/config if not already set
+  grep -q "^ONLYOFFICE_JWT_SECRET=" "$ENV_FILE" || \
+    echo "ONLYOFFICE_JWT_SECRET=$(openssl rand -base64 32 | tr -d '=+/')" >> "$ENV_FILE"
+  grep -q "^ONLYOFFICE_INTERNAL_BASE_URL=" "$ENV_FILE" || \
+    echo "ONLYOFFICE_INTERNAL_BASE_URL=http://nginx" >> "$ENV_FILE"
   echo "    ✓ Updated .env (DATA_DIR + AI backend URLs + GPU settings)"
 fi
 
@@ -439,16 +452,20 @@ if [[ "$NO_BUILD" == false ]]; then
 fi
 
 # ── Step 6: Pull all dependency images ──────────────────────────────────────
+# Skipped when --load-images is supplied (offline deployment from tarballs).
 if [[ -z "$LOAD_IMAGES_DIR" ]]; then
   echo ""
   echo ">>> Pulling dependency images..."
-  PULL_SERVICES="db redis nginx pg_tileserv prometheus grafana certbot"
+  PULL_SERVICES="db redis nginx pg_tileserv prometheus grafana onlyoffice osm-tiles"
   # Add Ollama image only if we're managing it via Docker (OLLAMA_BASE_URL points to Docker)
   [[ "$OLLAMA_BASE_URL_VAL" == "http://ollama:11434" ]] && \
     PULL_SERVICES="$PULL_SERVICES ollama${GPU_PROFILE_SUFFIX}"
   # shellcheck disable=SC2086
   docker compose $ALL_PROFILE_FLAGS pull --ignore-pull-failures $PULL_SERVICES
   echo "    ✓ Images pulled"
+else
+  echo ""
+  echo "    ✓ Skipping image pull (using loaded images from $LOAD_IMAGES_DIR)"
 fi
 
 # ── Step 7: Save Docker images to data dir (for offline deployment) ──────────
@@ -461,16 +478,16 @@ if [[ "$SAVE_IMAGES" == true ]]; then
   IMAGES=(
     "postgis/postgis:16-3.4"
     "redis:7-alpine"
-    "nginx:alpine"
+    "nginx:1.27-alpine"
     "pramsey/pg_tileserv:latest"
-    "ollama/ollama:latest"
-    "prom/prometheus:latest"
-    "grafana/grafana:latest"
-    "certbot/certbot:latest"
+    "overv/openstreetmap-tile-server:2.3.0"
+    "onlyoffice/documentserver:8.2.2"
+    "prom/prometheus:v2.55.1"
+    "grafana/grafana:11.4.2"
   )
-
-  # Also save the built app image
-  APP_IMAGE=$(docker compose config | grep "image:" | head -1 | awk '{print $2}' || echo "rakshagis-web")
+  # Include Ollama only if using Docker-managed Ollama
+  [[ "$OLLAMA_BASE_URL_VAL" == "http://ollama:11434" ]] && \
+    IMAGES+=("ollama/ollama:latest")
 
   for img in "${IMAGES[@]}"; do
     safe_name=$(echo "$img" | tr '/:' '_')
@@ -478,12 +495,14 @@ if [[ "$SAVE_IMAGES" == true ]]; then
     docker save "$img" -o "$IMAGES_DIR/${safe_name}.tar" 2>/dev/null && echo "      ✓ Saved" || echo "      ⚠ Skipped (image not pulled)"
   done
 
-  # Save app image
-  APP_IMG_NAME=$(docker compose images web --format json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['Image'] if d else '')" 2>/dev/null || echo "")
-  if [[ -n "$APP_IMG_NAME" ]]; then
+  # Save app image (explicitly named rakshagis:web in docker-compose.yml)
+  APP_IMG_NAME="rakshagis:web"
+  if docker inspect "$APP_IMG_NAME" &>/dev/null; then
     echo "    Saving app image: $APP_IMG_NAME"
     docker save "$APP_IMG_NAME" -o "$IMAGES_DIR/rakshagis_app.tar"
     echo "      ✓ Saved"
+  else
+    echo "      ⚠ App image not found (hasn't been built yet)"
   fi
 
   echo "    ✓ All images saved to $IMAGES_DIR"
@@ -498,8 +517,17 @@ sleep 8
 
 echo ""
 echo ">>> Running migrations and seeding data..."
-docker compose run --rm web python manage.py makemigrations --no-input
-docker compose run --rm web python manage.py migrate --no-input
+# Note: makemigrations is skipped here because the bind mount (.:./app) causes
+# permission issues with the container user (raksha) on WSL2/Docker Desktop.
+# Migrations are auto-created by entrypoint.sh when services start.
+# If you have custom models, create migrations on the host:
+#   python manage.py makemigrations
+echo "    Running migrations..."
+docker compose run --rm web python manage.py migrate --no-input || {
+  echo "    ⚠ Migration failed. Ensure makemigrations has been run on the host."
+  echo "      If you added new models, run: python manage.py makemigrations"
+  exit 1
+}
 docker compose run --rm web python manage.py seed_basemaps
 docker compose run --rm web python manage.py init_folders
 
@@ -513,6 +541,70 @@ if not User.objects.filter(username='admin').exists():
 else:
     print('Superadmin already exists')
 "
+
+# ── Step 8b: Import India OSM data into local tile server ────────────────────
+# Run once with:  ./build.sh --import-osm
+# Requires internet access to download ~800 MB from Geofabrik.
+# After this step the tile server runs completely offline.
+# Disk space required: ~20 GB under DATA_DIR/tiles/
+if [[ "$IMPORT_OSM" == true ]]; then
+  echo ""
+  echo -e "${BOLD}>>> Local OSM Tile Server — India data import${RESET}"
+  OSM_DIR="$DATA_DIR/tiles"
+  PBF_FILE="$OSM_DIR/india-latest.osm.pbf"
+  OSM_DATA_DIR="$OSM_DIR/osm-data"
+  OSM_CACHE_DIR="$OSM_DIR/tile-cache"
+  mkdir -p "$OSM_DATA_DIR" "$OSM_CACHE_DIR"
+
+  # Download India extract from Geofabrik (one-time, requires internet)
+  if [[ -f "$PBF_FILE" ]]; then
+    echo "    India PBF already present: $PBF_FILE"
+    echo "    Delete it to re-download."
+  else
+    echo "    Downloading India OSM extract from Geofabrik (~800 MB)..."
+    echo "    Source: https://download.geofabrik.de/asia/india-latest.osm.pbf"
+    if command -v wget &>/dev/null; then
+      wget --progress=bar:force \
+           --continue \
+           -O "$PBF_FILE" \
+           "https://download.geofabrik.de/asia/india-latest.osm.pbf"
+    elif command -v curl &>/dev/null; then
+      curl -L --continue-at - --progress-bar \
+           -o "$PBF_FILE" \
+           "https://download.geofabrik.de/asia/india-latest.osm.pbf"
+    else
+      echo "    ✖ Neither wget nor curl found. Please download manually:"
+      echo "      https://download.geofabrik.de/asia/india-latest.osm.pbf"
+      echo "      Save to: $PBF_FILE"
+      echo "    Then re-run:  ./build.sh --import-osm"
+      exit 1
+    fi
+    echo "    ✓ Download complete: $PBF_FILE"
+  fi
+
+  echo ""
+  echo "    Importing OSM data into the tile server database..."
+  echo "    ⏳ This takes 2-4 hours on first run. Please be patient."
+  echo "    (CPU: 4 threads, PostGIS inside the tile server container)"
+  echo ""
+  docker run --rm \
+    -v "$PBF_FILE:/data/region.osm.pbf:ro" \
+    -v "$OSM_DATA_DIR:/data/database" \
+    -v "$OSM_CACHE_DIR:/data/tiles" \
+    --shm-size="1g" \
+    -e THREADS=4 \
+    -e UPDATES=disabled \
+    overv/openstreetmap-tile-server:2.3.0 \
+    import
+
+  echo ""
+  echo -e "  ${GREEN}✓ OSM import complete.${RESET}"
+  echo "    Starting the tile server (profile: osm)..."
+  docker compose --profile osm up -d osm-tiles
+  echo "    The local tile server will serve India map tiles at /osm-tiles/{z}/{x}/{y}.png"
+  echo "    In the application: Settings → Basemaps → activate 'Local OSM (Offline)'"
+  echo ""
+fi
 
 # ── Step 9: Build frontend ────────────────────────────────────────────────────
 if command -v node &> /dev/null && [[ -d "$SCRIPT_DIR/frontend" ]]; then
@@ -567,5 +659,10 @@ echo "║  Access URL      : http://localhost                     ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Use './RakshaGIS.sh start|stop|restart|status'         ║"
 echo "║  Go to Settings → AI Config to activate a backend       ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+echo "║  OFFLINE TILE SERVER (one-time, needs internet):        ║"
+echo "║    ./build.sh --import-osm                              ║"
+echo "║    Downloads India OSM (~800 MB), import ~2-4 hrs       ║"
+echo "║    After import: fully offline India base map           ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""

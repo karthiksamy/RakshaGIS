@@ -8,11 +8,13 @@ from .views import (
     FeatureAttachmentViewSet, CSVImportView, EncroachmentView,
     FeatureMergeView, FeatureSplitView, ProjectMilestoneViewSet,
     QGISUploadLogViewSet, TemporaryLayerViewSet,
+    SurveyAreaAccessRequestViewSet,
 )
 
 router = DefaultRouter()
 router.register('', SurveyProjectViewSet, basename='survey-project')
 router.register('survey-areas', SurveyAreaViewSet, basename='survey-area')
+router.register('access-requests', SurveyAreaAccessRequestViewSet, basename='area-access-request')
 router.register('features', GISFeatureViewSet, basename='gis-feature')
 router.register('parcels', DefenceParcelViewSet, basename='defence-parcel')
 router.register('attribute-templates', AttributeTemplateViewSet, basename='attribute-template')

@@ -4,13 +4,16 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django_filters.rest_framework import DjangoFilterBackend
 
+from django.db import connection
+from django.utils import timezone
+
 from apps.accounts.models import User
 from apps.accounts.permissions import org_queryset_filter
 from apps.survey_projects.models import SurveyProject, SurveyArea
-from .models import WorkflowStep, AuditLog, Notification
+from .models import WorkflowStep, AuditLog, Notification, DisputeReport
 from .serializers import (
     WorkflowStepSerializer, WorkflowTransitionSerializer,
-    AuditLogSerializer, NotificationSerializer,
+    AuditLogSerializer, NotificationSerializer, DisputeReportSerializer,
 )
 
 # (required_from_status, new_status, role_property)
@@ -97,6 +100,60 @@ def _notify_org_users(project, transition_name, actor):
         )
         for u in users
     ])
+
+
+def _run_dispute_check(area):
+    """
+    Run a PostGIS spatial overlap check for the given SurveyArea.
+
+    Returns a list of dispute dicts (empty = no overlaps).
+    Only checks POLYGON features against PUBLISHED survey-area projects
+    from other organisations.
+    """
+    org_id = area.project.organisation_id
+    project_id = area.project_id
+
+    sql = """
+        SELECT DISTINCT ON (sf.id, tf.id)
+            sf.id                 AS source_feature_id,
+            sf.layer_name         AS source_layer,
+            tf.id                 AS target_feature_id,
+            tf.layer_name         AS target_layer,
+            tp.project_number     AS target_project,
+            tp.id                 AS target_project_id,
+            o.name                AS target_org,
+            ROUND(
+                ST_Area(ST_Transform(
+                    ST_Intersection(sf.geometry, tf.geometry), 32643
+                ))::numeric, 2
+            )                     AS overlap_sqm
+        FROM survey_projects_gisfeature sf
+        JOIN survey_projects_gisfeature tf
+            ON ST_Intersects(sf.geometry, tf.geometry)
+           AND sf.id != tf.id
+        JOIN survey_projects_surveyproject tp ON tf.project_id = tp.id
+        JOIN accounts_organisation o ON tp.organisation_id = o.id
+        WHERE sf.project_id      = %s
+          AND sf.geometry_type   = 'POLYGON'
+          AND sf.is_deleted      = false
+          AND tf.geometry_type   = 'POLYGON'
+          AND tf.is_deleted      = false
+          AND tp.organisation_id != %s
+          AND EXISTS (
+              SELECT 1
+              FROM survey_projects_surveyarea sa
+              WHERE sa.project_id = tp.id
+                AND sa.status     = 'PUBLISHED'
+          )
+        LIMIT 100
+    """
+
+    with connection.cursor() as cur:
+        cur.execute(sql, [project_id, org_id])
+        cols = [c.name for c in cur.description]
+        rows = cur.fetchall()
+
+    return [dict(zip(cols, row)) for row in rows]
 
 
 class WorkflowStepViewSet(viewsets.ReadOnlyModelViewSet):
@@ -211,6 +268,31 @@ class WorkflowStepViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # -- Dispute check for submission transitions --
+        if transition_name in ('forward', 're_forward'):
+            force = str(request.data.get('force_submit', '')).lower() in ('true', '1', 'yes')
+            if not force:
+                disputes = _run_dispute_check(area)
+                if disputes:
+                    report = DisputeReport.objects.create(
+                        survey_area=area,
+                        checked_by=user,
+                        status=DisputeReport.HAS_DISPUTES,
+                        disputes=disputes,
+                    )
+                    return Response(
+                        {
+                            'detail': (
+                                f'{len(disputes)} spatial overlap(s) detected with published '
+                                f'features from other organisations. Review and acknowledge to proceed.'
+                            ),
+                            'dispute_count': len(disputes),
+                            'dispute_report_id': report.id,
+                            'disputes': disputes,
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
         serializer = WorkflowTransitionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -249,6 +331,70 @@ class WorkflowStepViewSet(viewsets.ReadOnlyModelViewSet):
             'status': new_status,
             'detail': f'Survey area {TRANSITION_LABELS[transition_name]}.',
         })
+
+    @action(
+        detail=False, methods=['get', 'post'],
+        url_path='dispute-check/(?P<area_pk>[^/.]+)',
+        permission_classes=[permissions.IsAuthenticated],
+    )
+    def dispute_check(self, request, area_pk=None):
+        """
+        GET  — return the latest DisputeReport for this area (or 204 if none).
+        POST — run a fresh dispute check synchronously and return the result.
+        """
+        try:
+            area = SurveyArea.objects.select_related('project__organisation').get(pk=area_pk)
+        except SurveyArea.DoesNotExist:
+            return Response({'detail': 'Survey area not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        if user.role != User.SUPERADMIN and area.project.organisation != user.organisation:
+            return Response({'detail': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if request.method == 'GET':
+            report = DisputeReport.objects.filter(survey_area=area).first()
+            if not report:
+                return Response(status=status.HTTP_204_NO_CONTENT)
+            return Response(DisputeReportSerializer(report).data)
+
+        # POST — run fresh check
+        disputes = _run_dispute_check(area)
+        report_status = DisputeReport.HAS_DISPUTES if disputes else DisputeReport.CLEAN
+        report = DisputeReport.objects.create(
+            survey_area=area,
+            checked_by=user,
+            status=report_status,
+            disputes=disputes,
+        )
+        return Response(DisputeReportSerializer(report).data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=False, methods=['post'],
+        url_path='dispute-check/(?P<area_pk>[^/.]+)/acknowledge',
+        permission_classes=[permissions.IsAuthenticated],
+    )
+    def acknowledge_disputes(self, request, area_pk=None):
+        """Mark the latest dispute report as acknowledged so the area can be force-submitted."""
+        try:
+            area = SurveyArea.objects.select_related('project__organisation').get(pk=area_pk)
+        except SurveyArea.DoesNotExist:
+            return Response({'detail': 'Survey area not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        if user.role != User.SUPERADMIN and area.project.organisation != user.organisation:
+            return Response({'detail': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+
+        report = DisputeReport.objects.filter(
+            survey_area=area, status=DisputeReport.HAS_DISPUTES
+        ).first()
+        if not report:
+            return Response({'detail': 'No dispute report to acknowledge.'}, status=status.HTTP_404_NOT_FOUND)
+
+        report.acknowledged = True
+        report.acknowledged_by = user
+        report.acknowledged_at = timezone.now()
+        report.save(update_fields=['acknowledged', 'acknowledged_by', 'acknowledged_at'])
+        return Response({'detail': 'Disputes acknowledged.'})
 
 
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):

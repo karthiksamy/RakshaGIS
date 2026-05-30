@@ -10,12 +10,15 @@ import {
   MenuFoldOutlined, MenuUnfoldOutlined, DatabaseOutlined, KeyOutlined,
   BellOutlined, DashboardOutlined, BarChartOutlined, AuditOutlined,
   CheckCircleOutlined, SearchOutlined, BgColorsOutlined, EyeOutlined, EnvironmentOutlined,
+  ShareAltOutlined, ImportOutlined, CompassOutlined, SafetyOutlined, CloudServerOutlined,
 } from '@ant-design/icons'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useTranslation } from 'react-i18next'
 import { useAppStore } from '@/app/store'
 import api from '@/services/api'
 import { useTheme, THEMES, type ThemeKey } from '@/context/ThemeContext'
 import { useBranding } from '@/context/BrandingContext'
+import LanguageSwitcher from './LanguageSwitcher'
 
 const { Text } = Typography
 const { Header, Sider, Content } = Layout
@@ -23,9 +26,12 @@ const { Header, Sider, Content } = Layout
 const NAV_ITEMS = [
   { key: '/dashboard', icon: <DashboardOutlined />, label: 'Dashboard' },
   { key: '/map', icon: <GlobalOutlined />, label: 'Map' },
+  { key: '/terrain', icon: <CompassOutlined />, label: '3D Terrain' },
   { key: '/projects', icon: <FolderOutlined />, label: 'Projects' },
   { key: '/documents', icon: <FileOutlined />, label: 'Documents' },
+  { key: '/access-requests', icon: <ShareAltOutlined />, label: 'Data Access' },
   { key: '/ai-chat', icon: <RobotOutlined />, label: 'AI Assistant' },
+  { key: '/ai-vision', icon: <EyeOutlined />, label: 'AI Vision' },
 ]
 
 const ADMIN_NAV_ITEMS = [
@@ -34,6 +40,7 @@ const ADMIN_NAV_ITEMS = [
   { key: '/basemaps', icon: <AppstoreOutlined />, label: 'Basemaps' },
   { key: '/reports', icon: <BarChartOutlined />, label: 'Reports' },
   { key: '/audit', icon: <AuditOutlined />, label: 'Audit Logs' },
+  { key: '/backups', icon: <SafetyOutlined />, label: 'Backups' },
   { key: '/qgis-sync', icon: <CheckCircleOutlined />, label: 'QGIS Sync' },
 ]
 
@@ -42,11 +49,13 @@ const MASTER_NAV_ITEMS = [
   { key: '/master/districts', icon: <DatabaseOutlined />, label: 'Districts' },
   { key: '/master/taluks', icon: <DatabaseOutlined />, label: 'Taluks' },
   { key: '/master/villages', icon: <DatabaseOutlined />, label: 'Villages' },
+  { key: '/master/boundary-import', icon: <ImportOutlined />, label: 'Boundary Import' },
 ]
 
 const SETTINGS_NAV_ITEMS = [
-  { key: '/settings/branding', icon: <BgColorsOutlined />, label: 'Branding' },
-  { key: '/settings/ai-config', icon: <RobotOutlined />, label: 'AI Config' },
+  { key: '/settings/branding',       icon: <BgColorsOutlined />,    label: 'Branding'           },
+  { key: '/settings/ai-config',      icon: <RobotOutlined />,       label: 'AI Config'          },
+  { key: '/settings/external-data',  icon: <CloudServerOutlined />, label: 'External Data'      },
 ]
 
 export default function AppLayout() {
@@ -63,6 +72,7 @@ export default function AppLayout() {
   const qc = useQueryClient()
   const { themeKey, setTheme } = useTheme()
   const branding = useBranding()
+  const { t } = useTranslation()
 
   // Derive if we are on a light (non-dark) theme for text contrast
   const isLight = themeKey === 'light'
@@ -80,6 +90,16 @@ export default function AppLayout() {
     refetchInterval: 30_000,
   })
   const unread = unreadData?.unread ?? 0
+
+  const isAdmin = user && ['SUPERADMIN', 'DEO_ADMIN', 'CEO_ADMIN', 'ADEO_ADMIN'].includes(user.role)
+  const { data: pendingAccessData } = useQuery<any[]>({
+    queryKey: ['access-requests', { direction: 'incoming', status: 'PENDING' }],
+    queryFn: () =>
+      api.get('/projects/access-requests/?direction=incoming&status=PENDING').then((r) => r.data),
+    enabled: !!isAdmin,
+    refetchInterval: 60_000,
+  })
+  const pendingAccessCount = pendingAccessData?.length ?? 0
 
   const { data: notifsData } = useQuery<{ results: any[] }>({
     queryKey: ['notifications', notifOpen],
@@ -145,7 +165,6 @@ export default function AppLayout() {
     })
   }
 
-  const isAdmin = user && ['SUPERADMIN', 'DEO_ADMIN', 'CEO_ADMIN', 'ADEO_ADMIN'].includes(user.role)
   const isSuperAdmin = user?.role === 'SUPERADMIN'
 
   function handleLogout() {
@@ -213,15 +232,28 @@ export default function AppLayout() {
     ],
   }
 
+  // Translated nav items (re-computed when language changes)
+  const translatedNavItems = NAV_ITEMS.map(item => ({ ...item, label: t(`nav.${item.key.slice(1).replace(/-/g,'_')}`, item.label) }))
+  const translatedAdminItems = ADMIN_NAV_ITEMS.map(item => ({ ...item, label: t(`nav.${item.key.slice(1).replace(/-/g,'_')}`, item.label) }))
+  const translatedMasterItems = MASTER_NAV_ITEMS.map(item => ({ ...item, label: t(`nav.${item.key.replace('/master/','').replace(/-/g,'_')}`, item.label) }))
+  const translatedSettingsItems = SETTINGS_NAV_ITEMS.map(item => ({ ...item, label: t(`nav.${item.key.replace('/settings/','').replace(/-/g,'_')}`, item.label) }))
+
+  const navItemsWithBadgeTranslated = translatedNavItems.map(item => {
+    if (item.key === '/access-requests' && pendingAccessCount > 0) {
+      return { ...item, label: <Badge count={pendingAccessCount} size="small" offset={[6, 0]}>{item.label}</Badge> }
+    }
+    return item
+  })
+
   const navItems = [
-    ...NAV_ITEMS,
-    ...(isAdmin ? [{ type: 'divider' as const }, ...ADMIN_NAV_ITEMS] : []),
+    ...navItemsWithBadgeTranslated,
+    ...(isAdmin ? [{ type: 'divider' as const }, ...translatedAdminItems] : []),
     ...(isSuperAdmin
       ? [
           { type: 'divider' as const },
-          { key: 'master-header', label: 'Master Data', type: 'group', children: MASTER_NAV_ITEMS },
+          { key: 'master-header', label: t('nav.master_data', 'Master Data'), type: 'group', children: translatedMasterItems },
           { type: 'divider' as const },
-          { key: 'settings-header', label: 'Settings', type: 'group', children: SETTINGS_NAV_ITEMS },
+          { key: 'settings-header', label: t('common.settings', 'Settings'), type: 'group', children: translatedSettingsItems },
         ]
       : []),
   ]
@@ -305,6 +337,9 @@ export default function AppLayout() {
               {user.role}
             </span>
           )}
+
+          {/* Language switcher */}
+          <LanguageSwitcher />
 
           {/* Theme switcher */}
           <Dropdown menu={themeMenu} placement="bottomRight" trigger={['click']}>

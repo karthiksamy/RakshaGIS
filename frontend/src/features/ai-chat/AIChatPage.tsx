@@ -2,12 +2,13 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Layout, List, Button, Input, Typography, Spin, Space, Card, message,
-  Modal, Alert, Tag, Upload, Tooltip, Badge,
+  Modal, Alert, Tag, Upload, Tooltip, Badge, Select,
 } from 'antd'
 import {
   PlusOutlined, SendOutlined, RobotOutlined, UserOutlined,
   PaperClipOutlined, WarningOutlined, CheckCircleOutlined,
-  LoadingOutlined, FileOutlined, CloseOutlined,
+  LoadingOutlined, FileOutlined, CloseOutlined, AimOutlined,
+  BookOutlined,
 } from '@ant-design/icons'
 import type { UploadFile } from 'antd'
 import api from '@/services/api'
@@ -35,6 +36,8 @@ export default function AIChatPage() {
   const qc = useQueryClient()
   const [activeSession, setActiveSession] = useState<number | null>(null)
   const [inputText, setInputText] = useState('')
+  const [ragProjectId, setRagProjectId] = useState<number | null>(null)
+  const [lastRagSources, setLastRagSources] = useState<any[]>([])
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -64,12 +67,32 @@ export default function AIChatPage() {
     },
   })
 
+  const { data: projects = [] } = useQuery<any[]>({
+    queryKey: ['projects-list'],
+    queryFn: () => api.get('/projects/?page_size=100').then(r => r.data.results ?? r.data),
+  })
+
+  const { data: ragStatus } = useQuery<any>({
+    queryKey: ['rag-status', ragProjectId],
+    queryFn: () =>
+      ragProjectId
+        ? api.get(`/ai/rag/embed-status/${ragProjectId}/`).then(r => r.data)
+        : Promise.resolve(null),
+    enabled: !!ragProjectId,
+    refetchInterval: 15000,
+  })
+
   const sendMessage = useMutation({
     mutationFn: (msg: string) =>
-      api.post(`/ai/chat/${activeSession}/chat/`, { message: msg }).then((r) => r.data),
-    onSuccess: () => {
+      api.post(`/ai/chat/${activeSession}/chat/`, {
+        message: msg,
+        ...(ragProjectId ? { project_id: ragProjectId } : {}),
+      }).then((r) => r.data),
+    onSuccess: (data: any) => {
       qc.invalidateQueries({ queryKey: qk.chatSession(activeSession!) })
       setInputText('')
+      if (data?.rag_sources?.length) setLastRagSources(data.rag_sources)
+      else setLastRagSources([])
     },
     onError: (err: any) => {
       const detail = err?.response?.data?.detail || 'AI service unavailable'
@@ -322,6 +345,41 @@ export default function AIChatPage() {
                 </div>
               )}
               <div ref={messagesEndRef} />
+            </div>
+
+            {/* RAG project selector */}
+            <div style={{ padding: '6px 12px', borderTop: '1px solid #1a1a2e', background: '#0a0a18', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <AimOutlined style={{ color: '#4fc3f7', fontSize: 12 }} />
+              <span style={{ color: '#666', fontSize: 11 }}>RAG context:</span>
+              <Select
+                size="small"
+                allowClear
+                placeholder="No project (general chat)"
+                style={{ width: 200 }}
+                value={ragProjectId}
+                onChange={setRagProjectId}
+                options={projects.map((p: any) => ({ value: p.id, label: p.project_number || p.name }))}
+              />
+              {ragStatus && (
+                <Tag
+                  color={ragStatus.rag_ready ? 'green' : ragStatus.total_chunks > 0 ? 'orange' : 'default'}
+                  icon={ragStatus.rag_ready ? <CheckCircleOutlined /> : undefined}
+                  style={{ fontSize: 10 }}
+                >
+                  {ragStatus.rag_ready
+                    ? `${ragStatus.total_chunks} chunks ready`
+                    : ragStatus.pending_tasks > 0
+                    ? `Embedding ${ragStatus.pending_tasks} docs…`
+                    : 'No embeddings — go to Vision page → Embed Docs'}
+                </Tag>
+              )}
+              {lastRagSources.length > 0 && (
+                <Tooltip title={lastRagSources.map((s: any) => `${s.doc_title} (chunk ${s.chunk_index})`).join('\n')}>
+                  <Tag color="blue" icon={<BookOutlined />} style={{ fontSize: 10, cursor: 'help' }}>
+                    {lastRagSources.length} source{lastRagSources.length !== 1 ? 's' : ''} used
+                  </Tag>
+                </Tooltip>
+              )}
             </div>
 
             {/* Input */}

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import WorkflowStep, AuditLog, Notification
+from .models import WorkflowStep, AuditLog, Notification, DisputeReport
 
 
 class WorkflowStepSerializer(serializers.ModelSerializer):
@@ -30,6 +30,20 @@ class AuditLogSerializer(serializers.ModelSerializer):
             'id', 'user', 'user_name', 'action', 'action_display',
             'model_name', 'object_id', 'object_repr', 'changes',
             'ip_address', 'timestamp',
+        ]
+        read_only_fields = fields
+
+
+class DisputeReportSerializer(serializers.ModelSerializer):
+    checked_by_name = serializers.CharField(source='checked_by.username', read_only=True)
+    acknowledged_by_name = serializers.CharField(source='acknowledged_by.username', read_only=True)
+
+    class Meta:
+        model = DisputeReport
+        fields = [
+            'id', 'survey_area', 'checked_at', 'checked_by', 'checked_by_name',
+            'status', 'disputes', 'acknowledged', 'acknowledged_by',
+            'acknowledged_by_name', 'acknowledged_at',
         ]
         read_only_fields = fields
 

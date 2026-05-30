@@ -18,4 +18,6 @@ export const qk = {
   activeVersion: (projectId: number) => ['projects', projectId, 'active-version'] as const,
   surveyAreas: (projectId: number) => ['survey-areas', projectId] as const,
   areaWorkflow: (areaId: number) => ['survey-areas', areaId, 'workflow'] as const,
+  areaDiscovery: () => ['survey-areas', 'discovery'] as const,
+  accessRequests: (params?: Record<string, unknown>) => ['access-requests', params] as const,
 }

@@ -1,4 +1,5 @@
 import json
+import math
 import httpx
 from django.conf import settings
 
@@ -245,6 +246,196 @@ class LLMService:
             prompt=f"Validate these GIS feature attributes for a '{layer_name}' layer:\n\n{json.dumps(attributes, indent=2)}\n\nList any missing fields, inconsistencies, or data quality issues.",
             system="You are a GIS data quality expert for Indian land survey systems.",
         )
+
+    # ── Embedding (RAG) ──────────────────────────────────────────────────────
+
+    def get_embedding(self, text: str, model: str = 'nomic-embed-text') -> list[float]:
+        """Call Ollama /api/embed and return the embedding vector."""
+        r = httpx.post(
+            f"{self.base_url}/api/embed",
+            json={'model': model, 'input': text},
+            timeout=60,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # Ollama returns {"embeddings": [[...]], ...} in newer versions
+        if 'embeddings' in data:
+            return data['embeddings'][0]
+        # Older: {"embedding": [...]}
+        return data.get('embedding', [])
+
+    def list_embed_models(self) -> list[str]:
+        """Return models that are embed-only (bert family) from Ollama."""
+        try:
+            r = httpx.get(f"{self.base_url}/api/tags", timeout=3)
+            r.raise_for_status()
+            result = []
+            for m in r.json().get('models', []):
+                families = m.get('details', {}).get('families') or []
+                if any(f in _EMBED_ONLY_FAMILIES for f in families):
+                    result.append(m['name'])
+            return result
+        except Exception:
+            return []
+
+    # ── Vision ───────────────────────────────────────────────────────────────
+
+    def vision_analyze(self, image_b64: str, prompt: str, model: str = 'llava:7b') -> str:
+        """Send an image (base64) + prompt to a vision-capable Ollama model."""
+        r = httpx.post(
+            f"{self.base_url}/api/chat",
+            json={
+                'model': model,
+                'messages': [
+                    {
+                        'role': 'user',
+                        'content': prompt,
+                        'images': [image_b64],
+                    }
+                ],
+                'stream': False,
+            },
+            timeout=300,  # Vision models are slow
+        )
+        r.raise_for_status()
+        return r.json()['message']['content']
+
+    def list_vision_models(self) -> list[str]:
+        """Return models that support vision (have 'clip' or 'vision' in their details)."""
+        try:
+            r = httpx.get(f"{self.base_url}/api/tags", timeout=3)
+            r.raise_for_status()
+            result = []
+            for m in r.json().get('models', []):
+                name = m.get('name', '')
+                families = m.get('details', {}).get('families') or []
+                # Vision models include llava, moondream, qwen-vl, minicpm-v, etc.
+                if any(f in name.lower() for f in ('llava', 'moondream', 'minicpm', 'qwen2-vl', 'vision', 'bakllava')):
+                    result.append(name)
+                elif 'clip' in families:
+                    result.append(name)
+            return result
+        except Exception:
+            return []
+
+    # ── RAG context retrieval ─────────────────────────────────────────────────
+
+    def answer_with_rag(self, question: str, project_id: int, top_k: int = 5) -> tuple[str, list[dict]]:
+        """
+        Retrieve the top_k most relevant document chunks for `question`
+        from the given project, inject them as context, and return
+        (answer, list_of_source_chunks).
+        """
+        from apps.ai_assistant.models import DocumentChunk
+
+        chunks = list(
+            DocumentChunk.objects.filter(project_id=project_id)
+            .exclude(embedding=[])
+            .values('id', 'text', 'embedding', 'document__title', 'chunk_index')
+        )
+
+        if not chunks:
+            # No embeddings yet — fall back to plain answer
+            answer = self.answer_gis_question(question)
+            return answer, []
+
+        # Embed the question using the same model as the chunks
+        embed_model = chunks[0].get('embed_model', 'nomic-embed-text') if chunks else 'nomic-embed-text'
+        # embed_model is not in .values() above — get it separately
+        em_record = DocumentChunk.objects.filter(project_id=project_id).exclude(embedding=[]).first()
+        embed_model = em_record.embed_model if em_record else 'nomic-embed-text'
+
+        try:
+            q_embedding = self.get_embedding(question, model=embed_model)
+        except Exception:
+            answer = self.answer_gis_question(question)
+            return answer, []
+
+        # Compute cosine similarity for each chunk
+        scored = []
+        for chunk in chunks:
+            sim = _cosine_similarity(q_embedding, chunk['embedding'])
+            scored.append((sim, chunk))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_chunks = [c for _, c in scored[:top_k]]
+
+        # Build context string
+        context_parts = []
+        for c in top_chunks:
+            context_parts.append(
+                f"[Source: {c['document__title']}, chunk {c['chunk_index']}]\n{c['text']}"
+            )
+        context = '\n\n---\n\n'.join(context_parts)
+
+        system = (
+            "You are DGDE-Expert, an AI assistant for the Directorate General of Defence Estates, India. "
+            "You have deep knowledge of Indian land survey law, defence estate management, and GIS workflows. "
+            "Answer questions accurately based on the provided document context. "
+            "If the context does not contain the answer, say so clearly."
+        )
+        prompt = f"Context from project documents:\n\n{context}\n\n---\n\nQuestion: {question}"
+
+        answer = self.generate(prompt=prompt, system=system)
+
+        sources = [
+            {'chunk_id': c['id'], 'doc_title': c['document__title'], 'chunk_index': c['chunk_index']}
+            for c in top_chunks
+        ]
+        return answer, sources
+
+
+# ── Pure-Python helpers ────────────────────────────────────────────────────────
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot  = sum(x * y for x, y in zip(a, b))
+    na   = math.sqrt(sum(x * x for x in a))
+    nb   = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def chunk_text(text: str, chunk_size: int = 600, overlap: int = 80) -> list[str]:
+    """
+    Split `text` into overlapping word-level chunks.
+    chunk_size / overlap are in words (not characters).
+    """
+    words = text.split()
+    if not words:
+        return []
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = min(start + chunk_size, len(words))
+        chunks.append(' '.join(words[start:end]))
+        if end == len(words):
+            break
+        start += chunk_size - overlap
+    return chunks
+
+
+DGDE_SYSTEM_PROMPT = """\
+You are DGDE-Expert, an AI assistant embedded in RakshaGIS — the official GIS survey \
+management platform for the Directorate General of Defence Estates (DGDE), Government of India.
+
+Domain knowledge:
+- Land Acquisition Act 1894 / RFCTLARR Act 2013, Defence Lands and Cantonments Act 2006
+- Survey of India standards (cadastral, topographic, revenue surveys)
+- Indian coordinate reference systems: Everest 1830 (SOI local), WGS 84
+- DGDE org hierarchy: DGDE → PDDE → DEO → CEO/ADEO offices
+- Survey workflow roles: Surveyor/SDO → Checker → Approver → DEO Admin
+- Key document types: mutation record, survey settlement, revenue map, demarcation notice,
+  boundary pillars report, encroachment report, defence land register
+- GIS terms: cadastral parcel, khasra/khata, survey number, topo sheet, SFD (Standard Format Drawing)
+
+Behaviour:
+- Always refer to parcels by their survey number if available
+- Use formal government report language for generated reports
+- Cross-reference information across documents when possible
+- Flag discrepancies between document text and GIS data if noticed
+- Never speculate about land ownership; cite the source document
+"""
 
 
 # Keep OllamaService as an alias so existing code that imports it still works

@@ -42,6 +42,8 @@ urlpatterns = [
     path('api/ai/', include('apps.ai_assistant.urls')),
     path('api/dashboard/', include('apps.dashboard.urls')),
     path('api/reports/', include('apps.reports.urls')),
+    path('api/backups/', include('apps.backups.urls')),
+    path('api/external/', include('apps.external_data.urls')),
 
     # React SPA catch-all — must be last; serves Vite-built index.html for any non-API path
     re_path(r'^(?!api/|admin/|static/|media/|metrics/).*$', spa_index, name='frontend'),

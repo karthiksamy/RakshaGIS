@@ -1,4 +1,6 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
+import { useProjectWebSocket } from '@/hooks/useProjectWebSocket'
+import CollabPresence from './CollabPresence'
 import { useSearchParams } from 'react-router-dom'
 import Graticule from 'ol/layer/Graticule'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -52,7 +54,7 @@ import {
   MergeCellsOutlined, DownloadOutlined, ClearOutlined,
   HistoryOutlined, RetweetOutlined,
   SearchOutlined, NodeIndexOutlined, FunctionOutlined, SisternodeOutlined,
-  RadiusUprightOutlined, MinusCircleOutlined, FileAddOutlined,
+  RadiusUprightOutlined, MinusCircleOutlined, FileAddOutlined, UploadOutlined,
 } from '@ant-design/icons'
 import TileWMS from 'ol/source/TileWMS'
 import HeatmapLayer from 'ol/layer/Heatmap'
@@ -67,8 +69,11 @@ import type {
 import BufferAnalysisModal, { BUFFER_COLORS } from './BufferAnalysisModal'
 import AttributeTablePanel from './AttributeTablePanel'
 import PrintLayoutModal, { type LayerLegendItem } from './PrintLayoutModal'
+import MapExportModal from './MapExportModal'
 import TempLayersPanel, { getTempLayerColor } from './TempLayersPanel'
 import DraggableModal from '@/components/DraggableModal'
+import NewLayerModal from './NewLayerModal'
+import ImportGISModal from './ImportGISModal'
 import 'ol/ol.css'
 
 const INDIA_CENTER = fromLonLat([78.9629, 22.5937])
@@ -237,6 +242,7 @@ export default function MapPage() {
   const mapInstance = useRef<Map | null>(null)
   const basemapLayer = useRef<TileLayer<OSM | XYZ> | null>(null)
   const projectLayer = useRef<VectorLayer<VectorSource> | null>(null)
+  const projectSource = useRef<VectorSource | null>(null)  // exposed for collab updates
   const selectLayer = useRef<VectorLayer<VectorSource> | null>(null)
   const measureLayer = useRef<VectorLayer<VectorSource> | null>(null)
   const bufferLayer = useRef<VectorLayer<VectorSource> | null>(null)
@@ -259,6 +265,9 @@ export default function MapPage() {
   const tempLayerRefs = useRef<Record<number, VectorLayer<VectorSource>>>({})
   const [tempLayerPanelOpen, setTempLayerPanelOpen] = useState(false)
   const [tempVisibleIds, setTempVisibleIds] = useState<Set<number>>(new Set())
+  // External DB layers (key = 'ext:{id}')
+  const extLayerRefs = useRef<Record<string, VectorLayer<VectorSource>>>({})
+  const [extVisibleIds, setExtVisibleIds] = useState<Set<string>>(new Set())
 
   const {
     mapTool, setMapTool,
@@ -270,6 +279,18 @@ export default function MapPage() {
   } = useAppStore()
   const canDraw = user ? DRAW_ROLES.includes(user.role) : false
   const [selectedAreaStatus, setSelectedAreaStatus] = useState<string | null>(null)
+
+  // ── Real-time collaboration ─────────────────────────────────────────────────
+  const {
+    connected: collabConnected,
+    reconnecting: collabReconnecting,
+    presenceUsers,
+    lockedFeatures,
+    setEventHandler: setCollabHandler,
+    sendFeatureCreated: wsSendCreated,
+    sendFeatureUpdated: wsSendUpdated,
+    sendFeatureDeleted: wsSendDeleted,
+  } = useProjectWebSocket(selectedProjectId)
   // isReadOnly and toolButtons are computed after surveyAreas / flatFolders queries below
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -307,6 +328,13 @@ export default function MapPage() {
   const pendingDrawFeatureRef = useRef<Feature | null>(null)
   const pendingDrawTypeRef = useRef<string>('')
 
+  // Active layer preset — set by "New Layer" deep-link (?layer=NAME&folder=ID)
+  // When set, drawn features skip the "choose layer" modal and go straight to this layer
+  const [activeDrawLayer, setActiveDrawLayer] = useState<{ name: string; folderId: number } | null>(null)
+  const activeDrawLayerRef = useRef<{ name: string; folderId: number } | null>(null)
+  const [newLayerModalOpen, setNewLayerModalOpen] = useState(false)
+  const [importGISModalOpen, setImportGISModalOpen] = useState(false)
+
   // Buffer analysis state
   const [bufferDistances, setBufferDistances] = useState<number[]>([50, 100, 200, 500])
   const [bufferUnit, setBufferUnit] = useState<'meters' | 'kilometers'>('meters')
@@ -321,6 +349,7 @@ export default function MapPage() {
   // ArcGIS-like feature state
   const [attrTableOpen, setAttrTableOpen] = useState(false)
   const [printOpen, setPrintOpen] = useState(false)
+  const [mapExportOpen, setMapExportOpen] = useState(false)
   const [gotoOpen, setGotoOpen] = useState(false)
   const [gotoLat, setGotoLat] = useState('')
   const [gotoLon, setGotoLon] = useState('')
@@ -477,16 +506,41 @@ export default function MapPage() {
   }, [selectedFolderId, surveyAreas, flatFolders])
 
   // Deep-link: ?area=ID → auto-select that survey area once areas are loaded
+  // Also: ?layer=NAME&geomtype=POINT|LINE|POLYGON&folder=ID&tool=draw_*
+  //   → set active draw layer and activate the correct draw tool
   useEffect(() => {
     const areaParam = searchParams.get('area')
-    if (!areaParam || !surveyAreas.length) return
-    const areaId = Number(areaParam)
-    const found = surveyAreas.find((a) => a.id === areaId)
-    if (found) {
-      setSelectedSurveyAreaId(areaId)
-      setSearchParams({}, { replace: true })  // clean URL after applying
+    const layerParam = searchParams.get('layer')
+    const folderParam = searchParams.get('folder')
+    const toolParam = searchParams.get('tool')
+    if (!surveyAreas.length && !areaParam) return
+
+    let applied = false
+
+    if (areaParam) {
+      const areaId = Number(areaParam)
+      const found = surveyAreas.find((a) => a.id === areaId)
+      if (found) { setSelectedSurveyAreaId(areaId); applied = true }
     }
+
+    if (layerParam && folderParam) {
+      setActiveDrawLayer({ name: layerParam, folderId: Number(folderParam) })
+      if (toolParam && ['draw_point', 'draw_line', 'draw_polygon'].includes(toolParam)) {
+        // Slight delay so the area selection + read-only check settles first
+        setTimeout(() => setMapTool(toolParam as any), 300)
+      }
+      message.success(
+        `Layer "${layerParam}" is active — draw on the map to add features. Press Esc to exit draw mode.`,
+        5,
+      )
+      applied = true
+    }
+
+    if (applied) setSearchParams({}, { replace: true })
   }, [surveyAreas])
+
+  // Keep activeDrawLayerRef in sync so the draw interaction's drawend closure always reads current
+  useEffect(() => { activeDrawLayerRef.current = activeDrawLayer }, [activeDrawLayer])
 
   // Computed here (before isReadOnly) so it's available in the lock check below
   const selectedSurveyArea = surveyAreas.find((a) => a.id === selectedSurveyAreaId) ?? null
@@ -614,6 +668,24 @@ export default function MapPage() {
   )
   // ── End survey-area-wise helpers ────────────────────────────────────────────
 
+  // Auto-create the folder tree for any selected DRAFT/RETURNED area that has none.
+  // This ensures features are always scoped to an area, never floating in "All Areas".
+  useEffect(() => {
+    if (!selectedSurveyArea) return
+    if (!['DRAFT', 'RETURNED'].includes(selectedSurveyArea.status)) return
+    if (selectedSurveyArea.folder !== null) return
+
+    api.post(`/projects/survey-areas/${selectedSurveyArea.id}/ensure-folder/`)
+      .then((r) => {
+        qc.setQueryData<typeof surveyAreas>(
+          qk.surveyAreas(selectedProjectId ?? 0),
+          (old) => old ? old.map((a) => a.id === r.data.id ? r.data : a) : old,
+        )
+        qc.invalidateQueries({ queryKey: ['folders-flat', selectedProjectId] })
+      })
+      .catch(() => {})
+  }, [selectedSurveyAreaId, selectedSurveyArea?.folder])
+
   const layerNames = useMemo(
     () => layerOrder.filter((n) => visibleRawLayerNames.includes(n)),
     [layerOrder, visibleRawLayerNames]
@@ -710,6 +782,7 @@ export default function MapPage() {
       zIndex: 10,   // always above GeoTIFF (zIndex 2)
     })
     projectLayer.current = vl
+    projectSource.current = src
 
     // Box-select highlight layer (orange)
     const selSrc = new VectorSource()
@@ -867,6 +940,49 @@ export default function MapPage() {
     setSelectedCount(0)
     setMapTool('pan')
   }, [selectedSurveyAreaId])
+
+  // Register collaboration event handler — applies remote edits to the OL source
+  useEffect(() => {
+    setCollabHandler((event) => {
+      const src = projectSource.current
+      if (!src) return
+      const fmt = new GeoJSON()
+
+      if (event.type === 'feature_created' && event.feature) {
+        // Add remote feature to OL source (don't re-add if already there)
+        const fid = event.feature.id
+        if (fid && src.getFeatureById(fid)) return
+        try {
+          const olFeat = fmt.readFeature(
+            { type: 'Feature', id: fid, geometry: event.feature.geometry, properties: event.feature },
+            { featureProjection: 'EPSG:3857' }
+          ) as Feature
+          olFeat.setId(fid)
+          olFeat.set('layer_name', event.feature.layer_name || 'Remote')
+          olFeat.set('attributes', event.feature.attributes || {})
+          src.addFeature(olFeat)
+          qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+        } catch {}
+      }
+
+      if (event.type === 'feature_updated' && event.feature_id) {
+        const olFeat = src.getFeatureById(event.feature_id)
+        if (olFeat && event.geometry) {
+          try {
+            const newGeom = fmt.readGeometry(event.geometry, { featureProjection: 'EPSG:3857' })
+            olFeat.setGeometry(newGeom)
+          } catch {}
+        }
+        qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+      }
+
+      if (event.type === 'feature_deleted' && event.feature_id) {
+        const olFeat = src.getFeatureById(event.feature_id)
+        if (olFeat) src.removeFeature(olFeat)
+        qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+      }
+    })
+  }, [setCollabHandler, selectedProjectId, qc])
 
   // Load project features into OL layer (filtered to selected area)
   // Diff-based: add features not yet on map, remove features no longer visible.
@@ -1088,6 +1204,44 @@ export default function MapPage() {
     setTempVisibleIds(prev => { const s = new Set(prev); s.delete(id); return s })
   }
 
+  // ── External DB layer show/hide (read-only, no edit controls) ─────────────
+  function showExtLayer(key: string, geojson: Record<string, unknown>) {
+    const map = mapInstance.current
+    if (!map) return
+    if (extLayerRefs.current[key]) map.removeLayer(extLayerRefs.current[key])
+    const src = new VectorSource({
+      features: new GeoJSON().readFeatures(geojson, { featureProjection: 'EPSG:3857' }),
+    })
+    const lyr = new VectorLayer({
+      source: src,
+      style: new Style({
+        stroke: new Stroke({ color: '#ff6600', width: 1.8 }),
+        fill:   new Fill({ color: 'rgba(255,102,0,0.12)' }),
+        image:  new CircleStyle({ radius: 5, stroke: new Stroke({ color: '#ff6600', width: 1.5 }),
+                                   fill: new Fill({ color: 'rgba(255,102,0,0.4)' }) }),
+      }),
+      zIndex: 75,
+      properties: { _extLayerKey: key, _readOnly: true },
+    })
+    map.addLayer(lyr)
+    extLayerRefs.current[key] = lyr
+    setExtVisibleIds(prev => new Set([...prev, key]))
+    const extent = src.getExtent()
+    if (extent && extent[0] !== Infinity) {
+      map.getView().fit(extent, { padding: [40, 40, 40, 40], maxZoom: 16, duration: 500 })
+    }
+  }
+
+  function hideExtLayer(key: string) {
+    const map = mapInstance.current
+    if (!map) return
+    if (extLayerRefs.current[key]) {
+      map.removeLayer(extLayerRefs.current[key])
+      delete extLayerRefs.current[key]
+    }
+    setExtVisibleIds(prev => { const s = new Set(prev); s.delete(key); return s })
+  }
+
   // DragBox (box select) interaction
   useEffect(() => {
     const map = mapInstance.current
@@ -1181,6 +1335,7 @@ export default function MapPage() {
         onOk: async () => {
           await api.delete(`/projects/features/${id}/`).catch(() => {})
           qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+          if (typeof id === 'number') wsSendDeleted(id)
           message.success('Feature deleted')
         },
       })
@@ -1188,7 +1343,7 @@ export default function MapPage() {
 
     map.on('singleclick', handleClick as any)
     return () => { map.un('singleclick', handleClick as any) }
-  }, [mapTool, selectedProjectId])
+  }, [mapTool, selectedProjectId, wsSendDeleted])
 
   // Coordinate picker click handler
   useEffect(() => {
@@ -1785,9 +1940,18 @@ export default function MapPage() {
       draw.on('drawend', (e) => {
         setMeasureResult(null)
         if (!selectedProjectId) { message.warning('Select a project before drawing features'); return }
-        // Hold the feature and open the layer chooser modal
         pendingDrawFeatureRef.current = e.feature
         pendingDrawTypeRef.current = drawType
+
+        // When an active layer is preset (from "New Layer" flow), skip the chooser modal.
+        // Use the ref so we always get the current value even after re-renders.
+        const preset = activeDrawLayerRef.current
+        if (preset) {
+          saveDrawnFeature(preset.name, preset.folderId)
+          return
+        }
+
+        // Otherwise open the layer chooser as usual
         const defaultLayer = drawType === 'Point' ? 'point_layer' : drawType === 'LineString' ? 'line_layer' : 'polygon_layer'
         setDrawExistingLayer(defaultLayer)
         setDrawNewLayerName(defaultLayer)
@@ -1885,7 +2049,7 @@ export default function MapPage() {
     message.success('Bookmark saved')
   }, [bookmarks, bookmarkName])
 
-  const saveDrawnFeature = useCallback((layerName: string) => {
+  const saveDrawnFeature = useCallback((layerName: string, overrideFolderId?: number | null) => {
     const feat = pendingDrawFeatureRef.current
     const dt = pendingDrawTypeRef.current
     if (!feat || !selectedProjectId) return
@@ -1899,9 +2063,8 @@ export default function MapPage() {
     }
     const fmt = new GeoJSON()
     const gf = fmt.writeFeatureObject(feat, { dataProjection: 'EPSG:4326', featureProjection: 'EPSG:3857' })
-    // Resolve folder: prefer selectedFolderId, but fall back to the survey area's root folder
-    // so the feature always lands inside selectedAreaFolderIds and appears in the area view.
-    const folderId = selectedFolderId ?? selectedSurveyArea?.folder ?? null
+    // Folder priority: active-draw-layer folder > URL override > selectedFolderId > survey area root
+    const folderId = overrideFolderId ?? activeDrawLayer?.folderId ?? selectedFolderId ?? selectedSurveyArea?.folder ?? null
     api.post('/projects/features/', {
       project: selectedProjectId,
       folder: folderId,
@@ -1923,6 +2086,8 @@ export default function MapPage() {
         old ? [...old, saved] : [saved]
       )
       pendingDrawFeatureRef.current = null
+      // Broadcast to collaborators
+      wsSendCreated({ id: saved.id, geometry: gf.geometry, layer_name: layerName, attributes: {} })
     }).catch((err) => {
       const data = err?.response?.data
       const msg = data?.detail
@@ -1934,7 +2099,7 @@ export default function MapPage() {
       src?.removeFeature(feat)
       pendingDrawFeatureRef.current = null
     })
-  }, [selectedProjectId, selectedFolderId, selectedSurveyArea])
+  }, [selectedProjectId, selectedFolderId, selectedSurveyArea, activeDrawLayer, wsSendCreated])
 
   const handleGoToBookmark = useCallback((bm: MapBookmark) => {
     mapInstance.current?.getView().animate({
@@ -2285,6 +2450,17 @@ export default function MapPage() {
       {/* Map canvas */}
       <div ref={mapRef} className="ol-map" />
 
+      {/* Collaboration presence indicator */}
+      {(collabConnected || collabReconnecting) && (
+        <div style={{ position: 'absolute', top: 8, right: 8, zIndex: 30 }}>
+          <CollabPresence
+            connected={collabConnected}
+            reconnecting={collabReconnecting}
+            users={presenceUsers}
+          />
+        </div>
+      )}
+
       {/* ═══════════════════════════════════════════════════════════════════
            Left toolbar — QGIS-style collapsible tool groups
           ═══════════════════════════════════════════════════════════════════ */}
@@ -2442,6 +2618,76 @@ export default function MapPage() {
                 </div>
               )}
 
+              {/* ── New Shapefile Layer + Import buttons ──────────── */}
+              {canDraw && selectedProjectId && (
+                <div style={{ marginBottom: 8, display: 'flex', gap: 6 }}>
+                  <Tooltip title="Create a new layer and start drawing immediately (QGIS-style)" placement="right">
+                    <div
+                      onClick={() => setNewLayerModalOpen(true)}
+                      style={{
+                        flex: 1, display: 'flex', alignItems: 'center', gap: 6,
+                        padding: '5px 8px', borderRadius: 4, cursor: 'pointer',
+                        fontSize: 11, fontWeight: 600,
+                        background: 'rgba(79,195,247,0.12)',
+                        border: '1px dashed #4fc3f7',
+                        color: '#4fc3f7',
+                        transition: 'all 0.15s',
+                      }}
+                    >
+                      <FileAddOutlined style={{ fontSize: 12 }} />
+                      <span>New Layer</span>
+                    </div>
+                  </Tooltip>
+                  <Tooltip title="Import Shapefile ZIP, GeoJSON, KML or GeoPackage into the selected area" placement="right">
+                    <div
+                      onClick={() => {
+                        if (!selectedSurveyAreaId) {
+                          message.warning('Select a survey area first to import into')
+                          return
+                        }
+                        setImportGISModalOpen(true)
+                      }}
+                      style={{
+                        flex: 1, display: 'flex', alignItems: 'center', gap: 6,
+                        padding: '5px 8px', borderRadius: 4, cursor: 'pointer',
+                        fontSize: 11, fontWeight: 600,
+                        background: 'rgba(82,196,26,0.10)',
+                        border: '1px dashed #52c41a',
+                        color: '#52c41a',
+                        transition: 'all 0.15s',
+                      }}
+                    >
+                      <UploadOutlined style={{ fontSize: 12 }} />
+                      <span>Import File</span>
+                    </div>
+                  </Tooltip>
+                </div>
+              )}
+
+              {/* ── Active layer banner ──────────────────────────────── */}
+              {activeDrawLayer && (
+                <div style={{
+                  background: 'rgba(79,195,247,0.15)', border: '1px solid #4fc3f7',
+                  borderRadius: 4, padding: '6px 8px', marginBottom: 8,
+                  fontSize: 11,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#4fc3f7', fontWeight: 700, marginBottom: 2 }}>
+                    <FileAddOutlined />
+                    <span>Active Layer</span>
+                    <span
+                      style={{ marginLeft: 'auto', cursor: 'pointer', color: 'rgba(255,255,255,0.5)' }}
+                      onClick={() => { setActiveDrawLayer(null); setMapTool('pan') }}
+                    >
+                      <CloseOutlined style={{ fontSize: 9 }} />
+                    </span>
+                  </div>
+                  <div style={{ color: '#fff', fontWeight: 600, fontSize: 12 }}>{activeDrawLayer.name}</div>
+                  <div style={{ color: 'rgba(255,255,255,0.55)', fontSize: 10, marginTop: 2 }}>
+                    Draw on the map to add features. Each shape saves instantly.
+                  </div>
+                </div>
+              )}
+
               {/* ── Release active tool banner (hidden in overview) ── */}
               {mapTool !== 'pan' && !isOverviewMode && (
                 <Tooltip title="Release current tool and return to Pan mode (Esc)" placement="right">
@@ -2522,9 +2768,27 @@ export default function MapPage() {
                   <Tooltip title={<span><b>Attribute Table</b><br /><span style={{fontSize:11,color:'#aaa'}}>Open the feature attribute table</span></span>} placement="right">
                     <div style={btnStyle(attrTableOpen)} onClick={() => setAttrTableOpen((v) => !v)}><TableOutlined /></div>
                   </Tooltip>
-                  <Tooltip title={<span><b>Print Map</b></span>} placement="right">
-                    <div style={btnStyle(false)} onClick={() => setPrintOpen(true)}><PrinterOutlined /></div>
-                  </Tooltip>
+                  <Dropdown
+                    menu={{
+                      items: [
+                        {
+                          key: 'pdf',
+                          label: '📄 PDF with Details (Legend, Scale, North Arrow)',
+                          onClick: () => setPrintOpen(true),
+                        },
+                        {
+                          key: 'png',
+                          label: '🖼️ PNG High-Quality (300+ DPI)',
+                          onClick: () => setMapExportOpen(true),
+                        },
+                      ],
+                    }}
+                    trigger={['click']}
+                  >
+                    <Tooltip title={<span><b>Print/Export Map</b><br /><span style={{fontSize:11,color:'#aaa'}}>PDF (detailed) or PNG (300+ DPI)</span></span>} placement="right">
+                      <div style={btnStyle(false)}><PrinterOutlined /></div>
+                    </Tooltip>
+                  </Dropdown>
                   <Popover content={bookmarkContent} title="Bookmarks" trigger="click" placement="right">
                     <Tooltip title={<span><b>Bookmarks</b></span>} placement="right">
                       <div style={btnStyle(false)}><BookOutlined /></div>
@@ -2871,12 +3135,24 @@ export default function MapPage() {
         legend={printLegend}
       />
 
+      <MapExportModal
+        visible={mapExportOpen}
+        onClose={() => setMapExportOpen(false)}
+        mapState={{
+          center: mapInstance.current ? (toLonLat(mapInstance.current.getView().getCenter() || [78, 20]) as [number, number]) : [78, 20],
+          zoom: mapInstance.current ? mapInstance.current.getView().getZoom() || 10 : 10,
+        }}
+      />
+
       <TempLayersPanel
         open={tempLayerPanelOpen}
         onClose={() => setTempLayerPanelOpen(false)}
         visibleIds={tempVisibleIds}
         onToggleVisible={(id, geojson) => showTempLayer(id, geojson)}
         onHide={(id) => hideTempLayer(id)}
+        extVisibleIds={extVisibleIds}
+        onToggleExtVisible={(key, geojson) => showExtLayer(key, geojson)}
+        onHideExt={(key) => hideExtLayer(key)}
       />
 
       {/* Go-to coordinate modal */}
@@ -3941,6 +4217,31 @@ export default function MapPage() {
           <div style={{ color: '#666', fontSize: 11 }}>A new line feature will be created parallel to the selected line(s).</div>
         </Space>
       </DraggableModal>
+
+      {/* ── New Shapefile Layer Modal ─────────────────────────── */}
+      {selectedProjectId && (
+        <NewLayerModal
+          open={newLayerModalOpen}
+          onClose={() => setNewLayerModalOpen(false)}
+          projectId={selectedProjectId}
+          surveyAreas={surveyAreas as any}
+        />
+      )}
+
+      {/* ── Import GIS File Modal ─────────────────────────────── */}
+      {selectedProjectId && (
+        <ImportGISModal
+          open={importGISModalOpen}
+          onClose={() => setImportGISModalOpen(false)}
+          projectId={selectedProjectId}
+          surveyArea={selectedSurveyArea as any}
+          flatFolders={flatFolders}
+          onImported={() => {
+            qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+            qc.invalidateQueries({ queryKey: ['folders-flat', selectedProjectId] })
+          }}
+        />
+      )}
     </div>
   )
 }

@@ -1,29 +1,31 @@
-import React, { useRef, useState, useCallback } from 'react'
+import React, { useRef, useCallback } from 'react'
 import { Modal } from 'antd'
 import type { ModalProps } from 'antd'
 
 /**
  * Ant Design Modal that is draggable by its header bar.
- * Works by attaching a mousedown listener to the rendered .ant-modal-header element
- * so the FULL header area acts as a drag handle, not just the title text.
+ *
+ * Uses a stable `modalRender` (never changes reference) so Ant Design never
+ * replaces the modal subtree during a drag — that was causing the React
+ * "insertBefore: child not a child of this node" reconciler crash.
+ * Dragging now writes directly to containerRef.style.transform without
+ * triggering a React state update.
  */
 export default function DraggableModal({ afterClose, ...rest }: ModalProps) {
-  const [pos, setPos] = useState({ x: 0, y: 0 })
   const posRef = useRef({ x: 0, y: 0 })
 
+  // Stable reference — does NOT depend on pos so React never re-renders.
   const modalRender = useCallback((modal: React.ReactNode) => (
-    <ModalWrapper pos={pos} posRef={posRef} setPos={setPos}>
+    <ModalWrapper posRef={posRef}>
       {modal}
     </ModalWrapper>
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  ), [pos.x, pos.y])
+  ), [])
 
   return (
     <Modal
       {...rest}
       afterClose={() => {
         posRef.current = { x: 0, y: 0 }
-        setPos({ x: 0, y: 0 })
         afterClose?.()
       }}
       modalRender={modalRender}
@@ -32,17 +34,14 @@ export default function DraggableModal({ afterClose, ...rest }: ModalProps) {
 }
 
 interface WrapperProps {
-  pos: { x: number; y: number }
   posRef: React.MutableRefObject<{ x: number; y: number }>
-  setPos: React.Dispatch<React.SetStateAction<{ x: number; y: number }>>
   children: React.ReactNode
 }
 
-function ModalWrapper({ pos, posRef, setPos, children }: WrapperProps) {
+function ModalWrapper({ posRef, children }: WrapperProps) {
   const containerRef = useRef<HTMLDivElement>(null)
 
   const onMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    // Only start drag when clicking the header area (not buttons inside it)
     const target = e.target as HTMLElement
     if (target.closest('button') || target.closest('.ant-modal-close')) return
 
@@ -56,12 +55,13 @@ function ModalWrapper({ pos, posRef, setPos, children }: WrapperProps) {
     const startPosY = posRef.current.y
 
     const onMove = (ev: MouseEvent) => {
-      const next = {
-        x: startPosX + ev.clientX - startX,
-        y: startPosY + ev.clientY - startY,
+      const x = startPosX + ev.clientX - startX
+      const y = startPosY + ev.clientY - startY
+      posRef.current = { x, y }
+      // Write directly to DOM — no React state update, no reconciliation
+      if (containerRef.current) {
+        containerRef.current.style.transform = `translate(${x}px, ${y}px)`
       }
-      posRef.current = next
-      setPos(next)
     }
 
     const onUp = () => {
@@ -71,12 +71,12 @@ function ModalWrapper({ pos, posRef, setPos, children }: WrapperProps) {
 
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
-  }, [posRef, setPos])
+  }, [posRef])
 
   return (
     <div
       ref={containerRef}
-      style={{ transform: `translate(${pos.x}px, ${pos.y}px)` }}
+      style={{ transform: `translate(${posRef.current.x}px, ${posRef.current.y}px)` }}
       onMouseDown={onMouseDown}
     >
       <style>{`.ant-modal-header { cursor: move; user-select: none; }`}</style>

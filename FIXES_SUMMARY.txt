@@ -1,0 +1,83 @@
+╔════════════════════════════════════════════════════════════════════════╗
+║                  RakshaGIS Build System Fixes                          ║
+║                            2026-05-30                                  ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+ISSUES RESOLVED
+═════════════════════════════════════════════════════════════════════════
+
+1. DOCKER IMAGE NAMING ISSUE
+   Problem:  build.sh created images tagged as <none> instead of rakshagis:web
+   Root Cause: Missing explicit 'image:' field in docker-compose.yml
+   Status: FIXED ✓
+
+2. MIGRATIONS PERMISSION ERROR
+   Problem:  PermissionError when running makemigrations in Docker on WSL2
+   Root Cause: Container user couldn't write to host's bind-mounted migrations/
+   Status: FIXED ✓
+
+FILES MODIFIED
+═════════════════════════════════════════════════════════════════════════
+
+Core Fixes:
+  - docker-compose.yml: Added explicit image naming (image: rakshagis:web)
+  - build.sh: Removed problematic makemigrations call, simplified image logic
+  - entrypoint.sh: Made migration creation more robust
+
+Documentation:
+  - DOCKER_BUILD_FIXES.md: Detailed explanation of issues and solutions
+  - verify_build.sh: Post-build verification script
+  - README.md: Updated with image naming verification + troubleshooting
+  - CONTRIBUTING.md: Updated development setup with explicit makemigrations steps
+
+NEXT STEPS FOR USERS
+═════════════════════════════════════════════════════════════════════════
+
+1. Clean up any orphaned <none> images from previous builds:
+   docker image prune -f
+
+2. Run the build script (should work without permission errors now):
+   ./build.sh
+
+3. Verify the fixes are working:
+   ./verify_build.sh
+
+   OR manually check:
+   docker image ls | grep rakshagis:web
+   (Should show a properly tagged image, not <none>)
+
+4. If you modified Django models before deployment:
+   python manage.py makemigrations  (Run on HOST, not in Docker)
+   Then run: ./build.sh
+
+MIGRATION WORKFLOW
+═════════════════════════════════════════════════════════════════════════
+
+Development (local):
+  python manage.py makemigrations     # Create migrations on host
+  python manage.py migrate            # Apply locally
+  python manage.py test               # Test your changes
+
+Deployment (Docker):
+  ./build.sh                          # Builds images and applies migrations
+
+Key Point: Migration files MUST be committed to git. When others run
+./build.sh, migrations will be automatically applied from the committed files.
+
+VERIFICATION
+═════════════════════════════════════════════════════════════════════════
+
+✓ docker-compose.yml has explicit image naming
+✓ build.sh properly handles migration creation
+✓ entrypoint.sh gracefully handles permission errors
+✓ Documentation updated with correct workflow
+
+DETAILED INFORMATION
+═════════════════════════════════════════════════════════════════════════
+
+For comprehensive details, see:
+  - DOCKER_BUILD_FIXES.md (technical deep-dive)
+  - README.md (installation guide, troubleshooting section)
+  - CONTRIBUTING.md (development workflow)
+
+Questions? Check the Troubleshooting section in README.md

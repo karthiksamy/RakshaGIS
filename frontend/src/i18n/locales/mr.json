@@ -1,0 +1,63 @@
+{
+  "nav": {
+    "dashboard": "डॅशबोर्ड",
+    "map": "नकाशा",
+    "terrain": "3D भूप्रदेश",
+    "projects": "प्रकल्प",
+    "documents": "दस्तऐवज",
+    "ai_assistant": "AI सहाय्यक",
+    "users": "वापरकर्ते",
+    "organisations": "संस्था",
+    "reports": "अहवाल",
+    "backups": "बॅकअप",
+    "master_data": "मास्टर डेटा",
+    "states": "राज्ये",
+    "districts": "जिल्हे",
+    "taluks": "तालुके",
+    "villages": "गावे"
+  },
+  "common": {
+    "save": "जतन करा",
+    "cancel": "रद्द करा",
+    "delete": "हटवा",
+    "edit": "संपादित करा",
+    "add": "जोडा",
+    "create": "तयार करा",
+    "close": "बंद करा",
+    "search": "शोधा",
+    "submit": "सादर करा",
+    "yes": "होय",
+    "no": "नाही",
+    "ok": "ठीक आहे",
+    "loading": "लोड होत आहे...",
+    "error": "त्रुटी",
+    "success": "यश",
+    "logout": "लॉगआउट",
+    "settings": "सेटिंग्ज",
+    "status": "स्थिती"
+  },
+  "status": {
+    "draft": "मसुदा",
+    "submitted": "सादर केले",
+    "under_review": "पुनरावलोकनात",
+    "approved": "मंजूर",
+    "published": "प्रकाशित",
+    "returned": "सुधारणेसाठी परत",
+    "pending": "प्रलंबित"
+  },
+  "auth": {
+    "login": "लॉगिन",
+    "username": "वापरकर्तानाव",
+    "password": "पासवर्ड",
+    "login_title": "RakshaGIS मध्ये लॉगिन करा",
+    "login_subtitle": "संरक्षण भूमि GIS व्यासपीठ — भारत सरकार"
+  },
+  "workflow": {
+    "submit_to_checker": "तपासणीसाठी सादर करा",
+    "approve": "मंजूर करा",
+    "publish": "प्रकाशित करा"
+  },
+  "language": {
+    "select": "भाषा"
+  }
+}

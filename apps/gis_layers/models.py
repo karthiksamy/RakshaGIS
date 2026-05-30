@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.contrib.gis.db import models
 
 
@@ -53,3 +54,40 @@ class RevenueMap(models.Model):
 
     def __str__(self):
         return f"Survey {self.survey_number} — {self.village.name}"
+
+
+class BoundaryImportJob(models.Model):
+    PENDING = 'PENDING'
+    RUNNING = 'RUNNING'
+    DONE = 'DONE'
+    FAILED = 'FAILED'
+    STATUS_CHOICES = [(s, s) for s in (PENDING, RUNNING, DONE, FAILED)]
+
+    LEVEL_CHOICES = [
+        ('state', 'State'),
+        ('district', 'District'),
+        ('taluk', 'Taluk'),
+        ('village', 'Village'),
+    ]
+
+    level = models.CharField(max_length=10, choices=LEVEL_CHOICES)
+    file = models.FileField(upload_to='boundary_imports/')
+    name_field = models.CharField(max_length=64, default='NAME')
+    code_field = models.CharField(max_length=64, default='CODE')
+    parent_code_field = models.CharField(max_length=64, blank=True, default='')
+    spatial_parent = models.BooleanField(default=False)
+    clear_existing = models.BooleanField(default=False)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=PENDING)
+    result = models.JSONField(null=True, blank=True)
+    error_log = models.TextField(blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='+'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'BoundaryImport({self.level}, {self.status}, {self.created_at:%Y-%m-%d})'

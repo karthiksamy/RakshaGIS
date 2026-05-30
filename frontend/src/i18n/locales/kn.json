@@ -1,0 +1,63 @@
+{
+  "nav": {
+    "dashboard": "ಡ್ಯಾಶ್‌ಬೋರ್ಡ್",
+    "map": "ನಕ್ಷೆ",
+    "terrain": "3D ಭೂಪ್ರದೇಶ",
+    "projects": "ಯೋಜನೆಗಳು",
+    "documents": "ದಾಖಲೆಗಳು",
+    "ai_assistant": "AI ಸಹಾಯಕ",
+    "users": "ಬಳಕೆದಾರರು",
+    "organisations": "ಸಂಸ್ಥೆಗಳು",
+    "reports": "ವರದಿಗಳು",
+    "backups": "ಬ್ಯಾಕಪ್",
+    "master_data": "ಮಾಸ್ಟರ್ ಡೇಟಾ",
+    "states": "ರಾಜ್ಯಗಳು",
+    "districts": "ಜಿಲ್ಲೆಗಳು",
+    "taluks": "ತಾಲ್ಲೂಕುಗಳು",
+    "villages": "ಗ್ರಾಮಗಳು"
+  },
+  "common": {
+    "save": "ಉಳಿಸಿ",
+    "cancel": "ರದ್ದು ಮಾಡಿ",
+    "delete": "ಅಳಿಸಿ",
+    "edit": "ತಿದ್ದಿ",
+    "add": "ಸೇರಿಸಿ",
+    "create": "ರಚಿಸಿ",
+    "close": "ಮುಚ್ಚಿ",
+    "search": "ಹುಡುಕಿ",
+    "submit": "ಸಲ್ಲಿಸಿ",
+    "yes": "ಹೌದು",
+    "no": "ಇಲ್ಲ",
+    "ok": "ಸರಿ",
+    "loading": "ಲೋಡ್ ಆಗುತ್ತಿದೆ...",
+    "error": "ದೋಷ",
+    "success": "ಯಶಸ್ಸು",
+    "logout": "ಲಾಗ್‌ಔಟ್",
+    "settings": "ಸೆಟ್ಟಿಂಗ್‌ಗಳು",
+    "status": "ಸ್ಥಿತಿ"
+  },
+  "status": {
+    "draft": "ಕರಡು",
+    "submitted": "ಸಲ್ಲಿಸಲಾಗಿದೆ",
+    "under_review": "ಪರಿಶೀಲನೆಯಲ್ಲಿ",
+    "approved": "ಅನುಮೋದಿಸಲಾಗಿದೆ",
+    "published": "ಪ್ರಕಟಿಸಲಾಗಿದೆ",
+    "returned": "ಪರಿಷ್ಕರಣೆಗೆ ಹಿಂದಿರುಗಿಸಲಾಗಿದೆ",
+    "pending": "ಬಾಕಿ"
+  },
+  "auth": {
+    "login": "ಲಾಗಿನ್",
+    "username": "ಬಳಕೆದಾರ ಹೆಸರು",
+    "password": "ಪಾಸ್‌ವರ್ಡ್",
+    "login_title": "RakshaGIS ಗೆ ಲಾಗಿನ್ ಆಗಿ",
+    "login_subtitle": "ರಕ್ಷಣಾ ಎಸ್ಟೇಟ್ GIS ವೇದಿಕೆ — ಭಾರತ ಸರ್ಕಾರ"
+  },
+  "workflow": {
+    "submit_to_checker": "ಪರಿಶೀಲಕರಿಗೆ ಸಲ್ಲಿಸಿ",
+    "approve": "ಅನುಮೋದಿಸಿ",
+    "publish": "ಪ್ರಕಟಿಸಿ"
+  },
+  "language": {
+    "select": "ಭಾಷೆ"
+  }
+}

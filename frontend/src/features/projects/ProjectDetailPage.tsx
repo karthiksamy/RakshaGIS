@@ -16,7 +16,8 @@ import {
   FileImageOutlined, EyeOutlined, PictureOutlined,
   SyncOutlined, CheckSquareOutlined, ExclamationCircleOutlined, MinusCircleOutlined,
   CodeOutlined, EnvironmentOutlined, LockOutlined, EditOutlined, RollbackOutlined,
-  StopOutlined, ClockCircleOutlined, RobotOutlined, LoadingOutlined,
+  StopOutlined, ClockCircleOutlined, RobotOutlined, LoadingOutlined, FileAddOutlined,
+  FileWordOutlined, DownloadOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import type { DataNode } from 'antd/es/tree'
@@ -24,6 +25,10 @@ import api from '@/services/api'
 import { qk } from '@/services/queryKeys'
 import { useAppStore } from '@/app/store'
 import type { SurveyProject, SurveyArea, Document, ProjectLayerFolder, GeoTiffLayer, ShapefileImport, QGISUploadLog } from '@/types'
+import NewLayerModal from '@/features/map/NewLayerModal'
+import DisputeModal, { type DisputeRow } from './DisputeModal'
+import { useTranslation } from 'react-i18next'
+import { openDocumentInNewTab } from '@/services/documentUtils'
 
 // folder and folder_name now live directly on ShapefileImport
 type ShapefileImportWithFolder = ShapefileImport
@@ -118,6 +123,7 @@ function buildTreeData(
   docs: Document[],
   geotiffs: GeoTiffLayer[],
   shapefileImports: ShapefileImport[],
+  onOpenInOffice?: (docId: number) => void,
 ): DataNode[] {
   // Index files by folder id
   const docsByFolder = new Map<number, Document[]>()
@@ -154,24 +160,36 @@ function buildTreeData(
     let fileLeaves: DataNode[] = []
 
     if (f.folder_type === 'DOC') {
-      fileLeaves = (docsByFolder.get(f.id) ?? []).map((doc) => ({
-        key: `doc-${doc.id}`,
-        isLeaf: true,
-        selectable: false,
-        icon: fileIcon(doc.mime_type),
-        title: (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: 160 }}>
-            <a href={doc.file} target="_blank" rel="noreferrer"
-              style={{ color: '#aaa', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-              title={doc.title} onClick={(e) => e.stopPropagation()}>
-              {doc.title}
-            </a>
-            {doc.file_size > 0 && (
-              <span style={{ color: '#555', fontSize: 10, flexShrink: 0 }}>{formatBytes(doc.file_size)}</span>
-            )}
-          </span>
-        ) as any,
-      }))
+      fileLeaves = (docsByFolder.get(f.id) ?? []).map((doc) => {
+        const ext = (doc.file ?? '').split('.').pop()?.toLowerCase() ?? ''
+        const isOfficeDoc = ['doc', 'docx', 'odt', 'rtf', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf'].includes(ext)
+        return {
+          key: `doc-${doc.id}`,
+          isLeaf: true,
+          selectable: false,
+          icon: fileIcon(doc.mime_type),
+          title: (
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: 180 }}>
+              <a href={doc.file} target="_blank" rel="noreferrer"
+                style={{ color: '#aaa', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}
+                title={doc.title} onClick={(e) => e.stopPropagation()}>
+                {doc.title}
+              </a>
+              {doc.file_size > 0 && (
+                <span style={{ color: '#555', fontSize: 10, flexShrink: 0 }}>{formatBytes(doc.file_size)}</span>
+              )}
+              {isOfficeDoc && onOpenInOffice && (
+                <Tooltip title="Open in OnlyOffice">
+                  <FileWordOutlined
+                    style={{ color: '#1677ff', fontSize: 11, flexShrink: 0, cursor: 'pointer' }}
+                    onClick={(e) => { e.stopPropagation(); onOpenInOffice(doc.id) }}
+                  />
+                </Tooltip>
+              )}
+            </span>
+          ) as any,
+        }
+      })
     } else if (f.folder_type === 'RASTER') {
       fileLeaves = (geotiffsByFolder.get(f.id) ?? []).map((g) => ({
         key: `geotiff-${g.id}`,
@@ -332,6 +350,7 @@ export default function ProjectDetailPage() {
   const qc = useQueryClient()
   const user = useAppStore((s) => s.user)
   const { setSelectedFolderId, setSelectedProjectId } = useAppStore()
+  const { t } = useTranslation()
 
   const [commentModal, setCommentModal] = useState<string | null>(null)
   const [comment, setComment] = useState('')
@@ -349,11 +368,21 @@ export default function ProjectDetailPage() {
   const [docModal, setDocModal] = useState<{ folderId: number; folderName: string } | null>(null)
   const [docUploading, setDocUploading] = useState(false)
 
+  // New layer modal
+  const [newLayerModal, setNewLayerModal] = useState(false)
+
+  // Report generation state
+  const [reportLoading, setReportLoading] = useState<number | null>(null)
+  const [reportResult, setReportResult] = useState<{
+    areaName: string; docId: number; docUrl: string; pdfUrl: string | null
+  } | null>(null)
+
   // Survey area state
   const [areaModal, setAreaModal] = useState<'create' | SurveyArea | null>(null)
   const [areaForm] = Form.useForm()
   const [areaWorkflowModal, setAreaWorkflowModal] = useState<{ area: SurveyArea; action: string } | null>(null)
   const [areaRemarks, setAreaRemarks] = useState('')
+  const [disputeModal, setDisputeModal] = useState<{ area: SurveyArea; action: string; disputes: DisputeRow[] } | null>(null)
   const [expandedAreaId, setExpandedAreaId] = useState<number | null>(null)
 
   const pid = Number(id)
@@ -471,15 +500,27 @@ export default function ProjectDetailPage() {
   })
 
   const areaTransition = useMutation({
-    mutationFn: ({ areaId, action, remarks }: { areaId: number; action: string; remarks: string }) =>
-      api.post(`/workflow/steps/area-transition/${areaId}/${action}/`, { remarks }).then(r => r.data),
+    mutationFn: ({ areaId, action, remarks, force }: { areaId: number; action: string; remarks: string; force?: boolean }) =>
+      api.post(`/workflow/steps/area-transition/${areaId}/${action}/`, { remarks, force_submit: force ?? false }).then(r => r.data),
     onSuccess: () => {
       message.success('Workflow updated')
       qc.invalidateQueries({ queryKey: qk.surveyAreas(pid) })
       setAreaWorkflowModal(null)
       setAreaRemarks('')
+      setDisputeModal(null)
     },
-    onError: (e: any) => message.error(e?.response?.data?.detail || 'Transition failed'),
+    onError: (e: any) => {
+      if (e?.response?.status === 409 && e?.response?.data?.disputes) {
+        const { disputes } = e.response.data
+        const pending = areaWorkflowModal
+        if (pending) {
+          setAreaWorkflowModal(null)
+          setDisputeModal({ area: pending.area, action: pending.action, disputes })
+        }
+      } else {
+        message.error(e?.response?.data?.detail || 'Transition failed')
+      }
+    },
   })
 
   const createFolder = useMutation({
@@ -501,7 +542,7 @@ export default function ProjectDetailPage() {
   // Computed values that are safe before early returns (foldersRaw defaults to [])
   const activeVersionId = findActiveVersionId(foldersRaw)
   const allDocs: Document[] = docs?.results ?? []
-  const treeData = buildTreeData(foldersRaw, activeVersionId, allDocs, geotiffs, shapefileImports as ShapefileImportWithFolder[])
+  const treeData = buildTreeData(foldersRaw, activeVersionId, allDocs, geotiffs, shapefileImports as ShapefileImportWithFolder[], openDocumentInNewTab)
 
   // ALL hooks must appear before any conditional return
   useEffect(() => {
@@ -524,29 +565,50 @@ export default function ProjectDetailPage() {
   function areaActions(area: SurveyArea) {
     const acts: { key: string; label: string; icon: React.ReactNode; danger?: boolean; requiresRemarks?: boolean }[] = []
     if (canForward && area.status === 'DRAFT')
-      acts.push({ key: 'forward', label: 'Submit to Checker', icon: <SendOutlined /> })
+      acts.push({ key: 'forward', label: t('workflow.submit_to_checker'), icon: <SendOutlined /> })
     if (canForward && area.status === 'RETURNED')
-      acts.push({ key: 're_forward', label: 'Resubmit to Checker', icon: <SendOutlined /> })
+      acts.push({ key: 're_forward', label: t('workflow.resubmit_to_checker'), icon: <SendOutlined /> })
     if (canCheck && area.status === 'SUBMITTED') {
-      acts.push({ key: 'send_to_approver', label: 'Send to Approver', icon: <CheckOutlined /> })
-      acts.push({ key: 'return_to_sdo', label: 'Return to SDO', icon: <RollbackOutlined />, danger: true, requiresRemarks: true })
+      acts.push({ key: 'send_to_approver', label: t('workflow.send_to_approver'), icon: <CheckOutlined /> })
+      acts.push({ key: 'return_to_sdo', label: t('workflow.return_to_sdo'), icon: <RollbackOutlined />, danger: true, requiresRemarks: true })
     }
     if (canApprove && area.status === 'UNDER_REVIEW') {
-      acts.push({ key: 'approve', label: 'Approve', icon: <LikeOutlined /> })
-      acts.push({ key: 'return_from_review', label: 'Return for Revision', icon: <RollbackOutlined />, danger: true, requiresRemarks: true })
+      acts.push({ key: 'approve', label: t('workflow.approve'), icon: <LikeOutlined /> })
+      acts.push({ key: 'return_from_review', label: t('workflow.return_from_review'), icon: <RollbackOutlined />, danger: true, requiresRemarks: true })
     }
     if (canPublish && area.status === 'APPROVED')
-      acts.push({ key: 'publish', label: 'Publish', icon: <GlobalOutlined /> })
+      acts.push({ key: 'publish', label: t('workflow.publish'), icon: <GlobalOutlined /> })
     return acts
   }
 
+  async function generateReport(area: SurveyArea) {
+    setReportLoading(area.id)
+    try {
+      const r = await api.post(`/projects/survey-areas/${area.id}/generate-report/`, {
+        include_features: true, include_photos: true, include_workflow: true,
+      })
+      setReportResult({
+        areaName: area.name,
+        docId:   r.data.doc_id,
+        docUrl:  r.data.file_url,
+        pdfUrl:  r.data.pdf_url ?? null,
+      })
+      qc.invalidateQueries({ queryKey: ['documents', pid] })
+      message.success(`Report generated for "${area.name}"`)
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || 'Report generation failed')
+    } finally {
+      setReportLoading(null)
+    }
+  }
+
   const AREA_STATUS_CONFIG: Record<string, { color: string; icon: React.ReactNode; label: string }> = {
-    DRAFT:        { color: 'default',    icon: <EditOutlined />,          label: 'Draft' },
-    SUBMITTED:    { color: 'processing', icon: <ClockCircleOutlined />,   label: 'Submitted (Checker)' },
-    UNDER_REVIEW: { color: 'warning',    icon: <ExclamationCircleOutlined />, label: 'Under Review (Approver)' },
-    APPROVED:     { color: 'success',    icon: <CheckCircleOutlined />,   label: 'Approved' },
-    PUBLISHED:    { color: 'green',      icon: <GlobalOutlined />,        label: 'Published' },
-    RETURNED:     { color: 'error',      icon: <RollbackOutlined />,      label: 'Returned for Revision' },
+    DRAFT:        { color: 'default',    icon: <EditOutlined />,          label: t('status.draft') },
+    SUBMITTED:    { color: 'processing', icon: <ClockCircleOutlined />,   label: t('status.submitted') },
+    UNDER_REVIEW: { color: 'warning',    icon: <ExclamationCircleOutlined />, label: t('status.under_review') },
+    APPROVED:     { color: 'success',    icon: <CheckCircleOutlined />,   label: t('status.approved') },
+    PUBLISHED:    { color: 'green',      icon: <GlobalOutlined />,        label: t('status.published') },
+    RETURNED:     { color: 'error',      icon: <RollbackOutlined />,      label: t('status.returned') },
   }
 
   const actions = []
@@ -623,11 +685,23 @@ export default function ProjectDetailPage() {
       ) : <Tag style={{ fontSize: 10 }}>Pending</Tag>,
     },
     {
-      title: 'Actions', width: 160,
+      title: 'Actions', width: 200,
       render: (_, doc) => {
         const isPolling = aiPollingIds.has(doc.id)
+        const ext = (doc.file ?? '').split('.').pop()?.toLowerCase() ?? ''
+        const isOfficeDoc = ['doc', 'docx', 'odt', 'rtf', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf'].includes(ext)
         return (
           <Space size={4}>
+            {isOfficeDoc && (
+              <Tooltip title="Open in OnlyOffice">
+                <Button
+                  size="small" type="primary" ghost
+                  icon={<FileWordOutlined />}
+                  style={{ fontSize: 11 }}
+                  onClick={() => openDocumentInNewTab(doc.id)}
+                />
+              </Tooltip>
+            )}
             {doc.file_url && (
               <Button size="small" type="link" href={doc.file_url} target="_blank"
                 style={{ fontSize: 11, padding: 0 }}>
@@ -720,6 +794,20 @@ export default function ProjectDetailPage() {
                   key: 'doc', label: 'Upload Document', icon: <UploadOutlined />,
                   disabled: folderLocked,
                   onClick: folderLocked ? undefined : () => setDocModal({ folderId: folderObj!.id, folderName: folderObj!.name }),
+                })
+                menuItems.push({
+                  key: 'new-doc', label: 'New Online Document', icon: <FileAddOutlined />,
+                  disabled: folderLocked,
+                  onClick: folderLocked ? undefined : () => {
+                    const docType = 'docx'
+                    const title = `New Document — ${folderObj!.name}`
+                    api.post('/documents/create-blank/', { folder: folderObj!.id, title, doc_type: docType })
+                      .then((r) => {
+                        qc.invalidateQueries({ queryKey: ['documents', pid] })
+                        openDocumentInNewTab(r.data.doc_id)
+                      })
+                      .catch((e) => message.error(e?.response?.data?.detail || 'Failed to create document'))
+                  },
                 })
               } else if (isShp) {
                 menuItems.push({
@@ -839,12 +927,22 @@ export default function ProjectDetailPage() {
               children: (
                 <Space direction="vertical" style={{ width: '100%' }}>
                   {canForward && (
-                    <Button
-                      type="primary" icon={<PlusOutlined />} size="small"
-                      onClick={() => { areaForm.resetFields(); setAreaModal('create') }}
-                    >
-                      Add Survey Area
-                    </Button>
+                    <Space size={8} wrap>
+                      <Button
+                        type="primary" icon={<PlusOutlined />} size="small"
+                        onClick={() => { areaForm.resetFields(); setAreaModal('create') }}
+                      >
+                        Add Survey Area
+                      </Button>
+                      <Button
+                        icon={<FileAddOutlined />} size="small"
+                        style={{ borderColor: '#4fc3f7', color: '#4fc3f7' }}
+                        onClick={() => setNewLayerModal(true)}
+                        title="Create a new shapefile layer and start drawing immediately"
+                      >
+                        New Shapefile Layer
+                      </Button>
+                    </Space>
                   )}
                   {surveyAreas.length === 0 && (
                     <Alert
@@ -889,6 +987,32 @@ export default function ProjectDetailPage() {
                                 <Button size="small" icon={<DeleteOutlined />} type="text" danger />
                               </Popconfirm>
                             )}
+                            <Tooltip title="Generate AI survey report (.docx)">
+                              <Button
+                                size="small" type="text" icon={<FileWordOutlined />}
+                                style={{ color: '#52c41a' }}
+                                loading={reportLoading === area.id}
+                                onClick={() => generateReport(area)}
+                              />
+                            </Tooltip>
+                            <Tooltip title="Create blank report and edit online in OnlyOffice">
+                              <Button
+                                size="small" type="text" icon={<FileAddOutlined />}
+                                style={{ color: '#faad14' }}
+                                onClick={async () => {
+                                  try {
+                                    const r = await api.post(`/projects/survey-areas/${area.id}/create-online-report/`, {
+                                      title: `Survey Report — ${area.name}`,
+                                    })
+                                    qc.invalidateQueries({ queryKey: ['documents', pid] })
+                                    openDocumentInNewTab(r.data.doc_id)
+                                    message.success('Blank report created — OnlyOffice opening…')
+                                  } catch (e: any) {
+                                    message.error(e?.response?.data?.detail || 'Failed to create blank report')
+                                  }
+                                }}
+                              />
+                            </Tooltip>
                             <Tooltip title="Open in Map viewer">
                               <Button
                                 size="small" type="text" icon={<GlobalOutlined />}
@@ -932,30 +1056,49 @@ export default function ProjectDetailPage() {
                               </Text>
                             </div>
                           </div>
-                          {acts.length > 0 && (
-                            <Space size={4} wrap>
-                              {acts.map((act) => (
-                                <Button
-                                  key={act.key}
-                                  size="small"
-                                  type={act.danger ? 'default' : 'primary'}
-                                  danger={act.danger}
-                                  icon={act.icon}
-                                  onClick={() => {
-                                    if (act.requiresRemarks) {
-                                      setAreaRemarks('')
-                                      setAreaWorkflowModal({ area, action: act.key })
+                          <Space size={4} wrap>
+                            {acts.map((act) => (
+                              <Button
+                                key={act.key}
+                                size="small"
+                                type={act.danger ? 'default' : 'primary'}
+                                danger={act.danger}
+                                icon={act.icon}
+                                onClick={() => {
+                                  if (act.requiresRemarks) {
+                                    setAreaRemarks('')
+                                    setAreaWorkflowModal({ area, action: act.key })
+                                  } else {
+                                    setAreaRemarks('')
+                                    setAreaWorkflowModal({ area, action: act.key })
+                                  }
+                                }}
+                                loading={areaTransition.isPending}
+                              >
+                                {act.label}
+                              </Button>
+                            ))}
+                            {canForward && (area.status === 'DRAFT' || area.status === 'RETURNED') && (
+                              <Button
+                                size="small"
+                                icon={<ExclamationCircleOutlined />}
+                                onClick={async () => {
+                                  try {
+                                    const res = await api.post(`/workflow/steps/dispute-check/${area.id}/`)
+                                    if (res.data.status === 'CLEAN') {
+                                      message.success('No boundary disputes found — area is clear.')
                                     } else {
-                                      areaTransition.mutate({ areaId: area.id, action: act.key, remarks: '' })
+                                      setDisputeModal({ area, action: '', disputes: res.data.disputes })
                                     }
-                                  }}
-                                  loading={areaTransition.isPending}
-                                >
-                                  {act.label}
-                                </Button>
-                              ))}
-                            </Space>
-                          )}
+                                  } catch {
+                                    message.error('Dispute check failed')
+                                  }
+                                }}
+                              >
+                                Check Disputes
+                              </Button>
+                            )}
+                          </Space>
                         </div>
 
                         {/* Expanded workflow history */}
@@ -1642,6 +1785,25 @@ export default function ProjectDetailPage() {
         />
       </Modal>
 
+      {/* Boundary dispute modal — shown when submit returns 409 or via standalone check */}
+      <DisputeModal
+        open={!!disputeModal}
+        areaName={disputeModal?.area.name ?? ''}
+        disputes={disputeModal?.disputes ?? []}
+        loading={areaTransition.isPending}
+        readOnly={disputeModal?.action === ''}
+        onCancel={() => setDisputeModal(null)}
+        onForceSubmit={() => {
+          if (!disputeModal) return
+          areaTransition.mutate({
+            areaId: disputeModal.area.id,
+            action: disputeModal.action,
+            remarks: areaRemarks,
+            force: true,
+          })
+        }}
+      />
+
       {/* GIS File upload modal (Shape Files or Raster folder) */}
       <Modal
         title={<><ImportOutlined style={{ marginRight: 8 }} />Upload to "{shpModal?.folderName}"</>}
@@ -1842,6 +2004,79 @@ export default function ProjectDetailPage() {
           </Form.Item>
         </Form>
       </Modal>
+
+      {/* ── New Shapefile Layer ─────────────────────────────────── */}
+      <NewLayerModal
+        open={newLayerModal}
+        onClose={() => setNewLayerModal(false)}
+        projectId={pid}
+        surveyAreas={surveyAreas}
+      />
+
+      {/* ── Report Ready Modal ──────────────────────────────────── */}
+      <Modal
+        title={
+          <Space>
+            <FileWordOutlined style={{ color: '#52c41a' }} />
+            <span>Report Ready — {reportResult?.areaName}</span>
+          </Space>
+        }
+        open={!!reportResult}
+        onCancel={() => setReportResult(null)}
+        footer={[
+          <Button key="close" onClick={() => setReportResult(null)}>Close</Button>,
+        ]}
+        width={440}
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          <div style={{ color: '#aaa', fontSize: 13 }}>
+            The report has been saved to the <strong>Doc</strong> folder of this survey area.
+          </div>
+
+          <Button
+            type="primary"
+            icon={<FileWordOutlined />}
+            block
+            onClick={() => {
+              setReportResult(null)
+              openDocumentInNewTab(reportResult!.docId)
+            }}
+            style={{ background: '#1677ff' }}
+          >
+            Open in OnlyOffice (view / edit)
+          </Button>
+
+          <Button
+            icon={<DownloadOutlined />}
+            block
+            href={reportResult?.docUrl}
+            target="_blank"
+          >
+            Download Word (.docx)
+          </Button>
+
+          {reportResult?.pdfUrl ? (
+            <Button
+              icon={<FilePdfOutlined />}
+              block
+              href={reportResult.pdfUrl}
+              target="_blank"
+              danger
+            >
+              Download PDF
+            </Button>
+          ) : (
+            <div style={{ fontSize: 11, color: '#888', textAlign: 'center' }}>
+              PDF conversion requires LibreOffice on the server.
+            </div>
+          )}
+        </Space>
+      </Modal>
+
+      {/* ── OnlyOffice Viewer ──────────────────────────────────── */}
+      {(() => {
+        return null
+      })()}
     </div>
   )
 }

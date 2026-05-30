@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import State, District, Taluk, Village, RevenueMap
+from .models import State, District, Taluk, Village, RevenueMap, BoundaryImportJob
 
 
 class StateSerializer(serializers.ModelSerializer):
@@ -44,3 +44,18 @@ class RevenueMapSerializer(serializers.ModelSerializer):
         fields = ['id', 'survey_number', 'village', 'village_name',
                   'area_hectares', 'classification', 'notes']
         extra_kwargs = {'geometry': {'required': False}}
+
+
+class BoundaryImportJobSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.CharField(source='uploaded_by.username', read_only=True)
+
+    class Meta:
+        model = BoundaryImportJob
+        fields = [
+            'id', 'level', 'file', 'name_field', 'code_field',
+            'parent_code_field', 'spatial_parent', 'clear_existing',
+            'status', 'result', 'error_log', 'uploaded_by', 'uploaded_by_name',
+            'created_at', 'completed_at',
+        ]
+        read_only_fields = ['status', 'result', 'error_log', 'uploaded_by',
+                            'uploaded_by_name', 'created_at', 'completed_at']

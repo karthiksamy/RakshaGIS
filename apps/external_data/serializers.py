@@ -42,10 +42,20 @@ class ExternalLayerSerializer(serializers.ModelSerializer):
             'id', 'database', 'database_name',
             'table_name', 'schema_name', 'display_name', 'description',
             'geometry_column', 'geometry_type', 'srid',
-            'id_column', 'label_column', 'include_columns',
-            'office_filter_field',
-            'style', 'min_zoom', 'is_active', 'display_order',
+            'id_column', 'label_column', 'include_columns', 'analysis_columns',
+            'cantonment_scope',
+            'office_filter_field', 'level_filter_fields',
+            'style', 'inside_render_type', 'classification_field', 'classification_colors',
+            'min_zoom', 'is_active', 'display_order',
             'feature_count', 'bbox', 'last_synced_at',
             'created_at',
         ]
         read_only_fields = ['id', 'feature_count', 'bbox', 'last_synced_at', 'created_at']
+        extra_kwargs = {
+            'level_filter_fields': {'required': False},
+            'office_filter_field': {'required': False},
+            'classification_field': {'required': False},
+            'classification_colors': {'required': False},
+            'cantonment_scope': {'required': False},
+            'inside_render_type': {'required': False},
+        }

@@ -121,7 +121,9 @@ def _legend_items_html(legend: list[dict]) -> str:
 
 def generate_arcgis_print_html(
     *,
-    map_image_b64: str,
+    map_image_b64: str = '',
+    basemap_image_b64: str = '',
+    features_image_b64: str = '',
     title: str,
     subtitle: str = '',
     org_name: str = '',
@@ -228,8 +230,17 @@ def generate_arcgis_print_html(
         classif_html_top = f'<div style="{banner_style}">{classif_safe}</div>'
         classif_html_bot = f'<div style="{banner_style}">{classif_safe}</div>'
 
-    # Map image — encode into img src
-    map_img_src = f'data:image/png;base64,{map_image_b64}'
+    # Map image — encode into img src or layers
+    map_img_content = ''
+    if basemap_image_b64 or features_image_b64:
+        if basemap_image_b64:
+            map_img_content += f'<img src="data:image/png;base64,{basemap_image_b64}" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;" />'
+        if features_image_b64:
+            map_img_content += f'<img src="data:image/png;base64,{features_image_b64}" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;" />'
+    elif map_image_b64:
+        map_img_content = f'<img src="data:image/png;base64,{map_image_b64}" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;" />'
+    else:
+        map_img_content = '<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;background:#e0e5ea;font-size:8pt;color:#777;">Map image unavailable</div>'
 
     page_w = f'{pw}mm'
     page_h = f'{ph}mm'
@@ -389,7 +400,7 @@ body {{
 
     <!-- Map data frame -->
     <div class="map-frame">
-      <img src="{map_img_src}" alt="Map"/>
+      {map_img_content}
       {north_html}
       {scale_html}
     </div>

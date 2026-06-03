@@ -10,6 +10,7 @@ from .serializers import ExternalDatabaseSerializer, ExternalLayerSerializer
 from .db_utils import (
     test_connection, list_spatial_tables, table_columns,
     layer_geojson, layer_bbox_and_count, import_mst_office,
+    distinct_column_values, search_external_layer,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,9 @@ class ExternalDatabaseViewSet(viewsets.ModelViewSet):
 
         db.last_sync_at = timezone.now()
         db.save(update_fields=['last_sync_at'])
+        if result.get('unknown_level_codes'):
+            logger.warning('sync_orgs DB %s: unrecognised officelevelid codes %s',
+                           db.id, result['unknown_level_codes'])
         return Response(result)
 
 
@@ -106,7 +110,7 @@ class ExternalLayerViewSet(viewsets.ModelViewSet):
     serializer_class = ExternalLayerSerializer
 
     def get_permissions(self):
-        if self.action in ('list', 'retrieve', 'geojson'):
+        if self.action in ('list', 'retrieve', 'geojson', 'search'):
             return [permissions.IsAuthenticated()]
         return [IsSuperAdmin()]
 
@@ -144,9 +148,28 @@ class ExternalLayerViewSet(viewsets.ModelViewSet):
         if not layer.database.is_active:
             return Response({'detail': 'Source database is inactive.'}, status=503)
         try:
-            limit = min(int(request.query_params.get('limit', 5000)), 20_000)
+            # Cap high enough that an unfiltered (DGDE/superadmin) view of a large
+            # layer is not silently truncated. Filtered users get far fewer rows.
+            limit = min(int(request.query_params.get('limit', 20_000)), 200_000)
+            # Optional viewport filter: ?bbox=minLon,minLat,maxLon,maxLat (WGS84)
+            bbox = None
+            bbox_raw = (request.query_params.get('bbox') or '').strip()
+            if bbox_raw:
+                try:
+                    parts = [float(x) for x in bbox_raw.split(',')]
+                    if len(parts) == 4:
+                        bbox = parts
+                except ValueError:
+                    bbox = None
+            # Optional attribute filter: ?filter_field=Col&filter_value=Val
+            filter_field = (request.query_params.get('filter_field') or '').strip()
+            filter_value = request.query_params.get('filter_value')
             # Pass the logged-in user so office-based row filtering is applied.
-            fc    = layer_geojson(layer, limit=limit, user=request.user)
+            fc    = layer_geojson(
+                layer, limit=limit, user=request.user, bbox=bbox,
+                attr_field=filter_field or None,
+                attr_value=filter_value if filter_field else None,
+            )
         except Exception as exc:
             logger.error('layer_geojson failed for %s: %s', layer, exc)
             return Response({'detail': f'Query failed: {exc}'}, status=500)
@@ -200,3 +223,64 @@ class ExternalLayerViewSet(viewsets.ModelViewSet):
         except Exception as exc:
             return Response({'detail': str(exc)}, status=500)
         return Response(cols)
+
+    # ── /search ──────────────────────────────────────────────────────────────
+
+    @action(detail=False, methods=['get'], url_path='search')
+    def search(self, request):
+        """
+        GET /api/external/layers/search/?q=keyword[&limit=15]
+
+        Keyword-search across all active external layers' attributes and return
+        matching features (with WGS84 geometry) so the map viewer can fly to them.
+        The same per-level office filtering as the map is applied, so users only
+        find features they are allowed to see.
+        """
+        q = (request.query_params.get('q') or '').strip()
+        if len(q) < 2:
+            return Response({'detail': 'Enter at least 2 characters.', 'results': []}, status=400)
+
+        try:
+            per_layer = min(int(request.query_params.get('limit', 15)), 50)
+        except ValueError:
+            per_layer = 15
+        total_cap = 100
+
+        results: list = []
+        # get_queryset already restricts to active layers for non-superadmins.
+        for layer in self.get_queryset().filter(is_active=True, database__is_active=True):
+            if len(results) >= total_cap:
+                break
+            try:
+                results.extend(search_external_layer(layer, q, user=request.user, limit=per_layer))
+            except Exception as exc:
+                logger.warning('search failed for layer %s: %s', layer, exc)
+                continue
+
+        return Response({'query': q, 'count': len(results), 'results': results[:total_cap]})
+
+    # ── /distinct-values ─────────────────────────────────────────────────────
+
+    @action(detail=True, methods=['get'], url_path='distinct-values',
+            permission_classes=[permissions.IsAuthenticated])
+    def distinct_values(self, request, pk=None):
+        """
+        GET /api/external/layers/{id}/distinct-values/?field=Land_Use_Type
+
+        Return the distinct values of an attribute column. Used by the super admin
+        to auto-generate a classification colour map, and by viewers (e.g. the 3D
+        Terrain Viewer) to populate a value filter for the configured column.
+        """
+        layer = self.get_object()
+        field = (request.query_params.get('field') or '').strip()
+        if not field:
+            return Response({'detail': 'field query parameter is required.'}, status=400)
+        try:
+            limit  = min(int(request.query_params.get('limit', 200)), 1000)
+            values = distinct_column_values(layer, field, limit=limit)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=400)
+        except Exception as exc:
+            logger.error('distinct_values failed for %s.%s: %s', layer, field, exc)
+            return Response({'detail': str(exc)}, status=500)
+        return Response({'field': field, 'values': values})

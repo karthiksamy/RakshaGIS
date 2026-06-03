@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react'
 import { useProjectWebSocket } from '@/hooks/useProjectWebSocket'
 import CollabPresence from './CollabPresence'
 import { useSearchParams } from 'react-router-dom'
@@ -16,7 +16,8 @@ import OSM from 'ol/source/OSM'
 import XYZ from 'ol/source/XYZ'
 import VectorTileSource from 'ol/source/VectorTile'
 import MVT from 'ol/format/MVT'
-import { fromLonLat, toLonLat } from 'ol/proj'
+import { fromLonLat, toLonLat, transformExtent } from 'ol/proj'
+import { unByKey } from 'ol/Observable'
 import { toStringXY } from 'ol/coordinate'
 import { defaults as defaultControls, ScaleLine } from 'ol/control'
 import Draw from 'ol/interaction/Draw'
@@ -36,7 +37,7 @@ import { shiftKeyOnly } from 'ol/events/condition'
 import {
   Tooltip, Button, Select as AntSelect, Space, Drawer, Descriptions, Tag,
   Slider, InputNumber, message, Modal, Input, ColorPicker, Popover, Divider, Switch,
-  Tabs, Badge, Form, Radio, Collapse, Segmented, Dropdown,
+  Tabs, Badge, Form, Radio, Collapse, Segmented, Dropdown, Checkbox, AutoComplete, Spin,
 } from 'antd'
 import {
   DragOutlined, AimOutlined, EditOutlined,
@@ -55,6 +56,7 @@ import {
   HistoryOutlined, RetweetOutlined,
   SearchOutlined, NodeIndexOutlined, FunctionOutlined, SisternodeOutlined,
   RadiusUprightOutlined, MinusCircleOutlined, FileAddOutlined, UploadOutlined,
+  CloudServerOutlined,
 } from '@ant-design/icons'
 import TileWMS from 'ol/source/TileWMS'
 import HeatmapLayer from 'ol/layer/Heatmap'
@@ -71,6 +73,9 @@ import AttributeTablePanel from './AttributeTablePanel'
 import PrintLayoutModal, { type LayerLegendItem } from './PrintLayoutModal'
 import MapExportModal from './MapExportModal'
 import TempLayersPanel, { getTempLayerColor } from './TempLayersPanel'
+import ExternalLayersPanel from './ExternalLayersPanel'
+import { makePatternFill } from './fillPatterns'
+import { resolveExtStyle, type ExtStyleResolved } from './extStyle'
 import DraggableModal from '@/components/DraggableModal'
 import NewLayerModal from './NewLayerModal'
 import ImportGISModal from './ImportGISModal'
@@ -237,6 +242,126 @@ function loadBookmarks(): MapBookmark[] {
   try { return JSON.parse(localStorage.getItem(BOOKMARKS_KEY) ?? '[]') } catch { return [] }
 }
 
+// ── External-layer thematic (classification-based) styling ───────────────────
+const EXT_NULL_KEY = '__null__'
+
+interface ExtClassColor { color: string; opacity?: number }
+interface ExtLayerConfig {
+  id: number
+  display_name?: string
+  classification_field?: string
+  classification_colors?: Record<string, ExtClassColor>
+  style?: Record<string, unknown>
+  feature_count?: number | null
+  min_zoom?: number
+  bbox?: number[] | null
+}
+
+// Layers larger than this load by viewport (bbox); smaller ones load fully once.
+const EXT_BBOX_THRESHOLD = 5000
+
+interface ExtSearchResult {
+  layer_id: number
+  layer_name: string
+  id: number | string
+  label: string
+  match_field?: string | null
+  match_value?: string | null
+  geometry: Record<string, unknown>
+}
+
+function debounce<T extends (...a: any[]) => void>(fn: T, ms: number): T {
+  let h: ReturnType<typeof setTimeout> | null = null
+  return ((...args: any[]) => {
+    if (h) clearTimeout(h)
+    h = setTimeout(() => fn(...args), ms)
+  }) as T
+}
+interface ExtClassLegend {
+  title: string
+  field: string
+  entries: { value: string; color: string; opacity: number }[]
+}
+
+function hexToRgba(hex: string, opacity: number): string {
+  const h = (hex || '').replace('#', '').trim()
+  const full = h.length === 3 ? h.split('').map(c => c + c).join('') : h
+  const n = parseInt(full || 'ff6600', 16)
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255
+  const a = Math.max(0, Math.min(1, isNaN(opacity) ? 0.5 : opacity))
+  return `rgba(${r},${g},${b},${a})`
+}
+
+function makeExtImage(cfg: ExtStyleResolved, stroke?: Stroke) {
+  // Points use a solid fill (patterns are invisible at point scale).
+  const fill = new Fill({ color: hexToRgba(cfg.fillColor, Math.max(cfg.fillOpacity, 0.6)) })
+  const r = cfg.pointSize
+  if (cfg.pointShape === 'circle') return new CircleStyle({ radius: r, fill, stroke })
+  const shapeCfg: Record<string, [number, number | undefined, number]> = {
+    square:   [4, undefined, Math.PI / 4],
+    triangle: [3, undefined, 0],
+    diamond:  [4, undefined, 0],
+    star:     [5, r / 2.5,   0],
+    cross:    [4, 0,         0],
+    x:        [4, 0,         Math.PI / 4],
+  }
+  const [pts, r2, angle] = shapeCfg[cfg.pointShape] ?? [4, undefined, Math.PI / 4]
+  return new RegularShape({ points: pts, radius: r, radius2: r2, angle, fill, stroke })
+}
+
+function buildOLExtStyle(cfg: ExtStyleResolved): Style {
+  const stroke = cfg.strokeWidth > 0 ? new Stroke({
+    color: hexToRgba(cfg.strokeColor, cfg.strokeOpacity),
+    width: cfg.strokeWidth,
+    lineDash: LINE_DASH[cfg.strokeStyle],
+    lineCap: cfg.strokeCap,
+    lineJoin: cfg.strokeJoin,
+  }) : undefined
+  const fill = makePatternFill(cfg.fillPattern, cfg.fillColor, cfg.fillOpacity)
+  return new Style({ stroke, fill, image: makeExtImage(cfg, stroke) })
+}
+
+/** Build an OL style (or per-feature style function) for an external layer. */
+function makeExtStyle(layer?: ExtLayerConfig): Style | ((f: any) => Style) {
+  const base = resolveExtStyle(layer?.style)
+  const field = (layer?.classification_field || '').trim()
+  const colors = layer?.classification_colors || {}
+  if (!field || Object.keys(colors).length === 0) {
+    // Flat single-symbol style (stroke + pattern fill from the configured schema).
+    return buildOLExtStyle(base)
+  }
+  // Thematic: per-class fill colour/opacity, but keep the configured stroke + pattern.
+  const cache: Record<string, Style> = {}
+  const styleFor = (raw: unknown): Style => {
+    const key = raw == null || String(raw).trim() === '' ? EXT_NULL_KEY : String(raw).trim()
+    if (cache[key]) return cache[key]
+    const cfg = colors[key] || colors[EXT_NULL_KEY] || { color: '#bdbdbd', opacity: 0.5 }
+    const color = cfg.color || '#bdbdbd'
+    const st = buildOLExtStyle({
+      ...base,
+      fillColor: color,
+      strokeColor: color,
+      fillOpacity: cfg.opacity == null ? 0.5 : cfg.opacity,
+    })
+    cache[key] = st
+    return st
+  }
+  return (feature: any) => styleFor(feature.get(field))
+}
+
+/** Build legend rows for a classified external layer (null = no legend). */
+function makeExtLegend(layer?: ExtLayerConfig): ExtClassLegend | null {
+  const field = (layer?.classification_field || '').trim()
+  const colors = layer?.classification_colors || {}
+  if (!field || Object.keys(colors).length === 0) return null
+  const entries = Object.entries(colors).map(([value, cfg]) => ({
+    value: value === EXT_NULL_KEY ? 'Null / Others' : value,
+    color: cfg.color || '#bdbdbd',
+    opacity: cfg.opacity == null ? 0.5 : cfg.opacity,
+  }))
+  return { title: layer?.display_name || 'Layer', field, entries }
+}
+
 export default function MapPage() {
   const mapRef = useRef<HTMLDivElement>(null)
   const mapInstance = useRef<Map | null>(null)
@@ -267,7 +392,22 @@ export default function MapPage() {
   const [tempVisibleIds, setTempVisibleIds] = useState<Set<number>>(new Set())
   // External DB layers (key = 'ext:{id}')
   const extLayerRefs = useRef<Record<string, VectorLayer<VectorSource>>>({})
+  // moveend listeners for viewport (bbox) loaded external layers, keyed by 'ext:{id}'
+  const extMoveKeys = useRef<Record<string, any>>({})
   const [extVisibleIds, setExtVisibleIds] = useState<Set<string>>(new Set())
+  // Classification legends for visible external layers, keyed by 'ext:{id}'
+  const [extClassLegends, setExtClassLegends] = useState<Record<string, ExtClassLegend>>({})
+  // New shapes drawn by a CEO/ADEO surveyor can be shared with the parent DEO (default Yes).
+  const [deoVisible, setDeoVisible] = useState(true)
+  const deoVisibleRef = useRef(true)
+  useEffect(() => { deoVisibleRef.current = deoVisible }, [deoVisible])
+  const [extLayersPanelOpen, setExtLayersPanelOpen] = useState(false)
+
+  // External-layer keyword search
+  const [extSearchValue, setExtSearchValue] = useState('')
+  const [extSearchResults, setExtSearchResults] = useState<ExtSearchResult[]>([])
+  const [extSearchLoading, setExtSearchLoading] = useState(false)
+  const searchHighlightLayer = useRef<VectorLayer<VectorSource> | null>(null)
 
   const {
     mapTool, setMapTool,
@@ -278,7 +418,18 @@ export default function MapPage() {
     user,
   } = useAppStore()
   const canDraw = user ? DRAW_ROLES.includes(user.role) : false
+  const isCantonmentUploader = user?.role === 'SURVEYOR'
   const [selectedAreaStatus, setSelectedAreaStatus] = useState<string | null>(null)
+
+  // DGDE/PDDE (national/command) get a simplified, read-only viewer: pick an office,
+  // see only its PUBLISHED layers with basic controls. No draw/edit tools or feature lists.
+  const simplified = user?.organisation_level === 'DGDE' || user?.organisation_level === 'PDDE'
+  const [officeFilter, setOfficeFilter] = useState<number | null>(null)
+  const { data: officeOptions = [] } = useQuery<any[]>({
+    queryKey: ['map-offices'],
+    queryFn: () => api.get('/accounts/organisations/').then(r => r.data.results ?? r.data),
+    enabled: simplified,
+  })
 
   // ── Real-time collaboration ─────────────────────────────────────────────────
   const {
@@ -295,6 +446,7 @@ export default function MapPage() {
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [featureInfo, setFeatureInfo] = useState<Record<string, unknown> | null>(null)
+  const [featureModalMeta, setFeatureModalMeta] = useState<{ layerLabel: string; layerType: string } | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [layerPanelOpen, setLayerPanelOpen] = useState(false)
   const [measureResult, setMeasureResult] = useState<string | null>(null)
@@ -452,11 +604,20 @@ export default function MapPage() {
     queryFn: () => api.get('/projects/').then((r) => r.data),
   })
 
-  // Auto-select the most-recent project when map opens with nothing selected
+  // Auto-select project: honour ?project= URL param first, then stored ID, then most recent
   useEffect(() => {
     if (!projects?.results?.length) return
+    const projectParam = searchParams.get('project')
+    if (projectParam) {
+      const pid = Number(projectParam)
+      if (projects.results.some((p) => p.id === pid)) {
+        setSelectedProjectId(pid)
+        // Remove param from URL so it doesn't persist after selection
+        setSearchParams(prev => { prev.delete('project'); return prev }, { replace: true })
+        return
+      }
+    }
     if (selectedProjectId) {
-      // Validate stored ID still exists in the list
       const exists = projects.results.some((p) => p.id === selectedProjectId)
       if (!exists) setSelectedProjectId(projects.results[0].id)
     } else {
@@ -587,12 +748,19 @@ export default function MapPage() {
   })
 
   const { data: mapFeatures = [] } = useQuery<GISFeature[]>({
-    queryKey: ['map-features', selectedProjectId],
-    queryFn: () =>
-      selectedProjectId
+    queryKey: ['map-features', simplified ? `org:${officeFilter}` : selectedProjectId],
+    queryFn: () => {
+      // DGDE/PDDE: load the picked office's PUBLISHED features (backend enforces status).
+      if (simplified) {
+        return officeFilter
+          ? api.get(`/projects/features/?organisation=${officeFilter}&is_deleted=false`).then((r) => r.data.results ?? r.data)
+          : Promise.resolve([])
+      }
+      return selectedProjectId
         ? api.get(`/projects/features/?project=${selectedProjectId}&is_deleted=false`).then((r) => r.data.results ?? r.data)
-        : Promise.resolve([]),
-    enabled: !!selectedProjectId,
+        : Promise.resolve([])
+    },
+    enabled: simplified ? !!officeFilter : !!selectedProjectId,
   })
 
   const rawLayerNames = useMemo(
@@ -832,6 +1000,51 @@ export default function MapPage() {
     })
     bufferLayer.current = bl
 
+    // Enhanced click handler that works with all layers including external layers
+    const handleMapClick = (e: any) => {
+      const pixel = e.pixel
+      let featureFound = false
+
+      const map = mapInstance.current
+      if (!map) return
+
+      map.forEachFeatureAtPixel(pixel, (feature: any, layer: any) => {
+        if (featureFound) return
+
+        // Skip internal/utility layers
+        if (layer === boundaryLayer || layer === bl) return
+        // Skip measure layer and select layer (no useful attributes)
+        if (layer === ml || layer === selLayer) return
+
+        const props = feature.getProperties()
+        const displayProps: Record<string, unknown> = { ...props }
+        delete displayProps.geometry
+
+        // Determine layer type and label for the modal header
+        let layerLabel = 'Feature'
+        let layerType = 'project'
+        if (layer) {
+          const tempId = layer.get('_tempLayerId')
+          const extKey = layer.get('_extLayerKey')
+          if (tempId != null) {
+            layerType = 'temp'
+            layerLabel = `Temp Layer #${tempId}`
+          } else if (extKey != null) {
+            layerType = 'external'
+            layerLabel = `External Layer (${extKey})`
+          } else if (displayProps.layer_name) {
+            layerType = 'project'
+            layerLabel = String(displayProps.layer_name)
+          }
+        }
+
+        setFeatureInfo(displayProps)
+        setFeatureModalMeta({ layerLabel, layerType })
+        setDrawerOpen(true)
+        featureFound = true
+      })
+    }
+
     const identifySelect = new SelectInteraction({
       condition: click,
       layers: [vl],
@@ -848,7 +1061,11 @@ export default function MapPage() {
     identifySelect.on('select', (e) => {
       if (e.selected.length > 0) {
         const props = e.selected[0].getProperties()
-        setFeatureInfo(props)
+        const displayProps: Record<string, unknown> = { ...props }
+        delete displayProps.geometry
+        const layerLabel = displayProps.layer_name ? String(displayProps.layer_name) : 'Feature'
+        setFeatureInfo(displayProps)
+        setFeatureModalMeta({ layerLabel, layerType: 'project' })
         setDrawerOpen(true)
       }
     })
@@ -860,6 +1077,9 @@ export default function MapPage() {
       controls: defaultControls({ zoom: false }).extend([new ScaleLine({ units: 'metric' })]),
     })
     map.addInteraction(identifySelect)
+    
+    // Add generic click handler for external layers and other features
+    map.on('singleclick', handleMapClick)
 
     map.on('pointermove', (e) => {
       setMapCoords(e.coordinate as [number, number])
@@ -902,6 +1122,28 @@ export default function MapPage() {
     return () => map.getView().un('change:resolution', listener)
   }, [])
 
+  // Auto-load all active external layers on map init
+  useEffect(() => {
+    if (!mapInstance.current) return
+    
+    ;(async () => {
+      try {
+        const res = await api.get('/external/layers/')
+        const extLayers = res.data.results ?? res.data
+        if (!Array.isArray(extLayers)) return
+        
+        for (const layer of extLayers) {
+          const key = `ext:${layer.id}`
+          if (extVisibleIds.has(key)) continue  // Already loaded
+          // showExtLayer handles fetching (viewport-based for large layers).
+          showExtLayer(key, layer)
+        }
+      } catch (err) {
+        console.warn('⚠️ Failed to fetch external layers:', err)
+      }
+    })()
+  }, [])
+
   // Update basemap
   useEffect(() => {
     if (!basemapLayer.current) return
@@ -909,7 +1151,14 @@ export default function MapPage() {
   }, [activeBasemap])
 
   useEffect(() => {
-    if (basemaps && basemaps.length > 0 && !activeBasemap) setActiveBasemap(basemaps[0])
+    if (basemaps && basemaps.length > 0 && !activeBasemap) {
+      // Prefer the super-admin-configured default; fall back to first active, then first.
+      const pick =
+        basemaps.find((b) => b.is_default && b.is_active) ??
+        basemaps.find((b) => b.is_active) ??
+        basemaps[0]
+      setActiveBasemap(pick)
+    }
   }, [basemaps])
 
   // Auto-set folder from active version
@@ -1022,6 +1271,19 @@ export default function MapPage() {
       } catch (_) {}
     })
   }, [visibleFeatures])
+
+  // Simplified DGDE/PDDE viewer: frame the picked office's published features once loaded.
+  useEffect(() => {
+    if (!simplified) return
+    const src = projectLayer.current?.getSource()
+    const map = mapInstance.current
+    if (!src || !map || visibleFeatures.length === 0) return
+    const ext = src.getExtent()
+    if (ext && ext[0] !== Infinity) {
+      map.getView().fit(ext, { padding: [60, 60, 60, 60], maxZoom: 17, duration: 500 })
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [simplified, officeFilter, visibleFeatures.length])
 
   // Sync COG layers
   useEffect(() => {
@@ -1205,41 +1467,151 @@ export default function MapPage() {
   }
 
   // ── External DB layer show/hide (read-only, no edit controls) ─────────────
-  function showExtLayer(key: string, geojson: Record<string, unknown>) {
+  // Small layers load fully once; large layers (> EXT_BBOX_THRESHOLD) load by
+  // viewport (bbox) on every pan/zoom and are gated below the layer's min_zoom.
+  function showExtLayer(key: string, layer?: ExtLayerConfig) {
     const map = mapInstance.current
-    if (!map) return
+    if (!map || !layer) return
+    // Clean any prior instance (layer + moveend listener)
     if (extLayerRefs.current[key]) map.removeLayer(extLayerRefs.current[key])
-    const src = new VectorSource({
-      features: new GeoJSON().readFeatures(geojson, { featureProjection: 'EPSG:3857' }),
-    })
+    if (extMoveKeys.current[key]) { unByKey(extMoveKeys.current[key]); delete extMoveKeys.current[key] }
+
+    const src = new VectorSource()
     const lyr = new VectorLayer({
       source: src,
-      style: new Style({
-        stroke: new Stroke({ color: '#ff6600', width: 1.8 }),
-        fill:   new Fill({ color: 'rgba(255,102,0,0.12)' }),
-        image:  new CircleStyle({ radius: 5, stroke: new Stroke({ color: '#ff6600', width: 1.5 }),
-                                   fill: new Fill({ color: 'rgba(255,102,0,0.4)' }) }),
-      }),
+      style: makeExtStyle(layer),
       zIndex: 75,
       properties: { _extLayerKey: key, _readOnly: true },
     })
     map.addLayer(lyr)
     extLayerRefs.current[key] = lyr
     setExtVisibleIds(prev => new Set([...prev, key]))
-    const extent = src.getExtent()
-    if (extent && extent[0] !== Infinity) {
-      map.getView().fit(extent, { padding: [40, 40, 40, 40], maxZoom: 16, duration: 500 })
+
+    const legend = makeExtLegend(layer)
+    setExtClassLegends(prev => {
+      const next = { ...prev }
+      if (legend) next[key] = legend; else delete next[key]
+      return next
+    })
+
+    const count = layer.feature_count ?? 0
+    const useBbox = count > EXT_BBOX_THRESHOLD
+    const minZoom = layer.min_zoom ?? 0
+
+    const loadFeatures = async (withBbox: boolean) => {
+      const view = map.getView()
+      const params: Record<string, unknown> = {}
+      if (withBbox) {
+        if ((view.getZoom() ?? 0) < minZoom) { src.clear(); return }  // zoom gating
+        const ext4326 = transformExtent(
+          view.calculateExtent(map.getSize()), 'EPSG:3857', 'EPSG:4326',
+        )
+        params.bbox = ext4326.join(',')
+        params.limit = 50000
+      } else {
+        params.limit = Math.min(Math.max(count + 100, 20000), 200000)
+      }
+      try {
+        const r = await api.get(`/external/layers/${layer.id}/geojson/`, { params })
+        const feats = new GeoJSON().readFeatures(r.data, { featureProjection: 'EPSG:3857' })
+        src.clear()
+        src.addFeatures(feats)
+      } catch { /* leave existing features on transient error */ }
+    }
+
+    if (useBbox) {
+      // Fit to the layer's stored extent (if known) before the first viewport load
+      if (layer.bbox && layer.bbox.length === 4) {
+        const ext = transformExtent(layer.bbox as number[], 'EPSG:4326', 'EPSG:3857')
+        if (ext[0] !== Infinity) map.getView().fit(ext, { padding: [40, 40, 40, 40], maxZoom: 14, duration: 400 })
+      }
+      const handler = debounce(() => loadFeatures(true), 350)
+      extMoveKeys.current[key] = map.on('moveend', handler)
+      loadFeatures(true)
+    } else {
+      loadFeatures(false).then(() => {
+        const extent = src.getExtent()
+        if (extent && extent[0] !== Infinity) {
+          map.getView().fit(extent, { padding: [40, 40, 40, 40], maxZoom: 16, duration: 500 })
+        }
+      })
     }
   }
 
   function hideExtLayer(key: string) {
     const map = mapInstance.current
     if (!map) return
+    if (extMoveKeys.current[key]) { unByKey(extMoveKeys.current[key]); delete extMoveKeys.current[key] }
     if (extLayerRefs.current[key]) {
       map.removeLayer(extLayerRefs.current[key])
       delete extLayerRefs.current[key]
     }
     setExtVisibleIds(prev => { const s = new Set(prev); s.delete(key); return s })
+    setExtClassLegends(prev => { const n = { ...prev }; delete n[key]; return n })
+  }
+
+  /** Re-apply a layer's style live (no feature reload). Used by the style editor. */
+  function restyleExtLayer(key: string, layer: ExtLayerConfig) {
+    const lyr = extLayerRefs.current[key]
+    if (!lyr) return
+    lyr.setStyle(makeExtStyle(layer))
+    lyr.changed()
+    const legend = makeExtLegend(layer)
+    setExtClassLegends(prev => {
+      const next = { ...prev }
+      if (legend) next[key] = legend; else delete next[key]
+      return next
+    })
+  }
+
+  // ── External-layer keyword search ─────────────────────────────────────────
+  const runExtSearch = useMemo(() => debounce(async (q: string) => {
+    if (q.trim().length < 2) { setExtSearchResults([]); setExtSearchLoading(false); return }
+    setExtSearchLoading(true)
+    try {
+      const r = await api.get('/external/layers/search/', { params: { q: q.trim() } })
+      setExtSearchResults(r.data?.results ?? [])
+    } catch {
+      setExtSearchResults([])
+    } finally {
+      setExtSearchLoading(false)
+    }
+  }, 350), [])
+
+  function flyToSearchResult(res: ExtSearchResult) {
+    const map = mapInstance.current
+    if (!map || !res.geometry) return
+    let feat: Feature
+    try {
+      feat = new GeoJSON().readFeature(res.geometry, {
+        dataProjection: 'EPSG:4326', featureProjection: 'EPSG:3857',
+      }) as Feature
+    } catch { return }
+
+    // Lazily create a dedicated highlight layer above everything
+    if (!searchHighlightLayer.current) {
+      searchHighlightLayer.current = new VectorLayer({
+        source: new VectorSource(),
+        zIndex: 999,
+        style: new Style({
+          stroke: new Stroke({ color: '#ffeb3b', width: 3 }),
+          fill: new Fill({ color: 'rgba(255,235,59,0.25)' }),
+          image: new CircleStyle({ radius: 8, stroke: new Stroke({ color: '#ffeb3b', width: 3 }),
+                                   fill: new Fill({ color: 'rgba(255,235,59,0.5)' }) }),
+        }),
+      })
+      map.addLayer(searchHighlightLayer.current)
+    }
+    const hsrc = searchHighlightLayer.current.getSource()!
+    hsrc.clear()
+    hsrc.addFeature(feat)
+
+    const extent = feat.getGeometry()?.getExtent()
+    if (extent && extent[0] !== Infinity) {
+      map.getView().fit(extent, { padding: [80, 80, 80, 80], maxZoom: 18, duration: 600 })
+    }
+    // Auto-clear the highlight after a few seconds
+    window.setTimeout(() => { try { hsrc.clear() } catch { /* noop */ } }, 6000)
   }
 
   // DragBox (box select) interaction
@@ -1714,6 +2086,7 @@ export default function MapPage() {
             layer_name: f.get('layer_name') ?? 'polygon_layer',
             geometry_type: gf.geometry?.type?.toUpperCase() === 'POINT' ? 'POINT' : gf.geometry?.type?.toUpperCase() === 'LINESTRING' ? 'LINE' : 'POLYGON',
             geometry: gf.geometry, attributes: {},
+            ...(isCantonmentUploader ? { deo_visible: deoVisibleRef.current } : {}),
           }).then((r) => { f.setId(r.data.id); saved.push(r.data) }).catch(() => {})
         }
         qc.setQueryData<GISFeature[]>(['map-features', selectedProjectId], (old) =>
@@ -2072,6 +2445,7 @@ export default function MapPage() {
       geometry_type: dt === 'Point' ? 'POINT' : dt === 'LineString' ? 'LINE' : 'POLYGON',
       geometry: gf.geometry,
       attributes: {},
+      ...(isCantonmentUploader ? { deo_visible: deoVisibleRef.current } : {}),
     }).then((r) => {
       const saved: GISFeature = r.data
       // Update OL feature in-place (already on the map from Draw interaction)
@@ -2219,6 +2593,7 @@ export default function MapPage() {
           project: selectedProjectId, folder: selectedFolderId ?? null,
           layer_name: ln, geometry_type: gf.geometry?.type?.toUpperCase() === 'POINT' ? 'POINT' : gf.geometry?.type?.toUpperCase() === 'LINESTRING' ? 'LINE' : 'POLYGON',
           geometry: gf.geometry, attributes: f.getProperties(),
+          ...(isCantonmentUploader ? { deo_visible: deoVisibleRef.current } : {}),
         })
         count++
       } catch (_) {}
@@ -2449,6 +2824,40 @@ export default function MapPage() {
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       {/* Map canvas */}
       <div ref={mapRef} className="ol-map" />
+
+      {/* External-layer keyword search */}
+      <div style={{ position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)', zIndex: 31, width: 400, maxWidth: '70vw' }}>
+        <AutoComplete
+          style={{ width: '100%' }}
+          value={extSearchValue}
+          allowClear
+          placeholder="🔍 Search external layers (any keyword)…"
+          options={extSearchResults.map((res, i) => ({
+            value: `${res.layer_id}:${res.id}:${i}`,
+            data: res,
+            label: (
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <b>{res.match_value || res.label}</b>
+                  {res.match_field && <span style={{ color: '#888', fontSize: 11 }}> · {res.match_field}</span>}
+                </span>
+                <Tag color="blue" style={{ fontSize: 10, margin: 0 }}>{res.layer_name}</Tag>
+              </div>
+            ),
+          }))}
+          onSearch={(v) => { setExtSearchValue(v); setExtSearchLoading(v.trim().length >= 2); runExtSearch(v) }}
+          onChange={(v) => setExtSearchValue(v ?? '')}
+          onSelect={(_v, opt: any) => {
+            const res = opt?.data as ExtSearchResult
+            if (res) { flyToSearchResult(res); setExtSearchValue(res.match_value || res.label) }
+          }}
+          notFoundContent={
+            extSearchLoading ? <div style={{ textAlign: 'center', padding: 8 }}><Spin size="small" /></div>
+              : extSearchValue.trim().length >= 2 ? <div style={{ padding: 8, color: '#888' }}>No matches</div>
+              : null
+          }
+        />
+      </div>
 
       {/* Collaboration presence indicator */}
       {(collabConnected || collabReconnecting) && (
@@ -2744,17 +3153,21 @@ export default function MapPage() {
                 </div>
               )}
 
-              {/* ── Selection (hidden in overview mode) ── */}
-              {!isOverviewMode && (
+              {/* ── Selection (hidden in overview / simplified mode) ── */}
+              {!isOverviewMode && !simplified && (
                 <>
                   <GroupHeader id="sel" label="SELECTION" color="#ce93d8" />
                   <ToolGrid tools={SELECT_TOOLS} groupKey="sel" />
                 </>
               )}
 
-              {/* ── Measure (always visible) ── */}
-              <GroupHeader id="meas" label="MEASURE" color="#ffcc80" />
-              <ToolGrid tools={MEASURE_TOOLS} groupKey="meas" />
+              {/* ── Measure (hidden in simplified DGDE/PDDE view) ── */}
+              {!simplified && (
+                <>
+                  <GroupHeader id="meas" label="MEASURE" color="#ffcc80" />
+                  <ToolGrid tools={MEASURE_TOOLS} groupKey="meas" />
+                </>
+              )}
 
               {/* ── Actions (always visible) ── */}
               <GroupHeader id="act" label="ACTIONS" color="#a5d6a7" />
@@ -2765,9 +3178,11 @@ export default function MapPage() {
                       <div style={btnStyle(false)} onClick={handleUndo}><UndoOutlined /></div>
                     </Tooltip>
                   )}
-                  <Tooltip title={<span><b>Attribute Table</b><br /><span style={{fontSize:11,color:'#aaa'}}>Open the feature attribute table</span></span>} placement="right">
-                    <div style={btnStyle(attrTableOpen)} onClick={() => setAttrTableOpen((v) => !v)}><TableOutlined /></div>
-                  </Tooltip>
+                  {!simplified && (
+                    <Tooltip title={<span><b>Attribute Table</b><br /><span style={{fontSize:11,color:'#aaa'}}>Open the feature attribute table</span></span>} placement="right">
+                      <div style={btnStyle(attrTableOpen)} onClick={() => setAttrTableOpen((v) => !v)}><TableOutlined /></div>
+                    </Tooltip>
+                  )}
                   <Dropdown
                     menu={{
                       items: [
@@ -2796,6 +3211,14 @@ export default function MapPage() {
                   </Popover>
                   <Tooltip title={<span><b>Go to Coordinate</b></span>} placement="right">
                     <div style={btnStyle(false)} onClick={() => setGotoOpen(true)}><EnvironmentOutlined /></div>
+                  </Tooltip>
+                  <Tooltip title={<span><b>Layers & Tools</b><br /><span style={{fontSize:11,color:'#aaa'}}>View and enable external data layers</span></span>} placement="right">
+                    <div style={btnStyle(extLayersPanelOpen)} onClick={() => setExtLayersPanelOpen(v => !v)}>
+                      <CloudServerOutlined />
+                      {extVisibleIds.size > 0 && (
+                        <span style={{ position: 'absolute', top: 1, right: 1, width: 8, height: 8, borderRadius: '50%', background: '#1890ff', display: 'block' }} />
+                      )}
+                    </div>
                   </Tooltip>
                   <Tooltip title={<span><b>Temp Layers</b><br /><span style={{fontSize:11,color:'#aaa'}}>Upload KML/KMZ/GeoJSON/Shapefile for ad-hoc viewing</span></span>} placement="right">
                     <div style={btnStyle(tempLayerPanelOpen)} onClick={() => setTempLayerPanelOpen(v => !v)}>
@@ -2861,13 +3284,32 @@ export default function MapPage() {
           display: 'flex', flexDirection: 'column', gap: 8, zIndex: 20,
         }}
       >
+        {simplified && (
+          <AntSelect
+            size="small"
+            style={{ width: 200 }}
+            placeholder="Select office"
+            showSearch
+            optionFilterProp="label"
+            allowClear
+            value={officeFilter}
+            onChange={(v) => setOfficeFilter(v ?? null)}
+            options={officeOptions.map((o: any) => ({
+              value: o.id,
+              label: o.level ? `${o.name} (${o.level})` : o.name,
+            }))}
+          />
+        )}
         <AntSelect
           size="small"
           style={{ width: 160 }}
           placeholder="Basemap"
           value={activeBasemap?.id}
           onChange={(id) => setActiveBasemap(basemaps?.find((b) => b.id === id) ?? null)}
-          options={basemaps?.map((b) => ({ label: b.name, value: b.id }))}
+          options={basemaps?.filter((b) => b.is_active).map((b) => ({
+            label: b.is_default ? `${b.name} ★` : b.name,
+            value: b.id,
+          }))}
         />
         <Tooltip title="Layers" placement="left">
           <Button
@@ -2881,6 +3323,49 @@ export default function MapPage() {
       {/* Coordinate display */}
       {mapCoords && (
         <div className="map-coords">{formatCoords()}</div>
+      )}
+
+      {/* Surveyor (CEO/ADEO): share new shapes with the parent DEO office */}
+      {isCantonmentUploader && canDraw && selectedProjectId && (
+        <div style={{
+          position: 'absolute', top: 48, left: '50%', transform: 'translateX(-50%)', zIndex: 30,
+          background: 'rgba(26,26,26,0.92)', border: '1px solid #333', borderRadius: 6,
+          padding: '4px 12px',
+        }}>
+          <Tooltip title="When checked, new shapes you draw here are visible to the parent DEO office in the Map Viewer.">
+            <Checkbox checked={deoVisible} onChange={(e) => setDeoVisible(e.target.checked)}>
+              <span style={{ color: '#ccc', fontSize: 12 }}>New shapes visible to parent DEO</span>
+            </Checkbox>
+          </Tooltip>
+        </div>
+      )}
+
+      {/* Classification legend(s) for visible thematic external layers */}
+      {Object.keys(extClassLegends).length > 0 && (
+        <div style={{
+          position: 'absolute', bottom: 28, right: 12, zIndex: 30,
+          background: 'rgba(26,26,26,0.92)', border: '1px solid #333', borderRadius: 6,
+          padding: '8px 12px', maxWidth: 240, maxHeight: '45vh', overflowY: 'auto',
+          color: '#e0e0e0', fontSize: 12, boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+        }}>
+          {Object.entries(extClassLegends).map(([key, lg]) => (
+            <div key={key} style={{ marginBottom: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                {lg.title}
+                <span style={{ color: '#888', fontWeight: 400 }}> · {lg.field}</span>
+              </div>
+              {lg.entries.map((e) => (
+                <div key={e.value} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                  <span style={{
+                    display: 'inline-block', width: 14, height: 14, borderRadius: 3,
+                    background: hexToRgba(e.color, e.opacity), border: `1px solid ${e.color}`,
+                  }} />
+                  <span style={{ color: '#ccc' }}>{e.value}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
       )}
 
       {/* Read-only banner */}
@@ -3138,10 +3623,20 @@ export default function MapPage() {
       <MapExportModal
         visible={mapExportOpen}
         onClose={() => setMapExportOpen(false)}
+        mapInstance={mapInstance.current}
         mapState={{
           center: mapInstance.current ? (toLonLat(mapInstance.current.getView().getCenter() || [78, 20]) as [number, number]) : [78, 20],
           zoom: mapInstance.current ? mapInstance.current.getView().getZoom() || 10 : 10,
         }}
+      />
+
+      <ExternalLayersPanel
+        open={extLayersPanelOpen}
+        onClose={() => setExtLayersPanelOpen(false)}
+        visibleIds={extVisibleIds}
+        onToggleVisible={(key, layer) => showExtLayer(key, layer as ExtLayerConfig)}
+        onHide={(key) => hideExtLayer(key)}
+        onStyleApply={(key, layer) => restyleExtLayer(key, layer as ExtLayerConfig)}
       />
 
       <TempLayersPanel
@@ -3302,27 +3797,90 @@ export default function MapPage() {
         </Space>
       </DraggableModal>
 
-      {/* Feature info drawer */}
-      <Drawer
-        title="Feature Info"
-        placement="right"
+      {/* Feature attributes modal */}
+      <Modal
+        title={
+          <Space>
+            {featureModalMeta?.layerType === 'external'
+              ? <CloudServerOutlined style={{ color: '#ff6600' }} />
+              : featureModalMeta?.layerType === 'temp'
+                ? <UploadOutlined style={{ color: '#a855f7' }} />
+                : <AimOutlined style={{ color: '#1890ff' }} />}
+            <span style={{ color: '#e0e0e0' }}>
+              {featureModalMeta?.layerLabel ?? 'Feature Attributes'}
+            </span>
+            {featureModalMeta?.layerType === 'external' && (
+              <Tag color="orange" style={{ fontSize: 10 }}>External</Tag>
+            )}
+            {featureModalMeta?.layerType === 'temp' && (
+              <Tag color="purple" style={{ fontSize: 10 }}>Temp Layer</Tag>
+            )}
+          </Space>
+        }
         open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-        width={320}
-        styles={{ body: { background: '#0e0e1e' }, header: { background: '#0e0e1e', borderBottom: '1px solid #222' } }}
+        onCancel={() => { setDrawerOpen(false); setFeatureInfo(null); setFeatureModalMeta(null) }}
+        footer={<Button onClick={() => { setDrawerOpen(false); setFeatureInfo(null); setFeatureModalMeta(null) }}>Close</Button>}
+        width={480}
+        styles={{
+          content: { background: '#1e1e1e', border: '1px solid #333' },
+          header: { background: '#1e1e1e', borderBottom: '1px solid #333' },
+          footer: { background: '#1e1e1e', borderTop: '1px solid #333' },
+          mask: { background: 'rgba(0,0,0,0.6)' },
+        }}
       >
-        {featureInfo && (
-          <Descriptions column={1} size="small">
-            {Object.entries(featureInfo)
-              .filter(([k]) => k !== 'geometry')
-              .map(([k, v]) => (
-                <Descriptions.Item key={k} label={<span style={{ color: '#aaa', fontSize: 12 }}>{k}</span>}>
-                  <span style={{ color: '#e8e8e8', fontSize: 12 }}>{String(v ?? '')}</span>
-                </Descriptions.Item>
-              ))}
-          </Descriptions>
-        )}
-      </Drawer>
+        {featureInfo && (() => {
+          // Separate nested `attributes` object from top-level metadata
+          const meta: [string, unknown][] = []
+          const attrs: [string, string][] = []
+          const skip = new Set(['geometry', 'attributes'])
+          for (const [k, v] of Object.entries(featureInfo)) {
+            if (skip.has(k)) continue
+            if (v !== null && v !== undefined && String(v) !== '') meta.push([k, v])
+          }
+          const attrObj = featureInfo.attributes as Record<string, unknown> | undefined
+          if (attrObj && typeof attrObj === 'object') {
+            for (const [k, v] of Object.entries(attrObj)) {
+              if (v !== null && v !== undefined && String(v) !== '') attrs.push([k, String(v)])
+            }
+          }
+          const labelStyle: React.CSSProperties = { color: '#888', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.5px' }
+          const valueStyle: React.CSSProperties = { color: '#e8e8e8', fontSize: 13, wordBreak: 'break-word' }
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {meta.length > 0 && (
+                <div>
+                  <div style={{ color: '#666', fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>Layer Info</div>
+                  <Descriptions column={1} size="small" bordered
+                    labelStyle={{ background: '#2a2a2a', color: '#888', fontSize: 11, width: 120 }}
+                    contentStyle={{ background: '#1e1e1e', color: '#e8e8e8', fontSize: 12 }}>
+                    {meta.map(([k, v]) => (
+                      <Descriptions.Item key={k} label={k}>
+                        {typeof v === 'object' ? JSON.stringify(v) : String(v)}
+                      </Descriptions.Item>
+                    ))}
+                  </Descriptions>
+                </div>
+              )}
+              {attrs.length > 0 && (
+                <div>
+                  <div style={{ color: '#666', fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>Attributes</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px' }}>
+                    {attrs.map(([k, v]) => (
+                      <div key={k} style={{ borderBottom: '1px solid #2a2a2a', paddingBottom: 6 }}>
+                        <div style={labelStyle}>{k}</div>
+                        <div style={valueStyle}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {meta.length === 0 && attrs.length === 0 && (
+                <div style={{ color: '#666', textAlign: 'center', padding: '20px 0' }}>No attributes available</div>
+              )}
+            </div>
+          )
+        })()}
+      </Modal>
 
       {/* Layer panel drawer */}
       <Drawer

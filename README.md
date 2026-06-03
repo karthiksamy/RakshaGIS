@@ -36,8 +36,15 @@ Everything runs on-premise. No commercial cloud services, no internet dependency
 18. [Data Access Rules](#data-access-rules)
 19. [Project Structure](#project-structure)
 20. [Architecture](#architecture)
-21. [Troubleshooting](#troubleshooting)
-22. [Licence](#licence)
+21. [External Data Layers](#external-data-layers)
+22. [Map Printing & High-Resolution Export](#map-printing--high-resolution-export)
+23. [Boundary Extraction & Review](#boundary-extraction--review)
+24. [Contributing](#contributing)
+25. [Production Deployment Checklist](#production-deployment-checklist)
+26. [Troubleshooting](#troubleshooting)
+27. [Maintenance Notes & Resolved Issues](#maintenance-notes--resolved-issues)
+28. [Project Background (DGDE)](#project-background-dgde)
+29. [Licence](#licence)
 
 ---
 
@@ -1230,6 +1237,169 @@ Optional services (Docker profiles)
 
 ---
 
+## External Data Layers
+
+RakshaGIS can render **read-only layers that live in a separate PostgreSQL/PostGIS database** (e.g. a DGDE operational DB) without copying the geometry into RakshaGIS. Geometry is queried live, reprojected to WGS-84, and filtered per the logged-in user's office level.
+
+### How it works
+
+```
+External PostGIS DB ──live query (psycopg2)──▶ Django (apps/external_data)
+  └─ row-level filter by user's org level ─┘            │ GeoJSON (≤20k features, bbox-aware)
+                                                        ▼
+                                              Map viewer (OpenLayers) — "Layers & Tools" panel
+```
+
+- **Read-only**: no edit/delete/draw on these layers.
+- **Org-level row filtering**: DGDE/superadmin see all rows; PDDE/DEO/CEO/ADEO see only rows matching their office code.
+- **Per-layer styling**: stroke, fill colour/opacity, QGIS-style fill patterns, and classification (thematic) colouring.
+- **Performance**: large layers load by viewport (bbox + spatial index); smaller ones load fully.
+
+### Admin configuration (SuperAdmin only)
+
+1. **Add the external database** — Admin → External Data → Databases → set host/port/database/schema/user/password, then **Test Connection**. Use a **read-only** DB user.
+2. **Register a layer** — Admin → External Data → External Layers:
+
+   | Field | Example | Notes |
+   |-------|---------|-------|
+   | `database` | DGDE Operational DB | the connection above |
+   | `schema_name` / `table_name` | `public` / `sp_demap_p2` | source table |
+   | `geometry_column` / `geometry_type` / `srid` | `geom` / `MULTIPOLYGON` / `4326` | source geometry |
+   | `id_column` / `label_column` | `gid` / `survey_no` | identity + label |
+   | `level_filter_fields` | `{"PDDE":"command","DEO":"officeid","CEO":"officeid","ADEO":"officeid"}` | per-level filter column (recommended) |
+   | `office_filter_field` | `officeid` | single-column fallback (legacy) |
+   | `classification_field` / `classification_colors` | `land_use` / `{…}` | thematic colouring (optional) |
+   | `is_active` / `min_zoom` | `true` / `5` | visibility |
+
+3. **Refresh stats** — `POST /api/external/layers/{id}/refresh-stats/` populates `feature_count` and `bbox`.
+
+### Key endpoints
+
+```
+GET  /api/external/layers/                          # active layers (role-filtered)
+GET  /api/external/layers/{id}/geojson/?limit=20000 # live, office-filtered GeoJSON
+        &bbox=minLon,minLat,maxLon,maxLat           #   viewport filter (spatial index)
+        &filter_field=land_use&filter_value=Agri    #   attribute filter
+GET  /api/external/layers/{id}/distinct-values/?field=land_use
+POST /api/external/layers/{id}/refresh-stats/       # SuperAdmin
+GET  /api/external/databases/{id}/tables/           # list spatial tables
+```
+
+### Troubleshooting
+
+| Problem | Check |
+|---------|-------|
+| Layer shows 0 features | `is_active=True`? DB connection OK? user's org level set? filter column names correct & present in the table? |
+| Connection fails | host/port/db correct; server reachable from container (`docker compose exec web psql -h HOST -U USER -d DB`); credentials |
+| Wrong rows | confirm filter column type is TEXT/CHAR; `SELECT DISTINCT officeid FROM table LIMIT 10` |
+| Slow | add `GIST` index on geometry + b-tree index on filter column |
+
+> **Security:** External DB passwords are stored in `ExternalDatabase.password`. Use a **read-only** account, restrict the Admin UI to SuperAdmins, and protect the link with firewall/VPN. Row-level filtering is enforced server-side — only SuperAdmins bypass it.
+
+---
+
+## Map Printing & High-Resolution Export
+
+RakshaGIS offers two complementary export paths:
+
+| Path | Where | Quality | Use for |
+|------|-------|---------|---------|
+| **jsPDF + html2canvas** (client) | "Print/Export → PDF" | Screen DPI | quick previews, layouts with legend / scale bar / north arrow |
+| **Mapnik** (server, raster) | "Print/Export → PNG (300+ DPI)" | Publication (300+ DPI) | high-resolution cartographic output |
+
+### Quick (client) export
+The **Print/Export** action in the map toolbar produces a PDF with optional **legend, scale bar, north arrow, and title** (jsPDF). It is instant and needs no server resources, but is limited to screen resolution.
+
+### High-resolution Mapnik export
+
+Mapnik renders directly from PostGIS at arbitrary resolution using XML map styles.
+
+**Install (native):**
+```bash
+bash install-mapnik.sh                 # system libmapnik + python-mapnik
+# then edit the DB credentials in the style file:
+nano services/mapnik/styles/boundaries.xml   # host/user/password/dbname
+```
+In Docker, Mapnik is built into the image (see `Dockerfile`); set the style `host` to `host.docker.internal` (or the DB service name) and rebuild.
+
+**Files:**
+| Purpose | Path |
+|---------|------|
+| Map styles (XML) | `services/mapnik/styles/` (default `boundaries.xml`) |
+| Service layer | `apps/core/services/mapnik_service.py` |
+| API | `apps/core/views.py` (`export-map`, `map-styles`) |
+| React modal | `frontend/src/features/map/MapExportModal.tsx` |
+
+**API:**
+```bash
+# List available styles
+curl /api/core/map-styles/ -H "Authorization: Bearer TOKEN"
+# → {"styles": ["boundaries", ...], "count": N}
+
+# Render a PNG
+curl -X POST /api/core/export-map/ -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"width":1200,"height":800,"zoom":10,"center_lon":78.5,"center_lat":20.5,"style":"boundaries"}' \
+  -o map.png
+```
+
+**Add a style:** copy `boundaries.xml`, point its `<Datasource>` at your table/query, define `<PolygonSymbolizer>`/`<LineSymbolizer>`/`<TextSymbolizer>` rules (with optional `<Filter>` for conditional colouring). It appears automatically in `map-styles`.
+
+**Tuning:** add `GIST` indexes on geometry, keep `<Datasource>` queries simple, and optionally `@cache_page` the export view.
+
+> Other approaches evaluated (Puppeteer/Playwright, MapLibre GL export, ReportLab, GeoServer WPS) are documented in `docs/archive/MAP_PRINTING_OPTIONS.md`. Mapnik is the chosen path for publication-grade, high-volume output.
+
+---
+
+## Boundary Extraction & Review
+
+RakshaGIS can extract parcel polygons from drone/satellite **GeoTIFFs** and from scanned maps, then hand them to a dedicated review editor.
+
+- **Classical GIS pipeline** (default, no GPU): edge detection → morphological gap-closing → connected components → GDAL polygonize. Deterministic and fast; best-effort **Survey-Number OCR** (PaddleOCR) fills the `survey_number` attribute where readable, blank otherwise.
+- **AI Vision** / **Advanced AI Vision Pipeline** (GPU): LLaVA / SAM + U-Net++ + PaddleOCR for segmentation and survey-number recovery.
+
+After a Classical extraction completes the user is taken to a **standalone Boundary Review viewer** (separate from the main map) that overlays the GeoTIFF and the extracted polygons and provides **reshape, split, merge, add, and delete** tools plus an editable **Survey Number** per polygon. Reviewed polygons are saved to an existing or new **Survey Area**.
+
+Entry points: **AI → GeoTiff Polygon Extraction** (`/ai-vision`) → run Classical → auto-redirect to `/boundary-review/:jobId`; or the **Review** button in the extraction history.
+
+---
+
+## Contributing
+
+See the developer workflow below (full history in `docs/archive/CONTRIBUTING.md`).
+
+1. **Local setup** — run backend services in Docker, then Django + Celery + Vite locally:
+   ```bash
+   docker compose up -d db redis onlyoffice
+   python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+   cp .env.example .env          # point DATABASE_URL/REDIS_URL at localhost
+   python manage.py migrate && python manage.py createsuperuser
+   python manage.py runserver                       # API :8000
+   celery -A config worker -l info                  # background tasks
+   cd frontend && npm install && npm run dev        # UI :5173 (proxies API)
+   ```
+2. **Branch** off the default branch; keep changes focused.
+3. **Code style** — match surrounding code. Python: Django/DRF conventions, type hints where used. Frontend: TypeScript + React + AntD + OpenLayers; reuse existing components and `@/services/api`.
+4. **Migrations** — commit Django migrations for any model change (`python manage.py makemigrations`).
+5. **Build check** — `cd frontend && npm run build` must pass before a PR.
+6. **Commits/PRs** — clear messages; describe the change, testing done, and any migration/runtime steps.
+
+---
+
+## Production Deployment Checklist
+
+Beyond [Installation](#installation), harden before going live (full guide in `docs/archive/DEPLOYMENT.md`):
+
+- **Secrets** — set a strong `DJANGO_SECRET_KEY`, `ONLYOFFICE_JWT_SECRET`, DB and backup-encryption passwords; never reuse `.env.example` values.
+- **Hosts/TLS** — set `ALLOWED_HOSTS`/`CSRF_TRUSTED_ORIGINS`; terminate TLS at nginx (see [HTTPS / TLS](#https--tls)) and set `SECURE_*` cookies.
+- **Database** — dedicated PostGIS volume on persistent storage; restrict network access; schedule [backups](#backup--recovery) with rotation + off-host copy.
+- **Services** — run Django under **Daphne/ASGI** (WebSockets), Celery worker + beat, Redis; confirm `docker compose ps` is all healthy.
+- **Storage paths** — point `DATA_DIR`/media/static at persistent host paths; verify `collectstatic`/frontend build are deployed.
+- **Resources** — size CPU/RAM for COG conversion, Mapnik, and (optional) AI/terrain; keep Ollama/terrain on their own profiles.
+- **Verify** — log in, load the map, run an export, open a document in OnlyOffice, trigger a backup, and confirm a restore on a staging copy.
+
+---
+
 ## Troubleshooting
 
 ### Web container keeps restarting
@@ -1333,7 +1503,57 @@ python manage.py makemigrations
 # The build will apply migrations automatically
 ```
 
-For details, see [DOCKER_BUILD_FIXES.md](DOCKER_BUILD_FIXES.md).
+For details, see [docs/archive/DOCKER_BUILD_FIXES.md](docs/archive/DOCKER_BUILD_FIXES.md).
+
+---
+
+## Maintenance Notes & Resolved Issues
+
+A condensed history of notable fixes. The original per-issue notes are preserved under [`docs/archive/`](docs/archive/).
+
+| Area | Symptom | Resolution |
+|------|---------|------------|
+| **Cesium (3D)** | Blank globe / `Cannot find module` for Cesium assets in TerrainPage | Correct Cesium static asset path + import; `fix-cesium-path.sh` runs in the build. See `CESIUM_ASSET_PATH_FIX.md`, `CESIUM_IMPORT_FIX.md`. |
+| **3D Terrain** | Features draped wrong / globe halts after "Load Features" | Drape polygons (clamp-to-ground) instead of extrude+clamp; guard null `layer_name`; per-feature try/catch. See `TERRAIN_FIX_COMPLETE.md`. |
+| **OnlyOffice** | Document editor opened in a cramped modal | Open documents in a new browser tab. See `ONLYOFFICE_FIX_SUMMARY.md`. |
+| **Docker build** | `<none>` image tags, migration permission errors on WSL2 | Fixed image naming + entrypoint permissions. See `DOCKER_BUILD_FIXES.md`. |
+| **Mapnik** | `import mapnik` fails / export 503 | Install system `libmapnik` + `python-mapnik` (baked into the Docker image); see [Map Printing](#map-printing--high-resolution-export). |
+
+For broader status snapshots see `docs/archive/IMPLEMENTATION_SUMMARY.md`, `FIXES_COMPLETED_SUMMARY.md`, and `SETUP_PROGRESS.md`.
+
+---
+
+## Project Background (DGDE)
+
+*(Condensed from the formal write-up — full version: `RakshaGIS_Project_WriteUp.docx`.)*
+
+**Objective.** Defence-estate land management historically relied on paper maps, disconnected spreadsheets, and manual review — causing delays, inconsistencies, and security risks. RakshaGIS digitises field surveys, enforces an internal approval workflow, isolates data by office, and publishes approved maps — entirely on-premise with **zero cloud/internet dependency** after installation.
+
+**Expected outcomes / benefits.**
+- Faster, paperless surveys with consistent, georeferenced records.
+- Auditable survey-area-wise approval (Draft → Submitted → Under Review → Approved → Published).
+- Strict role- and office-level data isolation with controlled cross-office access.
+- In-browser document editing, AI-assisted document processing, and high-resolution map publishing in one platform.
+- Air-gap–friendly operation suitable for secure defence networks.
+
+### Roadmap & feature status
+
+Several items first identified as "future scope" are now **delivered**:
+
+| Capability | Status |
+|------------|--------|
+| HTTPS with internal CA (Nginx TLS) | ✅ Prepared — `https` profile + certbot ready; supply the CA cert to activate |
+| Prometheus / Grafana monitoring | ✅ `/metrics/` + `monitoring` profile shipped (import DGDE dashboards) |
+| Automated boundary dispute detection | ✅ Pre-submission PostGIS overlap check vs other orgs' PUBLISHED features (`DisputeReport`) |
+| Advanced AI integration | ✅ GeoTIFF/scanned-map parcel extraction + Survey-Number OCR; local-LLM training-export / fine-tune tooling |
+| Admin boundary data load | ✅ State/District/Taluk/Village master + shapefile import |
+| 3D terrain & elevation overlay | ✅ Cesium viewer — elevation/profile/slope over SRTM/Cartosat DEM |
+| Real-time collaborative editing | ✅ WebSocket (Channels/Daphne) concurrent editing + presence |
+| Multi-language UI | ✅ English, Hindi, Tamil, Telugu, Bengali, Kannada, Marathi |
+| Automated DR backups | ✅ Encrypted PostgreSQL dumps + rotation (off-site replication pending) |
+| Regulatory reporting | ◑ Survey-area `.docx` + proximity/encroachment reports done; ministry-format templates in progress |
+
+**Still planned:** mobile field-survey PWA/React-Native app with offline sync · DILRMP (national land registry) connectors · PKI / smart-card (mutual-TLS) authentication · off-site backup replication to NIC Meghraj · ministry-prescribed report templates.
 
 ---
 

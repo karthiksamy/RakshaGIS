@@ -15,7 +15,7 @@ from django.contrib.gis.measure import D
 
 from apps.accounts.permissions import (
     CanEditProject, IsSuperAdmin, org_queryset_filter,
-    get_shared_project_ids, get_approved_area_ids,
+    get_shared_project_ids, get_approved_area_ids, deo_subordinate_org_ids,
 )
 from .models import (
     SurveyProject, SurveyArea, GISFeature, DefenceParcel, AttributeTemplate,
@@ -53,7 +53,21 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
             SurveyArea.objects.filter(id__in=get_approved_area_ids(user))
             .values_list('project_id', flat=True)
         )
-        extra_ids = list(set(shared_ids + approved_project_ids))
+        # DEO offices additionally see subordinate-office projects that contain at
+        # least one opt-in (deo_visible=True) dataset — feature layer or GeoTIFF.
+        deo_sub_ids = deo_subordinate_org_ids(user)
+        deo_project_ids: list[int] = []
+        if deo_sub_ids:
+            deo_project_ids = list(set(
+                list(GISFeature.objects.filter(
+                    project__organisation_id__in=deo_sub_ids,
+                    deo_visible=True, is_deleted=False,
+                ).values_list('project_id', flat=True))
+                + list(GeoTiffLayer.objects.filter(
+                    project__organisation_id__in=deo_sub_ids, deo_visible=True,
+                ).values_list('project_id', flat=True))
+            ))
+        extra_ids = list(set(shared_ids + approved_project_ids + deo_project_ids))
         if not extra_ids:
             return own_qs
         return (own_qs | base_qs.filter(id__in=extra_ids)).distinct()
@@ -74,6 +88,23 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
             organisation=org,
         )
         _create_default_folders(project, self.request.user)
+
+    @action(detail=True, methods=['post'], url_path='set-map-enabled',
+            permission_classes=[permissions.IsAuthenticated])
+    def set_map_enabled(self, request, pk=None):
+        """
+        POST /api/projects/{id}/set-map-enabled/  body: {map_enabled: bool}
+        Enable/disable exposure of this project's PUBLISHED data to higher levels
+        (PDDE/DGDE). Owning-office admins (DEO/CEO/ADEO) + superadmin only. Works
+        even when the project is otherwise edit-locked.
+        """
+        project = self.get_object()
+        user = request.user
+        if not (user.is_superadmin or user.role in user.ADMIN_ROLES):
+            return Response({'detail': 'Only office admins can change visibility.'}, status=403)
+        project.map_enabled = bool(request.data.get('map_enabled', True))
+        project.save(update_fields=['map_enabled'])
+        return Response({'id': project.id, 'map_enabled': project.map_enabled})
 
     @action(detail=True, methods=['get', 'post'], url_path='active-version',
             permission_classes=[permissions.IsAuthenticated])
@@ -276,12 +307,34 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
         user = self.request.user
         base_qs = GISFeature.objects.select_related('project__organisation', 'created_by')
         own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation').filter(is_deleted=False)
+        # DGDE/PDDE (national/command): only features belonging to PUBLISHED + map-enabled
+        # survey areas, optionally scoped to one office via ?organisation=<id>. Viewers are
+        # always restricted; superadmins too when browsing the map office view (?organisation).
+        level = getattr(getattr(user, 'organisation', None), 'level', None)
+        org_id = self.request.query_params.get('organisation')
+        if level in ('DGDE', 'PDDE') and (not user.is_superadmin or org_id):
+            from apps.survey_projects.models import SurveyArea as _SA
+            areas = org_queryset_filter(
+                user,
+                _SA.objects.filter(status=_SA.PUBLISHED, map_enabled=True,
+                                   project__map_enabled=True, folder__isnull=False),
+                org_field='project__organisation',
+            )
+            if org_id:
+                areas = areas.filter(project__organisation_id=org_id)
+            folder_ids: list[int] = []
+            for a in areas.only('folder_id'):
+                folder_ids.extend(_get_subtree_folder_ids(a.folder_id))
+            if not folder_ids:
+                return base_qs.none()
+            return own_qs.filter(folder_id__in=folder_ids)
         if user.is_superadmin or user.role == 'PDDE_VIEWER':
             return own_qs
         # Include features from approved cross-org areas (in their folder subtrees)
         approved_area_ids = get_approved_area_ids(user)
         shared_project_ids = get_shared_project_ids(user)
-        if not approved_area_ids and not shared_project_ids:
+        deo_sub_ids = deo_subordinate_org_ids(user)
+        if not approved_area_ids and not shared_project_ids and not deo_sub_ids:
             return own_qs
         # For approved areas: features in the area's folder subtree
         from apps.survey_projects.models import SurveyArea as _SA
@@ -292,6 +345,9 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
         extra_q = Q(project_id__in=shared_project_ids)
         if approved_folder_ids:
             extra_q |= Q(folder_id__in=approved_folder_ids)
+        # DEO offices: subordinate-office features explicitly marked deo_visible
+        if deo_sub_ids:
+            extra_q |= Q(project__organisation_id__in=deo_sub_ids, deo_visible=True)
         return (own_qs | base_qs.filter(extra_q, is_deleted=False)).distinct()
 
     def get_permissions(self):
@@ -907,7 +963,7 @@ def _create_default_folders(project, user):
         _add_doc_shapefile_subfolders(boundary, user)
 
 
-def _import_geotiff(folder, uploaded, layer_name, user):
+def _import_geotiff(folder, uploaded, layer_name, user, deo_visible=True):
     """Save a GeoTiff file and queue COG conversion."""
     import os
     from rest_framework.response import Response
@@ -919,6 +975,7 @@ def _import_geotiff(folder, uploaded, layer_name, user):
         name=layer_name,
         file=uploaded,
         status=GeoTiffLayer.PENDING,
+        deo_visible=deo_visible,
         created_by=user,
     )
     try:
@@ -931,7 +988,7 @@ def _import_geotiff(folder, uploaded, layer_name, user):
     )
 
 
-def _import_shapefile_zip(folder, uploaded, layer_name, name_field, user):
+def _import_shapefile_zip(folder, uploaded, layer_name, name_field, user, deo_visible=True):
     """Validate a .zip Shapefile bundle and import all features into GIS features + log ShapefileImport."""
     import io
     import os
@@ -948,6 +1005,7 @@ def _import_shapefile_zip(folder, uploaded, layer_name, name_field, user):
         file=uploaded,
         layer_name=layer_name,
         status=ShapefileImport.RUNNING,
+        deo_visible=deo_visible,
         created_by=user,
     )
     uploaded.seek(0)  # reset after ShapefileImport save consumed it
@@ -1000,6 +1058,7 @@ def _import_shapefile_zip(folder, uploaded, layer_name, name_field, user):
                         geometry=geom,
                         feature_id=fid,
                         attributes=attrs,
+                        deo_visible=deo_visible,
                         created_by=user,
                     )
                     created += 1
@@ -1020,7 +1079,7 @@ def _import_shapefile_zip(folder, uploaded, layer_name, name_field, user):
     }, status=201)
 
 
-def _import_geojson_file(folder, uploaded, layer_name, name_field, user):
+def _import_geojson_file(folder, uploaded, layer_name, name_field, user, deo_visible=True):
     """Parse a GeoJSON file and import all features."""
     import json
     from django.contrib.gis.geos import GEOSGeometry
@@ -1056,6 +1115,7 @@ def _import_geojson_file(folder, uploaded, layer_name, name_field, user):
                 geometry=geom,
                 feature_id=fid,
                 attributes=attrs,
+                deo_visible=deo_visible,
                 created_by=user,
             )
             created += 1
@@ -1070,7 +1130,7 @@ def _import_geojson_file(folder, uploaded, layer_name, name_field, user):
     }, status=201)
 
 
-def _import_via_gdal(folder, uploaded, layer_name, name_field, user, fmt):
+def _import_via_gdal(folder, uploaded, layer_name, name_field, user, fmt, deo_visible=True):
     """Import KML or GeoPackage via GDAL DataSource."""
     import os
     import tempfile
@@ -1111,6 +1171,7 @@ def _import_via_gdal(folder, uploaded, layer_name, name_field, user, fmt):
                         geometry=geom,
                         feature_id=fid,
                         attributes=attrs,
+                        deo_visible=deo_visible,
                         created_by=user,
                     )
                     created += 1
@@ -1142,6 +1203,83 @@ def _safe_val(v):
     if isinstance(v, (str, int, float, bool, type(None))):
         return v
     return str(v)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OnlyOffice PDF Converter Helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _convert_to_pdf_via_onlyoffice(doc, project, doc_folder, user, report_title, docx_filename):
+    """Convert document to PDF using OnlyOffice ConvertService."""
+    import jwt
+    import json
+    import urllib.request
+    import time
+    from django.conf import settings
+    from django.core.files.base import ContentFile
+    from apps.documents.models import Document
+
+    secret = getattr(settings, 'ONLYOFFICE_JWT_SECRET', '')
+    internal_base = getattr(settings, 'ONLYOFFICE_INTERNAL_BASE_URL', '').rstrip('/')
+
+    if internal_base:
+        doc_url = f"{internal_base}{doc.file.url}"
+    else:
+        doc_url = f"http://nginx{doc.file.url}"
+
+    convert_url = 'http://onlyoffice/ConvertService.ashx'
+    key = f"conv-doc-{doc.id}-{doc.version}-{int(time.time())}"
+    payload = {
+        'async': False,
+        'filetype': 'docx',
+        'key': key,
+        'outputtype': 'pdf',
+        'title': docx_filename,
+        'url': doc_url
+    }
+
+    if secret:
+        token_payload = {
+            'payload': payload
+        }
+        token = jwt.encode(token_payload, secret, algorithm='HS256')
+        if isinstance(token, bytes):
+            token = token.decode('utf-8')
+        payload['token'] = token
+
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(convert_url, data=data, headers={
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {payload.get("token", "")}' if secret else ''
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_data = json.loads(resp.read().decode('utf-8'))
+            if resp_data.get('endConvert') and resp_data.get('fileUrl'):
+                pdf_download_url = resp_data['fileUrl']
+                with urllib.request.urlopen(pdf_download_url, timeout=30) as pdf_resp:
+                    pdf_content = pdf_resp.read()
+                
+                pdf_filename = docx_filename.replace('.docx', '.pdf')
+                pdf_doc = Document.objects.create(
+                    project=project,
+                    folder=doc_folder,
+                    title=f'{report_title} (PDF)',
+                    category=Document.SURVEY_REPORT,
+                    file_size=len(pdf_content),
+                    mime_type='application/pdf',
+                    uploaded_by=user,
+                    parent=doc,
+                )
+                pdf_doc.file.save(pdf_filename, ContentFile(pdf_content), save=True)
+                return pdf_doc
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"OnlyOffice PDF conversion failed: {e}")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1499,40 +1637,16 @@ def _build_survey_report(area, user, include_features=True, include_photos=True,
         'pdf_url':  None,
     }
 
-    # ── Convert to PDF (LibreOffice headless) ─────────────────────────────────
-    lo_bin = shutil.which('libreoffice') or shutil.which('soffice')
-    if lo_bin:
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                docx_tmp = os.path.join(tmpdir, docx_filename)
-                with open(docx_tmp, 'wb') as fh:
-                    buf.seek(0)
-                    fh.write(buf.read())
-
-                subprocess.run(
-                    [lo_bin, '--headless', '--convert-to', 'pdf', '--outdir', tmpdir, docx_tmp],
-                    timeout=60, capture_output=True, check=True,
-                )
-                pdf_tmp = docx_tmp.replace('.docx', '.pdf')
-                if os.path.exists(pdf_tmp):
-                    pdf_filename = docx_filename.replace('.docx', '.pdf')
-                    with open(pdf_tmp, 'rb') as pfh:
-                        pdf_content = pfh.read()
-                    pdf_doc = Document.objects.create(
-                        project=project,
-                        folder=doc_folder,
-                        title=f'{report_title} (PDF)',
-                        category=Document.SURVEY_REPORT,
-                        file_size=len(pdf_content),
-                        mime_type='application/pdf',
-                        uploaded_by=user,
-                        parent=db_doc,
-                    )
-                    pdf_doc.file.save(pdf_filename, ContentFile(pdf_content), save=True)
-                    result['pdf_doc_id'] = pdf_doc.id
-                    result['pdf_url']    = pdf_doc.file.url
-        except Exception:
-            pass  # PDF conversion optional — docx is always generated
+    # ── Convert to PDF (OnlyOffice ConvertService) ───────────────────────────
+    try:
+        pdf_doc = _convert_to_pdf_via_onlyoffice(
+            db_doc, project, doc_folder, user, report_title, docx_filename
+        )
+        if pdf_doc:
+            result['pdf_doc_id'] = pdf_doc.id
+            result['pdf_url']    = pdf_doc.file.url
+    except Exception:
+        pass
 
     return result
 
@@ -1567,6 +1681,19 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
             'project__organisation', 'assigned_to', 'created_by', 'folder'
         )
         own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation')
+        # DGDE/PDDE (national/command) levels: only PUBLISHED + map-enabled areas,
+        # optionally scoped to one office via ?organisation=<id> (the office picker).
+        # Viewers are always restricted; superadmins are restricted too when browsing the
+        # map office view (?organisation present) so the simplified viewer is consistent.
+        level = getattr(getattr(user, 'organisation', None), 'level', None)
+        org_id = self.request.query_params.get('organisation')
+        if level in ('DGDE', 'PDDE') and (not user.is_superadmin or org_id):
+            qs = own_qs.filter(
+                status=SurveyArea.PUBLISHED, map_enabled=True, project__map_enabled=True,
+            )
+            if org_id:
+                qs = qs.filter(project__organisation_id=org_id)
+            return qs
         if user.is_superadmin or user.role == 'PDDE_VIEWER':
             return own_qs
         # Also include survey areas shared via ProjectShare or SurveyAreaAccessRequest
@@ -1578,7 +1705,9 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
         return (own_qs | base_qs.filter(extra_q)).distinct()
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'discovery']:
+        # `features` is read-only; `set_map_enabled` enforces its own admin check and
+        # must work even on PUBLISHED (edit-locked) areas — so neither uses CanEditProject.
+        if self.action in ['list', 'retrieve', 'discovery', 'features', 'set_map_enabled']:
             return [permissions.IsAuthenticated()]
         return [permissions.IsAuthenticated(), CanEditProject()]
 
@@ -1600,6 +1729,58 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
         _add_survey_area_subfolders(root_folder, user)
         area.folder = root_folder
         area.save(update_fields=['folder'])
+
+    @action(detail=True, methods=['post'], url_path='set-map-enabled',
+            permission_classes=[permissions.IsAuthenticated])
+    def set_map_enabled(self, request, pk=None):
+        """
+        POST /api/projects/survey-areas/{id}/set-map-enabled/  body: {map_enabled: bool}
+        Enable/disable exposure of this area's PUBLISHED data to higher levels.
+        Owning-office admins (DEO/CEO/ADEO) + superadmin only.
+        """
+        area = self.get_object()
+        user = request.user
+        if not (user.is_superadmin or user.role in user.ADMIN_ROLES):
+            return Response({'detail': 'Only office admins can change visibility.'}, status=403)
+        area.map_enabled = bool(request.data.get('map_enabled', True))
+        area.save(update_fields=['map_enabled'])
+        return Response({'id': area.id, 'map_enabled': area.map_enabled})
+
+    @action(detail=True, methods=['get'], url_path='features',
+            permission_classes=[permissions.IsAuthenticated])
+    def features(self, request, pk=None):
+        """
+        GET /api/projects/survey-areas/{id}/features/?limit=5000
+
+        Return this survey area's GIS features as a GeoJSON FeatureCollection,
+        scoped to the area's folder subtree and the caller's jurisdiction.
+        Lets the 3D Terrain Viewer load a single named area (e.g. "AFS Sulur")
+        instead of the whole project.
+        """
+        area = self.get_object()
+        from apps.survey_projects.analysis import (
+            _get_folder_ids_for_survey_areas, _scope_survey_qs,
+        )
+        folder_ids = _get_folder_ids_for_survey_areas([area.id])
+        qs = _scope_survey_qs(
+            GISFeature.objects.filter(is_deleted=False, folder_id__in=folder_ids),
+            request.user,
+        ).only('geometry', 'layer_name', 'feature_id', 'attributes')
+        try:
+            limit = min(int(request.query_params.get('limit', 5000)), 20000)
+        except (TypeError, ValueError):
+            limit = 5000
+        feats = []
+        for f in qs[:limit]:
+            try:
+                geom = json.loads(f.geometry.geojson)
+            except Exception:
+                continue
+            props = {'layer_name': f.layer_name, 'feature_id': f.feature_id}
+            if isinstance(f.attributes, dict):
+                props.update(f.attributes)
+            feats.append({'type': 'Feature', 'geometry': geom, 'properties': props})
+        return Response({'type': 'FeatureCollection', 'features': feats})
 
     @action(detail=True, methods=['post'], url_path='ensure-folder',
             permission_classes=[permissions.IsAuthenticated])
@@ -1631,11 +1812,53 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def perform_destroy(self, instance):
-        from apps.accounts.models import User
-        user = self.request.user
         if instance.status not in (SurveyArea.DRAFT, SurveyArea.RETURNED):
             raise PermissionDenied('Cannot delete a submitted survey area.')
-        instance.delete()
+        # Deleting the area must remove ALL its data — features, rasters, shapefiles,
+        # documents and the folder tree. Every dependent model uses folder=SET_NULL,
+        # so deleting folders alone would orphan (not remove) those rows and they would
+        # keep showing on the map / in the project. So purge them explicitly first.
+        from django.db import transaction
+        from apps.survey_projects.analysis import _get_folder_ids_for_survey_areas
+        from apps.documents.models import Document
+
+        folder_ids = _get_folder_ids_for_survey_areas([instance.id])
+        root_folder = instance.folder
+
+        def _del_files(qs, *fields):
+            for obj in qs:
+                for fld in fields:
+                    f = getattr(obj, fld, None)
+                    if f:
+                        try:
+                            f.delete(save=False)
+                        except Exception:
+                            pass
+
+        with transaction.atomic():
+            if folder_ids:
+                # Remove stored files first (FileField.delete is not automatic on row delete).
+                _del_files(Document.objects.filter(folder_id__in=folder_ids), 'file')
+                _del_files(GeoTiffLayer.objects.filter(folder_id__in=folder_ids), 'file', 'cog_file')
+                Document.objects.filter(folder_id__in=folder_ids).delete()
+                GeoTiffLayer.objects.filter(folder_id__in=folder_ids).delete()
+                GISFeature.objects.filter(folder_id__in=folder_ids).delete()
+                # Optional models (present in this build) — purge if importable.
+                try:
+                    from .models import ShapefileImport
+                    _del_files(ShapefileImport.objects.filter(folder_id__in=folder_ids), 'file')
+                    ShapefileImport.objects.filter(folder_id__in=folder_ids).delete()
+                except Exception:
+                    pass
+                try:
+                    from .models import QGISUploadLog
+                    QGISUploadLog.objects.filter(folder_id__in=folder_ids).delete()
+                except Exception:
+                    pass
+            instance.delete()
+            if root_folder is not None:
+                # CASCADE on ProjectLayerFolder.parent removes the whole subtree.
+                ProjectLayerFolder.objects.filter(pk=root_folder.pk).delete()
 
     @action(detail=True, methods=['post'], url_path='generate-report',
             permission_classes=[permissions.IsAuthenticated])
@@ -1682,52 +1905,32 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
         area = self.get_object()
         user = request.user
         title = request.data.get('title') or f'Survey Report — {area.name}'
+        # Copy the blank docx template to prevent OnlyOffice "file content does not match the file extension" validation error
+        from django.conf import settings
+        template_path = os.path.join(str(settings.BASE_DIR), 'apps', 'documents', 'templates', 'new.docx')
+        buf_content = None
+        if os.path.exists(template_path):
+            try:
+                with open(template_path, 'rb') as f:
+                    buf_content = f.read()
+            except Exception:
+                pass
 
-        try:
-            from docx import Document as DocxDocument
-            from docx.shared import Pt, Inches
-            from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-            doc = DocxDocument()
-
-            # Cover heading
-            heading = doc.add_heading(title, level=0)
-            heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-            doc.add_heading('Survey Area Details', level=1)
-            table = doc.add_table(rows=4, cols=2)
-            table.style = 'Table Grid'
-            data = [
-                ('Survey Area', area.name),
-                ('Area Code', area.area_code or '—'),
-                ('Project', area.project.project_number),
-                ('Organisation', area.project.organisation.name if area.project.organisation_id else '—'),
-            ]
-            for i, (k, v) in enumerate(data):
-                table.rows[i].cells[0].text = k
-                table.rows[i].cells[1].text = v
-
-            doc.add_heading('Scope of Survey', level=1)
-            doc.add_paragraph('')
-
-            doc.add_heading('Findings', level=1)
-            doc.add_paragraph('')
-
-            doc.add_heading('Recommendations', level=1)
-            doc.add_paragraph('')
-
-            doc.add_heading('Conclusion', level=1)
-            doc.add_paragraph('')
-
-            buf = io.BytesIO()
-            doc.save(buf)
-            buf.seek(0)
-
-        except ImportError:
-            return Response(
-                {'detail': 'python-docx is not installed. Run: pip install python-docx'},
-                status=500,
-            )
+        if buf_content is None:
+            # Fallback to dynamic docx creation if template is missing
+            try:
+                from docx import Document as DocxDocument
+                doc = DocxDocument()
+                doc.add_heading(title, level=0)
+                buf = io.BytesIO()
+                doc.save(buf)
+                buf.seek(0)
+                buf_content = buf.read()
+            except ImportError:
+                return Response(
+                    {'detail': 'python-docx is not installed. Run: pip install python-docx'},
+                    status=500,
+                )
 
         # Find or create the Doc sub-folder under the area's root folder
         doc_folder = None
@@ -1746,10 +1949,73 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
             folder=doc_folder,
             title=title,
             category='REPORT',
+            file_size=len(buf_content),
+            mime_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             uploaded_by=user,
         )
-        db_doc.file.save(filename, ContentFile(buf.read()), save=True)
+        db_doc.file.save(filename, ContentFile(buf_content), save=True)
 
+        return Response({
+            'doc_id': db_doc.id,
+            'file_url': request.build_absolute_uri(db_doc.file.url) if db_doc.file else None,
+            'title': db_doc.title,
+        }, status=201)
+
+    @action(detail=True, methods=['post'], url_path='template-report',
+            permission_classes=[permissions.IsAuthenticated])
+    def template_report(self, request, pk=None):
+        """
+        POST /api/projects/survey-areas/{id}/template-report/
+
+        Generate the ministry-prescribed DGDE survey report (.docx) for this area
+        from the standard template — title page + clickable index + the 17 sections,
+        with the Statement of Survey Numbers and Area Computation auto-filled from
+        the area's GIS features. Saved to the area's Doc folder and returned as a
+        Document id so the caller can open it in OnlyOffice for editing.
+        """
+        from django.core.files.base import ContentFile
+        from apps.documents.models import Document as Doc
+        from .report_templates import build_ministry_survey_report
+
+        area = self.get_object()
+        user = request.user
+
+        # Ensure the area has a folder tree + a Doc sub-folder.
+        if not area.folder_id:
+            root = ProjectLayerFolder.objects.create(
+                project=area.project, name=area.name,
+                folder_type=ProjectLayerFolder.ZONE, created_by=user, order=0,
+            )
+            _add_survey_area_subfolders(root, user)
+            area.folder = root
+            area.save(update_fields=['folder'])
+        doc_folder, _ = ProjectLayerFolder.objects.get_or_create(
+            project=area.project, parent=area.folder,
+            folder_type=ProjectLayerFolder.DOC,
+            defaults={'name': 'Doc', 'created_by': user, 'order': 2},
+        )
+
+        try:
+            content = build_ministry_survey_report(area, user)
+        except ImportError:
+            return Response(
+                {'detail': 'python-docx is not installed. Run: pip install python-docx'},
+                status=500,
+            )
+        except Exception as exc:
+            import traceback
+            logger.exception('Template report failed for area %s', area.id)
+            return Response({'detail': f'Report generation failed: {exc}'}, status=500)
+
+        safe_name = ''.join(c if c.isalnum() or c in '-_ ' else '_' for c in area.name)
+        title = f'DGDE Survey Report — {area.name}'
+        db_doc = Doc(
+            project=area.project, folder=doc_folder, title=title, category='REPORT',
+            file_size=len(content),
+            mime_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            uploaded_by=user,
+        )
+        db_doc.file.save(f'survey_report_{safe_name}.docx', ContentFile(content), save=True)
         return Response({
             'doc_id': db_doc.id,
             'file_url': request.build_absolute_uri(db_doc.file.url) if db_doc.file else None,
@@ -2025,6 +2291,26 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
             return Response({'detail': 'No file provided.'}, status=400)
         title = (request.data.get('title') or uploaded.name).strip()
         category = request.data.get('category', Document.OTHER)
+        mime_type = getattr(uploaded, 'content_type', '')
+        if not mime_type or mime_type == 'application/octet-stream':
+            ext = uploaded.name.split('.')[-1].lower() if '.' in uploaded.name else ''
+            mime_map = {
+                'doc': 'application/msword',
+                'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                'odt': 'application/vnd.oasis.opendocument.text',
+                'rtf': 'application/rtf',
+                'txt': 'text/plain',
+                'pdf': 'application/pdf',
+                'xls': 'application/vnd.ms-excel',
+                'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'ods': 'application/vnd.oasis.opendocument.spreadsheet',
+                'csv': 'text/csv',
+                'ppt': 'application/vnd.ms-powerpoint',
+                'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                'odp': 'application/vnd.oasis.opendocument.presentation',
+            }
+            mime_type = mime_map.get(ext, 'application/octet-stream')
+
         doc = Document.objects.create(
             project=folder.project,
             folder=folder,
@@ -2032,7 +2318,7 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
             category=category,
             file=uploaded,
             file_size=uploaded.size,
-            mime_type=getattr(uploaded, 'content_type', ''),
+            mime_type=mime_type,
             uploaded_by=request.user,
         )
         return Response({'detail': 'Document uploaded.', 'id': doc.id}, status=201)
@@ -2093,15 +2379,17 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
         ext = os.path.splitext(fname)[1].lower()
         layer_name = (request.data.get('layer_name') or os.path.splitext(fname)[0]).strip()
         name_field = request.data.get('name_field', '').strip()
+        # Default Yes; only sub-DEO uploaders send this explicitly.
+        deo_visible = str(request.data.get('deo_visible', 'true')).lower() not in ('false', '0', 'no')
 
         if ext in ('.tif', '.tiff'):
-            return _import_geotiff(folder, uploaded, layer_name, request.user)
+            return _import_geotiff(folder, uploaded, layer_name, request.user, deo_visible=deo_visible)
         if ext == '.zip':
-            return _import_shapefile_zip(folder, uploaded, layer_name, name_field, request.user)
+            return _import_shapefile_zip(folder, uploaded, layer_name, name_field, request.user, deo_visible=deo_visible)
         if ext in ('.geojson', '.json'):
-            return _import_geojson_file(folder, uploaded, layer_name, name_field, request.user)
+            return _import_geojson_file(folder, uploaded, layer_name, name_field, request.user, deo_visible=deo_visible)
         if ext in ('.kml', '.gpkg'):
-            return _import_via_gdal(folder, uploaded, layer_name, name_field, request.user, ext.lstrip('.'))
+            return _import_via_gdal(folder, uploaded, layer_name, name_field, request.user, ext.lstrip('.'), deo_visible=deo_visible)
         return Response(
             {'detail': f'Unsupported format "{ext}". Accepted: .zip, .geojson, .json, .kml, .gpkg, .tif, .tiff'},
             status=400
@@ -2139,8 +2427,15 @@ def _export_features(qs, project, fmt: str):
     import os
     from django.http import HttpResponse, FileResponse
     from django.contrib.gis.serializers.geojson import Serializer as GeoJSONSerializer
+    from apps.core.watermark import embed_watermark
 
     features = list(qs.select_related('created_by'))
+    metadata = {
+        "project_id": project.id,
+        "project_number": project.project_number,
+        "export_format": fmt,
+        "features_count": len(features),
+    }
 
     if fmt == 'geojson':
         fc = {
@@ -2162,7 +2457,12 @@ def _export_features(qs, project, fmt: str):
                 for f in features
             ],
         }
-        resp = HttpResponse(json.dumps(fc, indent=2), content_type='application/geo+json')
+        geojson_str = json.dumps(fc, indent=2)
+        try:
+            watermarked_bytes = embed_watermark(geojson_str.encode('utf-8'), f"{project.project_number}.geojson", 'application/geo+json', metadata)
+            resp = HttpResponse(watermarked_bytes, content_type='application/geo+json')
+        except Exception:
+            resp = HttpResponse(geojson_str, content_type='application/geo+json')
         resp['Content-Disposition'] = f'attachment; filename="{project.project_number}.geojson"'
         return resp
 
@@ -2175,7 +2475,12 @@ def _export_features(qs, project, fmt: str):
         for f in features:
             centroid = f.geometry.centroid
             writer.writerow([f.id, f.layer_name, f.geometry_type, f.feature_id, centroid.x, centroid.y, f.created_at.isoformat()])
-        resp = HttpResponse(buf.getvalue(), content_type='text/csv')
+        csv_str = buf.getvalue()
+        try:
+            watermarked_bytes = embed_watermark(csv_str.encode('utf-8'), f"{project.project_number}.csv", 'text/csv', metadata)
+            resp = HttpResponse(watermarked_bytes, content_type='text/csv')
+        except Exception:
+            resp = HttpResponse(csv_str, content_type='text/csv')
         resp['Content-Disposition'] = f'attachment; filename="{project.project_number}.csv"'
         return resp
 
@@ -2230,13 +2535,23 @@ def _export_features(qs, project, fmt: str):
                     for fn in os.listdir(tmpdir):
                         zf.write(os.path.join(tmpdir, fn), fn)
                 buf.seek(0)
-                resp = HttpResponse(buf.read(), content_type='application/zip')
+                shape_bytes = buf.read()
+                try:
+                    watermarked_bytes = embed_watermark(shape_bytes, f"{project.project_number}.zip", 'application/zip', metadata)
+                    resp = HttpResponse(watermarked_bytes, content_type='application/zip')
+                except Exception:
+                    resp = HttpResponse(shape_bytes, content_type='application/zip')
                 resp['Content-Disposition'] = f'attachment; filename="{project.project_number}.zip"'
                 return resp
             else:
                 with open(out_path, 'rb') as fh:
                     content_type = 'application/octet-stream'
-                    resp = HttpResponse(fh.read(), content_type=content_type)
+                    file_bytes = fh.read()
+                    try:
+                        watermarked_bytes = embed_watermark(file_bytes, f"{project.project_number}{archive_ext}", content_type, metadata)
+                        resp = HttpResponse(watermarked_bytes, content_type=content_type)
+                    except Exception:
+                        resp = HttpResponse(file_bytes, content_type=content_type)
                     resp['Content-Disposition'] = f'attachment; filename="{project.project_number}{archive_ext}"'
                     return resp
 
@@ -2251,16 +2566,33 @@ class GeoTiffLayerViewSet(viewsets.ModelViewSet):
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
-        return org_queryset_filter(
-            self.request.user,
-            GeoTiffLayer.objects.select_related('project__organisation', 'folder', 'created_by'),
-            org_field='project__organisation',
-        )
+        user = self.request.user
+        base_qs = GeoTiffLayer.objects.select_related('project__organisation', 'folder', 'created_by')
+        own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation')
+        # DEO offices additionally see subordinate-office rasters marked deo_visible.
+        deo_sub_ids = deo_subordinate_org_ids(user)
+        if not deo_sub_ids:
+            return own_qs
+        extra = base_qs.filter(project__organisation_id__in=deo_sub_ids, deo_visible=True)
+        return (own_qs | extra).distinct()
 
     def get_permissions(self):
         if self.action in ['list', 'retrieve']:
             return [permissions.IsAuthenticated()]
+        # partial_update (PATCH) is used by the map to toggle is_visible / opacity.
+        # Any authenticated user in the same org may do this; full create/delete
+        # is restricted to CanEditProject (SDO/SURVEYOR/SUPERADMIN).
+        if self.action == 'partial_update':
+            return [permissions.IsAuthenticated()]
         return [CanEditProject()]
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not (user.is_superadmin or
+                serializer.instance.project.organisation_id == user.organisation_id):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('You can only modify GeoTiff layers in your organisation.')
+        serializer.save()
 
     def get_serializer_context(self):
         ctx = super().get_serializer_context()
@@ -3028,8 +3360,16 @@ class TemporaryLayerViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
+        from django.db.models import Q
         from .models import TemporaryLayer
-        return TemporaryLayer.objects.filter(uploaded_by=self.request.user)
+        user = self.request.user
+        # Always your own temp layers; DEO offices also see subordinate-office
+        # uploaders' temp layers that are marked deo_visible.
+        q = Q(uploaded_by=user)
+        deo_sub_ids = deo_subordinate_org_ids(user)
+        if deo_sub_ids:
+            q |= Q(uploaded_by__organisation_id__in=deo_sub_ids, deo_visible=True)
+        return TemporaryLayer.objects.filter(q).distinct()
 
     def create(self, request, *args, **kwargs):
         from .models import TemporaryLayer
@@ -3083,6 +3423,7 @@ class TemporaryLayerViewSet(viewsets.ModelViewSet):
             file=file_obj,
             geojson=geojson,
             feature_count=feature_count,
+            deo_visible=str(request.data.get('deo_visible', 'true')).lower() not in ('false', '0', 'no'),
             uploaded_by=request.user,
         )
         layer.save()
@@ -3094,25 +3435,70 @@ class TemporaryLayerViewSet(viewsets.ModelViewSet):
         """
         POST /api/projects/temp-layers/{id}/analyse/
 
-        Runs spatial analysis: checks whether the uploaded layer intersects or
-        is within 1 km of any DefenceParcel boundary.  Caches the result on
-        the layer record and returns a JSON summary.
+        Body: { "buffer_m": 1000 }  (must be one of VALID_BUFFER_M; default 1000)
+
+        Runs spatial analysis for the given buffer distance, caches the result
+        keyed by buffer_m, and returns the JSON result.
         """
-        from .models import DefenceParcel
-        from apps.survey_projects.analysis import run_defence_analysis
+        from apps.survey_projects.analysis import run_defence_analysis, DEFAULT_BUFFER_M, VALID_BUFFER_M
 
         layer = self.get_object()
         if not layer.geojson:
             return Response({'detail': 'No geometry data in this layer.'}, status=400)
 
         try:
-            result = run_defence_analysis(layer)
+            buffer_m = int(request.data.get('buffer_m', DEFAULT_BUFFER_M))
+        except (TypeError, ValueError):
+            buffer_m = DEFAULT_BUFFER_M
+
+        if buffer_m not in VALID_BUFFER_M:
+            return Response(
+                {'detail': f'buffer_m must be one of {VALID_BUFFER_M}'},
+                status=400,
+            )
+
+        # survey_area_ids / external_layer_ids:
+        #   null / omitted  → check all
+        #   []              → skip that type
+        #   [1, 2, ...]     → check only those IDs
+        def _parse_ids(key):
+            val = request.data.get(key)
+            if val is None:
+                return None           # all
+            if isinstance(val, list):
+                return [int(x) for x in val if str(x).isdigit() or isinstance(x, int)]
+            return None               # unexpected format → treat as all
+
+        survey_area_ids    = _parse_ids('survey_area_ids')
+        external_layer_ids = _parse_ids('external_layer_ids')
+
+        try:
+            result = run_defence_analysis(
+                layer,
+                buffer_m=buffer_m,
+                survey_area_ids=survey_area_ids,
+                external_layer_ids=external_layer_ids,
+                user=request.user,
+            )
         except Exception as exc:
             logger.exception('Defence analysis failed for temp layer %s', layer.id)
             return Response({'detail': f'Analysis failed: {exc}'}, status=500)
 
-        layer.analysis_result = result
-        layer.save(update_fields=['analysis_result'])
+        # Store keyed by buffer; migrate legacy flat result.
+        # The frontend fires one request per buffer in parallel, so this
+        # read-modify-write must be serialised under a row lock — otherwise
+        # concurrent saves clobber each other and a buffer's result is lost
+        # (the stale value then surfaces in the PDF report).
+        from django.db import transaction
+        from .models import TemporaryLayer
+        with transaction.atomic():
+            locked = TemporaryLayer.objects.select_for_update().get(pk=layer.pk)
+            stored = locked.analysis_result or {}
+            if isinstance(stored, dict) and 'verdict' in stored:
+                stored = {'1000': stored}
+            stored[str(buffer_m)] = result
+            locked.analysis_result = stored
+            locked.save(update_fields=['analysis_result'])
         return Response(result)
 
     @action(detail=True, methods=['get'], url_path='analyse/report')
@@ -3120,31 +3506,80 @@ class TemporaryLayerViewSet(viewsets.ModelViewSet):
         """
         GET /api/projects/temp-layers/{id}/analyse/report/
 
-        Generates and streams an ArcGIS-style PDF proximity analysis report.
-        Runs analysis if no cached result exists.
+        Generates a PDF for the specified buffer distances.
+
+        Optional ?buffers=1000,5000,10000 — comma-separated list of buffer_m values.
+        If omitted, uses whatever is cached in analysis_result.
+        Missing buffers that are requested will be run on-the-fly.
         """
-        from apps.survey_projects.analysis import run_defence_analysis, generate_analysis_report_html
+        from apps.survey_projects.analysis import (
+            run_defence_analysis,
+            generate_multi_range_report_html, VALID_BUFFER_M,
+        )
         import httpx
 
         layer = self.get_object()
         if not layer.geojson:
             return Response({'detail': 'No geometry data in this layer.'}, status=400)
 
-        result = layer.analysis_result
-        if not result:
+        # Normalise cached results
+        stored = layer.analysis_result or {}
+        if isinstance(stored, dict) and 'verdict' in stored:
+            stored = {'1000': stored}
+
+        # Determine which buffers to include in the report
+        buffers_param = request.query_params.get('buffers', '').strip()
+        if buffers_param:
+            requested = []
+            for part in buffers_param.split(','):
+                try:
+                    bm = int(part.strip())
+                    if bm in VALID_BUFFER_M:
+                        requested.append(bm)
+                except ValueError:
+                    pass
+            target_buffers = requested if requested else list(stored.keys())
+        else:
+            # No param → use whatever is already cached
+            target_buffers = [int(k) for k in stored.keys()] if stored else [1000]
+
+        if not target_buffers:
+            return Response({'detail': 'No buffer ranges available. Run analysis first.'}, status=400)
+
+        # Run any missing buffers in the requested set
+        missing = [bm for bm in target_buffers if str(bm) not in stored]
+        if missing:
             try:
-                result = run_defence_analysis(layer)
-                layer.analysis_result = result
-                layer.save(update_fields=['analysis_result'])
+                computed = {
+                    str(bm): run_defence_analysis(layer, buffer_m=bm, user=request.user)
+                    for bm in missing
+                }
+                stored.update(computed)
+                # Merge under a row lock so we don't clobber a concurrent analyse write.
+                from django.db import transaction
+                from .models import TemporaryLayer
+                with transaction.atomic():
+                    locked = TemporaryLayer.objects.select_for_update().get(pk=layer.pk)
+                    current = locked.analysis_result or {}
+                    if isinstance(current, dict) and 'verdict' in current:
+                        current = {'1000': current}
+                    current.update(computed)
+                    locked.analysis_result = current
+                    locked.save(update_fields=['analysis_result'])
             except Exception as exc:
                 return Response({'detail': f'Analysis failed: {exc}'}, status=500)
 
+        # Build subset for this report
+        report_data = {str(bm): stored[str(bm)] for bm in target_buffers if str(bm) in stored}
+        if not report_data:
+            return Response({'detail': 'No results to include in report.'}, status=400)
+
         try:
-            html = generate_analysis_report_html(layer, result)
+            html = generate_multi_range_report_html(layer, report_data)
             pw_response = httpx.post(
                 'http://print-service:3001/render',
                 json={'html': html, 'paper_size': 'A4', 'orientation': 'portrait', 'scale': 1.5},
-                timeout=120,
+                timeout=180,
             )
             pw_response.raise_for_status()
         except httpx.ConnectError:
@@ -3153,9 +3588,22 @@ class TemporaryLayerViewSet(viewsets.ModelViewSet):
             return Response({'detail': str(exc)}, status=500)
 
         from django.http import HttpResponse as DjangoHttpResponse
+        from apps.core.watermark import embed_watermark
         safe_name = ''.join(c if c.isalnum() or c in '-_ ' else '_' for c in layer.name)
-        pdf_resp = DjangoHttpResponse(pw_response.content, content_type='application/pdf')
-        pdf_resp['Content-Disposition'] = f'attachment; filename="defence_analysis_{safe_name}.pdf"'
+        filename = f"defence_proximity_report_{safe_name}.pdf"
+        metadata = {
+            "uploaded_by": request.user.username,
+            "export_format": "pdf",
+            "report_type": "defence_proximity",
+            "layer_name": layer.name,
+        }
+        try:
+            pdf_bytes = embed_watermark(pw_response.content, filename, 'application/pdf', metadata)
+        except Exception as wexc:
+            pdf_bytes = pw_response.content
+
+        pdf_resp = DjangoHttpResponse(pdf_bytes, content_type='application/pdf')
+        pdf_resp['Content-Disposition'] = f'attachment; filename="{filename}"'
         return pdf_resp
 
     http_method_names = ['get', 'post', 'delete', 'head', 'options']

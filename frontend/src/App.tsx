@@ -5,11 +5,13 @@ import AppRoutes from './app/routes'
 import { useAppStore } from './app/store'
 import api from './services/api'
 import { qk } from './services/queryKeys'
+import { useBranding } from './context/BrandingContext'
 import type { User } from './types'
 
 export default function App() {
   const user = useAppStore((s) => s.user)
   const setUser = useAppStore((s) => s.setUser)
+  const branding = useBranding()
 
   const hasToken = !!localStorage.getItem('access_token')
 
@@ -40,7 +42,7 @@ export default function App() {
   if (hasToken && (isLoading || (data && !user))) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: '#050510' }}>
-        <Spin size="large" tip="Loading RakshaGIS..." />
+        <Spin size="large" tip={`Loading ${branding.app_title}...`} />
       </div>
     )
   }

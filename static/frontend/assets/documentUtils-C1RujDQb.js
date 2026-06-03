@@ -1,0 +1,1 @@
+import"./index--uGjFhKB.js";import{bP as t}from"./antd-w8_xI58P.js";function a(o){const e=localStorage.getItem("access_token");if(!e){t.error("Your session has expired. Please sign in again.");return}const n=`/api/documents/${o}/embed/?token=${encodeURIComponent(e)}`;window.open(n,"_blank","noopener,noreferrer")}export{a as o};

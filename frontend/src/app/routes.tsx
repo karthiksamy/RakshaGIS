@@ -25,6 +25,7 @@ const VillageMasterPage = lazy(() => import('@/features/master/VillageMasterPage
 const BoundaryImportPage = lazy(() => import('@/features/master/BoundaryImportPage'))
 const TerrainPage = lazy(() => import('@/features/terrain/TerrainPage'))
 const BoundaryExtractionPage = lazy(() => import('@/features/ai-vision/BoundaryExtractionPage'))
+const BoundaryReviewPage = lazy(() => import('@/features/ai-vision/BoundaryReviewPage'))
 const BackupPage = lazy(() => import('@/features/backups/BackupPage'))
 const BrandingSettingsPage   = lazy(() => import('@/features/settings/BrandingSettingsPage'))
 const QGISSyncPage           = lazy(() => import('@/features/qgis-sync/QGISSyncPage'))
@@ -78,6 +79,7 @@ export default function AppRoutes() {
           <Route path="master/boundary-import" element={<BoundaryImportPage />} />
           <Route path="terrain" element={<TerrainPage />} />
           <Route path="ai-vision" element={<BoundaryExtractionPage />} />
+          <Route path="boundary-review/:jobId" element={<BoundaryReviewPage />} />
           <Route path="backups" element={<BackupPage />} />
           <Route path="settings/branding"      element={<BrandingSettingsPage />} />
           <Route path="settings/ai-config"     element={<AIConfigPage />} />

@@ -23,12 +23,12 @@ class SurveyProjectSerializer(serializers.ModelSerializer):
             'survey_type', 'survey_type_display',
             'priority', 'priority_display',
             'organisation', 'organisation_name',
-            'status', 'status_display',
+            'status', 'status_display', 'map_enabled',
             'state', 'district', 'taluk', 'village',
             'total_area_hectares', 'start_date', 'target_date',
             'created_by', 'created_by_name', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['project_number', 'created_by', 'created_at', 'updated_at', 'status']
+        read_only_fields = ['project_number', 'created_by', 'created_at', 'updated_at', 'status', 'map_enabled']
         extra_kwargs = {'organisation': {'required': False}}
 
 
@@ -44,10 +44,10 @@ class SurveyAreaSerializer(serializers.ModelSerializer):
             'id', 'project', 'name', 'area_code', 'description',
             'folder', 'folder_name',
             'assigned_to', 'assigned_to_name',
-            'status', 'status_display',
+            'status', 'status_display', 'map_enabled',
             'created_by', 'created_by_name', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['created_by', 'created_at', 'updated_at', 'status']
+        read_only_fields = ['created_by', 'created_at', 'updated_at', 'status', 'map_enabled']
 
 
 class ProjectLayerFolderSerializer(serializers.ModelSerializer):
@@ -87,7 +87,7 @@ class GISFeatureSerializer(serializers.ModelSerializer):
         model = GISFeature
         fields = [
             'id', 'project', 'folder', 'feature_id', 'layer_name', 'geometry_type',
-            'geometry', 'attributes', 'is_deleted',
+            'geometry', 'attributes', 'is_deleted', 'deo_visible',
             'created_by', 'created_by_name', 'created_at', 'updated_at',
         ]
         read_only_fields = ['created_by', 'created_at', 'updated_at']
@@ -140,7 +140,7 @@ class ShapefileImportSerializer(serializers.ModelSerializer):
         model = ShapefileImport
         fields = [
             'id', 'project', 'folder', 'folder_name', 'file', 'layer_name',
-            'attribute_template', 'status', 'status_display',
+            'attribute_template', 'status', 'status_display', 'deo_visible',
             'feature_count', 'columns', 'error',
             'ai_processed', 'ai_summary',
             'created_by', 'created_by_name', 'created_at',
@@ -183,7 +183,7 @@ class GeoTiffLayerSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'project', 'folder', 'folder_name', 'name', 'file',
             'cog_file', 'cog_url', 'status', 'status_display', 'error',
-            'is_visible', 'opacity',
+            'is_visible', 'deo_visible', 'opacity',
             'created_by', 'created_by_name', 'created_at',
         ]
         read_only_fields = ['id', 'cog_file', 'status', 'error', 'created_by', 'created_at']
@@ -284,7 +284,7 @@ class TemporaryLayerSerializer(serializers.ModelSerializer):
             'description',
             'file_format', 'file_format_display',
             'file', 'geojson', 'feature_count',
-            'analysis_result',
+            'analysis_result', 'deo_visible',
             'uploaded_by', 'uploaded_by_name', 'created_at',
         ]
         read_only_fields = [

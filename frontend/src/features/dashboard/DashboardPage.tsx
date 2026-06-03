@@ -6,6 +6,7 @@ import {
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
+import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 
 dayjs.extend(relativeTime)
@@ -28,7 +29,8 @@ const STATUS_COLOR: Record<string, string> = {
 }
 
 function MiniBarChart({ data }: { data: { month: string; count: number }[] }) {
-  if (!data.length) return <Text type="secondary">No data yet</Text>
+  const { t } = useTranslation()
+  if (!data.length) return <Text type="secondary">{t('dashboard.no_data')}</Text>
   const max = Math.max(...data.map(d => d.count), 1)
   return (
     <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 80 }}>
@@ -75,6 +77,7 @@ function StatusDonut({ stats }: { stats: DashboardStats['projects'] }) {
 }
 
 export default function DashboardPage() {
+  const { t } = useTranslation()
   const { data, isLoading } = useQuery<DashboardStats>({
     queryKey: ['dashboard-stats'],
     queryFn: () => api.get('/dashboard/stats/').then(r => r.data),
@@ -93,14 +96,14 @@ export default function DashboardPage() {
 
   return (
     <div style={{ padding: '20px 24px', overflowY: 'auto', height: '100%', background: '#050510' }}>
-      <Title level={4} style={{ color: '#4fc3f7', marginBottom: 20 }}>Dashboard</Title>
+      <Title level={4} style={{ color: '#4fc3f7', marginBottom: 20 }}>{t('dashboard.title')}</Title>
 
       {/* Stats Cards */}
       <Row gutter={[16, 16]}>
         <Col xs={12} sm={6}>
           <Card size="small" style={{ background: '#0e1a2e', border: '1px solid #1a3050' }}>
             <Statistic
-              title={<Text style={{ color: '#888', fontSize: 12 }}>Total Projects</Text>}
+              title={<Text style={{ color: '#888', fontSize: 12 }}>{t('dashboard.total_projects')}</Text>}
               value={s.projects.total}
               prefix={<FolderOutlined style={{ color: '#1677ff' }} />}
               valueStyle={{ color: '#e0e0e0', fontSize: 28 }}
@@ -110,7 +113,7 @@ export default function DashboardPage() {
         <Col xs={12} sm={6}>
           <Card size="small" style={{ background: '#0e1a2e', border: '1px solid #1a3050' }}>
             <Statistic
-              title={<Text style={{ color: '#888', fontSize: 12 }}>Total Features</Text>}
+              title={<Text style={{ color: '#888', fontSize: 12 }}>{t('dashboard.total_features')}</Text>}
               value={s.feature_count}
               prefix={<EnvironmentOutlined style={{ color: '#52c41a' }} />}
               valueStyle={{ color: '#e0e0e0', fontSize: 28 }}
@@ -121,7 +124,7 @@ export default function DashboardPage() {
           <Col xs={12} sm={6}>
             <Card size="small" style={{ background: '#0e1a2e', border: '1px solid #1a3050' }}>
               <Statistic
-                title={<Text style={{ color: '#888', fontSize: 12 }}>Active Users</Text>}
+                title={<Text style={{ color: '#888', fontSize: 12 }}>{t('dashboard.active_users')}</Text>}
                 value={s.user_count}
                 prefix={<TeamOutlined style={{ color: '#fa8c16' }} />}
                 valueStyle={{ color: '#e0e0e0', fontSize: 28 }}
@@ -133,7 +136,7 @@ export default function DashboardPage() {
           <Col xs={12} sm={6}>
             <Card size="small" style={{ background: '#0e1a2e', border: '1px solid #1a3050' }}>
               <Statistic
-                title={<Text style={{ color: '#888', fontSize: 12 }}>Organisations</Text>}
+                title={<Text style={{ color: '#888', fontSize: 12 }}>{t('dashboard.organisations')}</Text>}
                 value={s.org_count}
                 prefix={<BankOutlined style={{ color: '#13c2c2' }} />}
                 valueStyle={{ color: '#e0e0e0', fontSize: 28 }}
@@ -148,7 +151,7 @@ export default function DashboardPage() {
         <Col xs={24} md={12}>
           <Card
             size="small"
-            title={<Text style={{ color: '#aaa' }}>Project Status Breakdown</Text>}
+            title={<Text style={{ color: '#aaa' }}>{t('dashboard.status_breakdown')}</Text>}
             style={{ background: '#0e1a2e', border: '1px solid #1a3050' }}
           >
             <Space direction="vertical" style={{ width: '100%' }} size={8}>
@@ -157,7 +160,7 @@ export default function DashboardPage() {
                 percent={publishedPct}
                 strokeColor="#13c2c2"
                 trailColor="#1a2a3a"
-                format={p => <Text style={{ color: '#aaa', fontSize: 11 }}>{p}% published</Text>}
+                format={p => <Text style={{ color: '#aaa', fontSize: 11 }}>{t('dashboard.published_pct', { pct: p })}</Text>}
               />
             </Space>
           </Card>
@@ -167,7 +170,7 @@ export default function DashboardPage() {
         <Col xs={24} md={12}>
           <Card
             size="small"
-            title={<Text style={{ color: '#aaa' }}>Monthly Project Creation</Text>}
+            title={<Text style={{ color: '#aaa' }}>{t('dashboard.monthly_trend')}</Text>}
             style={{ background: '#0e1a2e', border: '1px solid #1a3050' }}
           >
             <MiniBarChart data={s.monthly_trend} />
@@ -180,11 +183,11 @@ export default function DashboardPage() {
         <Col xs={24} md={14}>
           <Card
             size="small"
-            title={<Text style={{ color: '#aaa' }}>Recent Projects (7 days)</Text>}
+            title={<Text style={{ color: '#aaa' }}>{t('dashboard.recent_projects')}</Text>}
             style={{ background: '#0e1a2e', border: '1px solid #1a3050' }}
           >
             {s.recent_projects.length === 0 ? (
-              <Text type="secondary">No recent projects</Text>
+              <Text type="secondary">{t('dashboard.no_recent_projects')}</Text>
             ) : (
               <Table
                 dataSource={s.recent_projects}
@@ -227,11 +230,11 @@ export default function DashboardPage() {
         <Col xs={24} md={10}>
           <Card
             size="small"
-            title={<Text style={{ color: '#aaa' }}>Recent Activity</Text>}
+            title={<Text style={{ color: '#aaa' }}>{t('dashboard.recent_activity')}</Text>}
             style={{ background: '#0e1a2e', border: '1px solid #1a3050', maxHeight: 380, overflowY: 'auto' }}
           >
             {s.recent_activity.length === 0 ? (
-              <Text type="secondary">No recent activity</Text>
+              <Text type="secondary">{t('dashboard.no_recent_activity')}</Text>
             ) : (
               <Timeline
                 items={s.recent_activity.map(a => {

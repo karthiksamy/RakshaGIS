@@ -9,6 +9,7 @@ import {
   KeyOutlined, PoweroffOutlined, LogoutOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
+import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 import { qk } from '@/services/queryKeys'
 import { useAppStore } from '@/app/store'
@@ -22,6 +23,7 @@ export default function UsersPage() {
   const qc = useQueryClient()
   const currentUser = useAppStore((s) => s.user)
   const isSuperAdmin = currentUser?.role === 'SUPERADMIN'
+  const { t } = useTranslation()
 
   const [userModalOpen, setUserModalOpen] = useState(false)
   const [pwdModalOpen, setPwdModalOpen] = useState(false)
@@ -47,7 +49,7 @@ export default function UsersPage() {
         : api.post('/accounts/users/', values),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.users() })
-      message.success(editingUser ? 'User updated' : 'User created')
+      message.success(editingUser ? t('user.user_updated') : t('user.user_created'))
       setUserModalOpen(false)
     },
     onError: (e: any) => message.error(e?.response?.data?.detail || 'Save failed'),
@@ -55,27 +57,27 @@ export default function UsersPage() {
 
   const delUser = useMutation({
     mutationFn: (id: number) => api.delete(`/accounts/users/${id}/`),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: qk.users() }); message.success('User deleted') },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: qk.users() }); message.success(t('user.user_deleted')) },
     onError: (e: any) => message.error(e?.response?.data?.detail || 'Delete failed'),
   })
 
   const forceLogout = useMutation({
     mutationFn: (id: number) => api.post(`/accounts/users/${id}/force-logout/`),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: qk.users() }); message.success('User force-logged out') },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: qk.users() }); message.success(t('user.force_logged_out')) },
     onError: (e: any) => message.error(e?.response?.data?.detail || 'Failed'),
   })
 
   const toggleActive = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
       api.patch(`/accounts/users/${id}/`, { is_active }),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: qk.users() }); message.success('Status updated') },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: qk.users() }); message.success(t('user.status_updated')) },
     onError: (e: any) => message.error(e?.response?.data?.detail || 'Failed'),
   })
 
   const changePwd = useMutation({
     mutationFn: ({ id, new_password }: { id: number; new_password: string }) =>
       api.post(`/accounts/users/${id}/change-password/`, { new_password }),
-    onSuccess: () => { message.success('Password changed'); setPwdModalOpen(false); pwdForm.resetFields() },
+    onSuccess: () => { message.success(t('common.success')); setPwdModalOpen(false); pwdForm.resetFields() },
     onError: (e: any) => message.error(e?.response?.data?.detail || 'Failed'),
   })
 
@@ -106,22 +108,22 @@ export default function UsersPage() {
     : ORG_ADMIN_ASSIGNABLE.map((r) => ({ value: r, label: r }))
 
   const columns: ColumnsType<User> = [
-    { title: 'Username', dataIndex: 'username', width: 140 },
-    { title: 'Full Name', dataIndex: 'full_name' },
-    { title: 'Email', dataIndex: 'email', responsive: ['md'] },
+    { title: t("user.username"), dataIndex: "username", width: 140 },
+    { title: t("user.full_name"), dataIndex: "full_name" },
+    { title: t("user.email"), dataIndex: "email", responsive: ['md'] },
     {
-      title: 'Role',
+      title: t('user.role'),
       dataIndex: 'role',
       render: (r) => <Tag color={ADMIN_ROLES.includes(r) ? 'gold' : 'default'}>{r}</Tag>,
     },
-    { title: 'Organisation', dataIndex: 'organisation_name', responsive: ['lg'] },
+    { title: t('common.organisation'), dataIndex: 'organisation_name', responsive: ['lg'] },
     {
-      title: 'Active',
+      title: t('common.active'),
       dataIndex: 'is_active',
       render: (v) => <Tag color={v ? 'green' : 'default'}>{v ? 'Active' : 'Inactive'}</Tag>,
     },
     {
-      title: 'Actions',
+      title: t('common.actions'),
       width: 200,
       render: (_: any, u: User) => {
         const protected_ = isProtected(u)
@@ -151,7 +153,7 @@ export default function UsersPage() {
               />
             </Tooltip>
             <Popconfirm
-              title="Delete this user?"
+              title={t("user.delete_user")}
               disabled={!canAct}
               onConfirm={() => canAct && delUser.mutate(u.id)}
             >
@@ -166,8 +168,8 @@ export default function UsersPage() {
   return (
     <div style={{ padding: 24, height: '100%', overflow: 'auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-        <Typography.Title level={4} style={{ margin: 0, color: '#e8e8e8' }}>Users</Typography.Title>
-        <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>Add User</Button>
+        <Typography.Title level={4} style={{ margin: 0, color: '#e8e8e8' }}>{t("user.users")}</Typography.Title>
+        <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>{t("user.add_user")}</Button>
       </div>
 
       <Table
@@ -181,7 +183,7 @@ export default function UsersPage() {
 
       {/* Create / Edit modal */}
       <Modal
-        title={editingUser ? 'Edit User' : 'Create User'}
+        title={editingUser ? t('user.edit_user') : t('user.create_user')}
         open={userModalOpen}
         onCancel={() => setUserModalOpen(false)}
         onOk={() => form.submit()}
@@ -189,33 +191,33 @@ export default function UsersPage() {
         width={600}
       >
         <Form form={form} layout="vertical" onFinish={(v) => saveUser.mutate(v)} style={{ marginTop: 16 }}>
-          <Form.Item name="username" label="Username" rules={[{ required: true }]}>
+          <Form.Item name="username" label={t("user.username")} rules={[{ required: true }]}>
             <Input />
           </Form.Item>
-          <Form.Item name="first_name" label="First Name">
+          <Form.Item name="first_name" label={t("user.first_name")}>
             <Input />
           </Form.Item>
-          <Form.Item name="last_name" label="Last Name">
+          <Form.Item name="last_name" label={t("user.last_name")}>
             <Input />
           </Form.Item>
-          <Form.Item name="email" label="Email">
+          <Form.Item name="email" label={t("user.email")}>
             <Input type="email" />
           </Form.Item>
-          <Form.Item name="employee_id" label="Employee ID">
+          <Form.Item name="employee_id" label={t("user.employee_id")}>
             <Input />
           </Form.Item>
-          <Form.Item name="designation" label="Designation">
+          <Form.Item name="designation" label={t("user.designation")}>
             <Input />
           </Form.Item>
-          <Form.Item name="phone" label="Phone">
+          <Form.Item name="phone" label={t("user.phone")}>
             <Input maxLength={15} />
           </Form.Item>
           {!editingUser && (
-            <Form.Item name="password" label="Password" rules={[{ required: true }, { min: 8 }]}>
+            <Form.Item name="password" label={t("auth.password")} rules={[{ required: true }, { min: 8 }]}>
               <Input.Password />
             </Form.Item>
           )}
-          <Form.Item name="role" label="Role" rules={[{ required: true }]}>
+          <Form.Item name="role" label={t("user.role")} rules={[{ required: true }]}>
             <Select options={roleOptions} />
           </Form.Item>
           <Form.Item name="organisation" label="Organisation">
@@ -245,8 +247,8 @@ export default function UsersPage() {
         >
           <Form.Item
             name="new_password"
-            label="New Password"
-            rules={[{ required: true }, { min: 8, message: 'Minimum 8 characters' }]}
+            label={t("auth.new_password")}
+            rules={[{ required: true }, { min: 8, message: t("user.min_8_chars") }]}
           >
             <Input.Password />
           </Form.Item>

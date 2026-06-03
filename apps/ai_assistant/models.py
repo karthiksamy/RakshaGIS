@@ -157,14 +157,17 @@ class DocumentChunk(models.Model):
 
 
 class BoundaryExtractionJob(models.Model):
-    """Tracks a vision-model run that extracts parcel boundaries from a scanned map image."""
+    """Tracks a vision-model run that extracts parcel boundaries from a scanned map image or GeoTiff."""
     PENDING  = 'PENDING'
     RUNNING  = 'RUNNING'
     DONE     = 'DONE'
     FAILED   = 'FAILED'
     STATUS_CHOICES = [(s, s) for s in (PENDING, RUNNING, DONE, FAILED)]
 
-    # Source image — can be an uploaded document or a raw file field
+    SOURCE_SCAN    = 'scan'
+    SOURCE_GEOTIFF = 'geotiff'
+
+    # Source image — scanned document, raw upload, or georeferenced GeoTiff
     source_document = models.ForeignKey(
         'documents.Document', on_delete=models.SET_NULL, null=True, blank=True,
         related_name='boundary_extractions',
@@ -173,6 +176,11 @@ class BoundaryExtractionJob(models.Model):
     source_image = models.ImageField(
         upload_to='boundary_extraction/', null=True, blank=True,
         help_text='Directly uploaded scanned map image.',
+    )
+    source_geotiff = models.ForeignKey(
+        'survey_projects.GeoTiffLayer', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='boundary_extractions',
+        help_text='Georeferenced GeoTiff layer — produces polygons with real coordinates.',
     )
     project  = models.ForeignKey(
         'survey_projects.SurveyProject', on_delete=models.CASCADE,

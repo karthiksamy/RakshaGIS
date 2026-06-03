@@ -2,16 +2,17 @@ import { useState } from 'react'
 import {
   Button, Card, Table, Tag, Space, Modal, Form, Input, InputNumber,
   Switch, message, Popconfirm, Tooltip, Alert, Spin, Tabs, Select,
-  Typography, Badge, Divider,
+  Typography, Badge, Divider, Radio,
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import {
   PlusOutlined, EditOutlined, DeleteOutlined, ApiOutlined,
   SyncOutlined, TableOutlined, CloudServerOutlined,
   CheckCircleOutlined, CloseCircleOutlined, QuestionCircleOutlined,
-  FilterOutlined,
+  FilterOutlined, BarChartOutlined, BgColorsOutlined,
 } from '@ant-design/icons'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 
 const { Text } = Typography
@@ -34,6 +35,9 @@ interface ExtDB {
   password_set: boolean
 }
 
+// Per-level filter map: {"PDDE":"colname", "DEO":"colname", ...}
+type LevelFilterFields = Record<string, string>
+
 interface ExtLayer {
   id: number
   database: number
@@ -46,12 +50,50 @@ interface ExtLayer {
   id_column: string
   label_column: string
   office_filter_field: string
+  level_filter_fields: LevelFilterFields
+  analysis_columns: string[]
   style: Record<string, unknown>
+  cantonment_scope: 'INSIDE' | 'OUTSIDE'
+  inside_render_type: 'GLR_PLAN' | 'OTHERS'
+  classification_field: string
+  classification_colors: Record<string, { color: string; opacity?: number }>
   is_active: boolean
   display_order: number
   feature_count: number | null
   bbox: number[] | null
   last_synced_at: string | null
+}
+
+// All org levels — super admin maps each to the appropriate column in the external table
+const FILTERABLE_LEVELS = [
+  { key: 'DGDE', label: 'DGDE (National)' },
+  { key: 'PDDE', label: 'PDDE (Command)' },
+  { key: 'DEO',  label: 'DEO (District/Area)' },
+  { key: 'CEO',  label: 'CEO (Cantonment)' },
+  { key: 'ADEO', label: 'ADEO (Sub-Area)' },
+]
+
+const LEVEL_TAG_COLOR: Record<string, string> = {
+  DGDE: 'gold', PDDE: 'blue', DEO: 'cyan', CEO: 'green', ADEO: 'orange',
+}
+
+const CLASS_NULL_KEY = '__null__'
+
+// Suggested colours for common GLR land-classification codes (super admin can override).
+const SUGGESTED_CLASS_COLORS: Record<string, string> = {
+  'A1': '#1b5e20', 'A2': '#66bb6a', 'B1': '#1565c0', 'B2': '#00bcd4',
+  'B2-PRIVATE': '#7b1fa2', 'B3': '#ef6c00', 'B4': '#795548', 'C': '#d32f2f',
+  'FREE HOLD': '#fdd835', 'FREEHOLD': '#fdd835', 'NIL': '#9e9e9e',
+  'PVT': '#ec407a', [CLASS_NULL_KEY]: '#e0e0e0',
+}
+// Fallback rotating palette for values not in the suggested map.
+const CLASS_PALETTE = [
+  '#1b5e20', '#1565c0', '#ef6c00', '#6a1b9a', '#00838f', '#c62828',
+  '#558b2f', '#4527a0', '#ad1457', '#00695c', '#e65100', '#283593',
+]
+function suggestColor(value: string, idx: number): string {
+  const k = (value || '').toUpperCase().trim()
+  return SUGGESTED_CLASS_COLORS[k] || CLASS_PALETTE[idx % CLASS_PALETTE.length]
 }
 
 interface TableColumn {
@@ -83,6 +125,7 @@ const GEOM_COLOR: Record<string, string> = {
 
 export default function ExternalDatabasePage() {
   const qc = useQueryClient()
+  const { t } = useTranslation()
   const [dbModalOpen, setDbModalOpen]     = useState(false)
   const [editingDb,   setEditingDb]       = useState<ExtDB | null>(null)
   const [dbForm]                           = Form.useForm()
@@ -99,16 +142,58 @@ export default function ExternalDatabasePage() {
   const [testingId, setTestingId]  = useState<number | null>(null)
   const [syncingId,  setSyncingId]  = useState<number | null>(null)
 
-  // Office-filter configuration modal
-  const [filterLayer,    setFilterLayer]    = useState<ExtLayer | null>(null)
-  const [filterCols,     setFilterCols]     = useState<TableColumn[]>([])
-  const [filterColsLoad, setFilterColsLoad] = useState(false)
-  const [filterField,    setFilterField]    = useState<string>('')
-  const [savingFilter,   setSavingFilter]   = useState(false)
+  // Per-level office-filter configuration modal
+  const [filterLayer,       setFilterLayer]       = useState<ExtLayer | null>(null)
+  const [filterCols,        setFilterCols]        = useState<TableColumn[]>([])
+  const [filterColsLoad,    setFilterColsLoad]    = useState(false)
+  // Draft state: per-level map + legacy fallback field
+  const [levelFields,       setLevelFields]       = useState<LevelFilterFields>({})
+  const [defaultFilterField, setDefaultFilterField] = useState<string>('')
+  const [cantonmentScope,   setCantonmentScope]   = useState<'INSIDE' | 'OUTSIDE'>('OUTSIDE')
+  const [savingFilter,      setSavingFilter]      = useState(false)
+
+  // Analysis columns configuration modal
+  const [analysisLayer,     setAnalysisLayer]     = useState<ExtLayer | null>(null)
+  const [analysisCols,      setAnalysisCols]      = useState<TableColumn[]>([])
+  const [analysisColsLoad,  setAnalysisColsLoad]  = useState(false)
+  const [selectedAnalysisCols, setSelectedAnalysisCols] = useState<string[]>([])
+  const [savingAnalysis,    setSavingAnalysis]    = useState(false)
+
+  async function openAnalysisConfig(layer: ExtLayer) {
+    setAnalysisLayer(layer)
+    setSelectedAnalysisCols(layer.analysis_columns ?? [])
+    setAnalysisCols([])
+    setAnalysisColsLoad(true)
+    try {
+      const r = await api.get(`/external/layers/${layer.id}/columns/`)
+      setAnalysisCols(r.data)
+    } catch {
+      message.error('Could not load columns')
+    } finally {
+      setAnalysisColsLoad(false)
+    }
+  }
+
+  async function saveAnalysisConfig() {
+    if (!analysisLayer) return
+    setSavingAnalysis(true)
+    try {
+      await api.patch(`/external/layers/${analysisLayer.id}/`, { analysis_columns: selectedAnalysisCols })
+      qc.invalidateQueries({ queryKey: ['ext-layers'] })
+      message.success('Analysis columns saved')
+      setAnalysisLayer(null)
+    } catch {
+      message.error('Save failed')
+    } finally {
+      setSavingAnalysis(false)
+    }
+  }
 
   async function openFilterConfig(layer: ExtLayer) {
     setFilterLayer(layer)
-    setFilterField(layer.office_filter_field || '')
+    setLevelFields(layer.level_filter_fields || {})
+    setDefaultFilterField(layer.office_filter_field || '')
+    setCantonmentScope(layer.cantonment_scope || 'OUTSIDE')
     setFilterCols([])
     setFilterColsLoad(true)
     try {
@@ -121,20 +206,137 @@ export default function ExternalDatabasePage() {
     }
   }
 
+  function setLevelField(level: string, col: string) {
+    setLevelFields(prev => ({ ...prev, [level]: col }))
+  }
+
   async function saveFilterConfig() {
     if (!filterLayer) return
     setSavingFilter(true)
+    // Strip empty-string entries so the backend JSON stays clean
+    const cleaned: LevelFilterFields = {}
+    for (const [k, v] of Object.entries(levelFields)) {
+      if (v) cleaned[k] = v
+    }
     try {
-      await api.patch(`/external/layers/${filterLayer.id}/`, { office_filter_field: filterField })
-      message.success(filterField
-        ? `Office filter set to "${filterField}"`
-        : 'Office filter cleared — all users see all rows')
+      await api.patch(`/external/layers/${filterLayer.id}/`, {
+        level_filter_fields: cleaned,
+        office_filter_field: defaultFilterField.trim(),
+        cantonment_scope: cantonmentScope,
+      })
+      const configuredCount = Object.keys(cleaned).length
+      message.success(configuredCount || defaultFilterField
+        ? `Filter saved (${configuredCount} level(s) + ${defaultFilterField ? 'default set' : 'no default'})`
+        : 'All filters cleared — all users see all rows')
       qc.invalidateQueries({ queryKey: ['ext-layers'] })
       setFilterLayer(null)
     } catch (err: any) {
       message.error(err?.response?.data?.detail || 'Save failed')
     } finally {
       setSavingFilter(false)
+    }
+  }
+
+  // Classification (thematic rendering) configuration modal
+  const [classLayer,      setClassLayer]      = useState<ExtLayer | null>(null)
+  const [classCols,       setClassCols]       = useState<TableColumn[]>([])
+  const [classColsLoad,   setClassColsLoad]   = useState(false)
+  const [classField,      setClassField]      = useState<string>('')
+  // Draft colour map: { value: { color, opacity } }
+  const [classColors,     setClassColors]     = useState<Record<string, { color: string; opacity: number }>>({})
+  const [classValsLoad,   setClassValsLoad]   = useState(false)
+  const [savingClass,     setSavingClass]     = useState(false)
+  // INSIDE-cantonment render choice + flat colour (for Outside / Inside-Others)
+  const [insideType,      setInsideType]      = useState<'GLR_PLAN' | 'OTHERS'>('OTHERS')
+  const [flatColor,       setFlatColor]       = useState<string>('#ff6600')
+  const [flatOpacity,     setFlatOpacity]     = useState<number>(0.4)
+
+  async function openClassConfig(layer: ExtLayer) {
+    setClassLayer(layer)
+    setClassField(layer.classification_field || '')
+    setInsideType(layer.inside_render_type || (layer.classification_field ? 'GLR_PLAN' : 'OTHERS'))
+    const st = (layer.style || {}) as { color?: string; opacity?: number }
+    setFlatColor(st.color || '#ff6600')
+    setFlatOpacity(st.opacity == null ? 0.4 : st.opacity)
+    const existing: Record<string, { color: string; opacity: number }> = {}
+    for (const [k, v] of Object.entries(layer.classification_colors || {})) {
+      existing[k] = { color: v.color || '#bdbdbd', opacity: v.opacity == null ? 0.6 : v.opacity }
+    }
+    setClassColors(existing)
+    setClassCols([])
+    setClassColsLoad(true)
+    try {
+      const r = await api.get(`/external/layers/${layer.id}/columns/`)
+      setClassCols(r.data)
+    } catch {
+      message.error('Could not load columns')
+    } finally {
+      setClassColsLoad(false)
+    }
+  }
+
+  // Pull distinct values for the chosen field and auto-assign suggested colours.
+  async function autoGenerateClassColors() {
+    if (!classLayer || !classField) {
+      message.warning('Select a classification field first.')
+      return
+    }
+    setClassValsLoad(true)
+    try {
+      const r = await api.get(`/external/layers/${classLayer.id}/distinct-values/`, {
+        params: { field: classField },
+      })
+      const values: string[] = r.data.values || []
+      setClassColors(prev => {
+        const next = { ...prev }
+        values.forEach((v, i) => {
+          if (!next[v]) next[v] = { color: suggestColor(v, i), opacity: 0.6 }
+        })
+        if (!next[CLASS_NULL_KEY]) next[CLASS_NULL_KEY] = { color: '#e0e0e0', opacity: 0.5 }
+        return next
+      })
+      message.success(`Loaded ${values.length} value(s)`)
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || 'Could not load distinct values')
+    } finally {
+      setClassValsLoad(false)
+    }
+  }
+
+  function setClassColor(value: string, patch: Partial<{ color: string; opacity: number }>) {
+    setClassColors(prev => ({ ...prev, [value]: { ...prev[value], ...patch } }))
+  }
+  function removeClassValue(value: string) {
+    setClassColors(prev => { const n = { ...prev }; delete n[value]; return n })
+  }
+
+  async function saveClassConfig() {
+    if (!classLayer) return
+    // Classification colouring is available only for INSIDE + GLR Plan.
+    const useClassification = classLayer.cantonment_scope === 'INSIDE' && insideType === 'GLR_PLAN'
+    setSavingClass(true)
+    try {
+      const payload: Record<string, unknown> = classLayer.cantonment_scope === 'INSIDE'
+        ? { inside_render_type: insideType } : {}
+      if (useClassification) {
+        payload.classification_field = classField.trim()
+        payload.classification_colors = classField.trim() ? classColors : {}
+      } else {
+        // Flat single colour + opacity; clear any classification config.
+        payload.classification_field = ''
+        payload.classification_colors = {}
+        payload.style = { color: flatColor, opacity: flatOpacity }
+      }
+      await api.patch(`/external/layers/${classLayer.id}/`, payload)
+      qc.invalidateQueries({ queryKey: ['ext-layers'] })
+      message.success(useClassification
+        ? 'Classification rendering saved — reload the map to see it'
+        : 'Colour saved — reload the map to see it')
+      setClassLayer(null)
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || 'Save failed')
+    } finally {
+      setSavingClass(false)
     }
   }
 
@@ -155,10 +357,10 @@ export default function ExternalDatabasePage() {
     try {
       if (editingDb) {
         await api.patch(`/external/databases/${editingDb.id}/`, values)
-        message.success('Database updated')
+        message.success(t('common.updated'))
       } else {
         await api.post('/external/databases/', values)
-        message.success('Database added')
+        message.success(t('common.created'))
       }
       qc.invalidateQueries({ queryKey: ['ext-databases'] })
       setDbModalOpen(false)
@@ -243,7 +445,7 @@ export default function ExternalDatabasePage() {
   async function saveLayer(values: Record<string, unknown>) {
     try {
       await api.post('/external/layers/', values)
-      message.success('Layer registered')
+      message.success(t('common.created'))
       qc.invalidateQueries({ queryKey: ['ext-layers'] })
       setLayerModalOpen(false)
       layerForm.resetFields()
@@ -254,7 +456,7 @@ export default function ExternalDatabasePage() {
 
   const deleteLayerMut = useMutation({
     mutationFn: (id: number) => api.delete(`/external/layers/${id}/`),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['ext-layers'] }); message.success('Removed') },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['ext-layers'] }); message.success(t('common.deleted')) },
   })
 
   // ── Column definitions ────────────────────────────────────────────────────
@@ -289,11 +491,11 @@ export default function ExternalDatabasePage() {
         <Space size={4} wrap>
           <Tooltip title="Test connection">
             <Button size="small" icon={<ApiOutlined />} loading={testingId === row.id}
-              onClick={() => testConnection(row)}>Test</Button>
+              onClick={() => testConnection(row)}>{t("external.test")}</Button>
           </Tooltip>
           <Tooltip title="Import mst_office → Organisations">
             <Button size="small" icon={<SyncOutlined />} loading={syncingId === row.id}
-              onClick={() => syncOrgs(row)}>Sync Orgs</Button>
+              onClick={() => syncOrgs(row)}>{t("external.sync_orgs")}</Button>
           </Tooltip>
           <Tooltip title="Browse spatial tables">
             <Button size="small" icon={<TableOutlined />} onClick={() => browseTables(row)}>
@@ -332,18 +534,39 @@ export default function ExternalDatabasePage() {
     { title: 'Features', dataIndex: 'feature_count', width: 80, align: 'right',
       render: v => v != null ? v.toLocaleString() : '—' },
     {
-      title: 'Office Filter', width: 150,
-      render: (_, row) => row.office_filter_field
-        ? <Tag color="purple" style={{ fontSize: 11 }}>{row.office_filter_field}</Tag>
-        : <Tag color="default" style={{ fontSize: 11 }}>All users see all</Tag>,
+      title: 'Level Filters', width: 200,
+      render: (_, row) => {
+        const lf = row.level_filter_fields || {}
+        const entries = FILTERABLE_LEVELS.filter(l => lf[l.key])
+        if (entries.length === 0)
+          return <Tag color="default" style={{ fontSize: 10 }}>All users see all rows</Tag>
+        return (
+          <Space size={2} wrap>
+            {entries.map(l => (
+              <Tag key={l.key} color={LEVEL_TAG_COLOR[l.key] ?? 'default'} style={{ fontSize: 10 }}>
+                {l.key}:{lf[l.key]}
+              </Tag>
+            ))}
+          </Space>
+        )
+      },
     },
     {
-      title: 'Actions', width: 130,
+      title: 'Actions', width: 200,
       render: (_, row) => (
         <Space>
+          <Tooltip title="Configure analysis columns (shown in Intersecting/Nearby tables)">
+            <Button size="small" icon={<BarChartOutlined />}
+              onClick={() => openAnalysisConfig(row)} />
+          </Tooltip>
           <Tooltip title="Configure office data filter">
             <Button size="small" icon={<FilterOutlined />}
               onClick={() => openFilterConfig(row)} />
+          </Tooltip>
+          <Tooltip title="Classification-based colour rendering">
+            <Button size="small" icon={<BgColorsOutlined />}
+              type={row.classification_field ? 'primary' : 'default'}
+              onClick={() => openClassConfig(row)} />
           </Tooltip>
           <Tooltip title="Refresh stats from external DB">
             <Button size="small" icon={<SyncOutlined />}
@@ -386,7 +609,7 @@ export default function ExternalDatabasePage() {
         return alreadyAdded
           ? <Tag color="green">Added ✓</Tag>
           : <Button size="small" type="primary" icon={<PlusOutlined />}
-              onClick={() => addLayerFromTable(row)}>Add to Map</Button>
+              onClick={() => addLayerFromTable(row)}>{t("external.add_to_map")}</Button>
       },
     },
   ]
@@ -532,15 +755,65 @@ export default function ExternalDatabasePage() {
         </Form>
       </Modal>
 
-      {/* ── Office Data Filter Modal ──────────────────────────────────────── */}
+      {/* ── Analysis Columns Modal ────────────────────────────────────────── */}
       <Modal
-        title={<Space><FilterOutlined />Configure Office Data Filter</Space>}
+        title={<Space><BarChartOutlined />Configure Analysis Columns</Space>}
+        open={!!analysisLayer}
+        onCancel={() => setAnalysisLayer(null)}
+        onOk={saveAnalysisConfig}
+        confirmLoading={savingAnalysis}
+        okText="Save Columns"
+        width={560}
+      >
+        {analysisLayer && (
+          <div style={{ marginTop: 8 }}>
+            <Alert
+              type="info" showIcon style={{ marginBottom: 16 }}
+              message={`Layer: ${analysisLayer.display_name}`}
+              description={
+                <span style={{ fontSize: 12 }}>
+                  Select which columns from this external table appear as columns in the
+                  <b> Intersecting Defence Parcels</b> and{' '}
+                  <b>Nearby Defence Parcels within __ km</b> analysis result tables.
+                  Leave empty to show the first 5 available columns automatically.
+                </span>
+              }
+            />
+            {analysisColsLoad
+              ? <div style={{ textAlign: 'center', padding: 24 }}><Spin /></div>
+              : (
+                <Select
+                  mode="multiple"
+                  style={{ width: '100%' }}
+                  placeholder="Leave empty to auto-show first 5 columns"
+                  value={selectedAnalysisCols}
+                  onChange={setSelectedAnalysisCols}
+                  optionFilterProp="label"
+                  options={analysisCols.map(c => ({
+                    value: c.column_name,
+                    label: `${c.column_name}  (${c.data_type})`,
+                  }))}
+                />
+              )
+            }
+            {selectedAnalysisCols.length > 0 && (
+              <div style={{ marginTop: 10, fontSize: 12, color: '#888' }}>
+                <strong>Will show:</strong> {selectedAnalysisCols.join(' · ')}
+              </div>
+            )}
+          </div>
+        )}
+      </Modal>
+
+      {/* ── Per-Level Office Filter Modal ─────────────────────────────────── */}
+      <Modal
+        title={<Space><FilterOutlined />{t("external.filter_title")}</Space>}
         open={!!filterLayer}
         onCancel={() => setFilterLayer(null)}
         onOk={saveFilterConfig}
         confirmLoading={savingFilter}
-        okText="Save Filter"
-        width={540}
+        okText={t("external.save_filters")}
+        width={580}
       >
         {filterLayer && (
           <div style={{ marginTop: 8 }}>
@@ -549,38 +822,233 @@ export default function ExternalDatabasePage() {
               message={`Layer: ${filterLayer.display_name}`}
               description={
                 <span style={{ fontSize: 12 }}>
-                  Choose the column holding the <b>office code</b> (e.g. officeid).
-                  Each non-DGDE user then sees only rows matching their own office and
-                  the offices beneath it. <b>DGDE-level users and super admins always see
-                  all rows.</b> Leave blank to disable filtering.
+                  For each level, pick the <b>column in the external table</b> whose value
+                  must match the user's office code.  Users see only rows for their own
+                  office and all offices beneath it in the hierarchy.
+                  <br />
+                  Leave a level blank to fall through to the <b>Default</b> column (if set),
+                  or show all rows if no default is configured.
+                  <b> Super Admin always sees all rows.</b>
                 </span>
               }
             />
-            <div style={{ marginBottom: 8, color: '#888', fontSize: 12 }}>Office filter field</div>
-            <Select
-              showSearch allowClear
-              loading={filterColsLoad}
-              value={filterField || undefined}
-              placeholder="Select a column (blank = no filter)"
-              style={{ width: '100%' }}
-              onChange={(v) => setFilterField(v || '')}
-              optionFilterProp="label"
-              options={filterCols.map(c => ({
-                value: c.column_name,
-                label: `${c.column_name}  (${c.data_type})`,
-              }))}
-            />
-            <div style={{ marginTop: 16, padding: 12, background: '#f6f6ff', borderRadius: 4, fontSize: 12, color: '#555' }}>
-              <b>Filtering by login level:</b>
-              <ul style={{ margin: '6px 0 0 18px', padding: 0 }}>
-                <li><b>DGDE</b> — all rows (no filter)</li>
-                <li><b>PDDE / DEO / CEO / ADEO</b> — only rows whose
-                  {' '}<Text code style={{ fontSize: 11 }}>{filterField || '(field)'}</Text>{' '}
-                  matches their office or a subordinate office</li>
-              </ul>
+
+            {/* Inside / Outside cantonment scope */}
+            <div style={{ marginBottom: 16 }}>
+              <Text strong style={{ fontSize: 12, color: '#888', display: 'block', marginBottom: 6 }}>
+                Data Scope
+              </Text>
+              <Radio.Group
+                value={cantonmentScope}
+                onChange={(e) => setCantonmentScope(e.target.value)}
+                optionType="button" buttonStyle="solid"
+              >
+                <Radio.Button value="OUTSIDE">Outside Cantonment</Radio.Button>
+                <Radio.Button value="INSIDE">Inside Cantonment</Radio.Button>
+              </Radio.Group>
+              <div style={{ fontSize: 11, color: '#888', marginTop: 6 }}>
+                {cantonmentScope === 'INSIDE'
+                  ? 'Rows are keyed by cantonment (CB) office code. PDDE → cantonments it controls; DEO → cantonments parented under it; CEO → its own cantonment. DGDE sees all.'
+                  : 'Rows are filtered by the user\'s office and everything beneath it in the hierarchy.'}
+              </div>
+            </div>
+
+            <Divider style={{ margin: '4px 0 12px' }} />
+
+            {/* Header */}
+            <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr', gap: 8, marginBottom: 8 }}>
+              <Text strong style={{ fontSize: 12, color: '#888' }}>Level</Text>
+              <Text strong style={{ fontSize: 12, color: '#888' }}>Filter Column in External Table</Text>
+            </div>
+
+            {/* Super Admin — always unrestricted */}
+            <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+              <Tag color="purple" style={{ width: 'fit-content' }}>Super Admin</Tag>
+              <Text type="secondary" style={{ fontSize: 12 }}>No filter — always sees all rows</Text>
+            </div>
+
+            <Divider style={{ margin: '4px 0 12px' }} />
+
+            {/* One select per org level */}
+            {filterColsLoad
+              ? <div style={{ textAlign: 'center', padding: 20 }}><Spin /></div>
+              : FILTERABLE_LEVELS.map(({ key, label }) => (
+                <div key={key} style={{ display: 'grid', gridTemplateColumns: '160px 1fr', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+                  <Tag color={LEVEL_TAG_COLOR[key] ?? 'default'} style={{ width: 'fit-content' }}>{label}</Tag>
+                  <Select
+                    showSearch allowClear
+                    value={levelFields[key] || undefined}
+                    placeholder="— use Default below —"
+                    style={{ width: '100%' }}
+                    onChange={(v) => setLevelField(key, v || '')}
+                    optionFilterProp="label"
+                    options={filterCols.map(c => ({
+                      value: c.column_name,
+                      label: `${c.column_name}  (${c.data_type})`,
+                    }))}
+                  />
+                </div>
+              ))
+            }
+
+            <Divider style={{ margin: '8px 0 12px' }} />
+
+            {/* Default / fallback field */}
+            <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr', gap: 8, alignItems: 'center' }}>
+              <div>
+                <Tag color="default" style={{ width: 'fit-content' }}>Default</Tag>
+                <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>Fallback for levels not set above</div>
+              </div>
+              <Select
+                showSearch allowClear
+                value={defaultFilterField || undefined}
+                placeholder="— no default (all rows if level blank) —"
+                style={{ width: '100%' }}
+                onChange={(v) => setDefaultFilterField(v || '')}
+                optionFilterProp="label"
+                disabled={filterColsLoad}
+                options={filterCols.map(c => ({
+                  value: c.column_name,
+                  label: `${c.column_name}  (${c.data_type})`,
+                }))}
+              />
             </div>
           </div>
         )}
+      </Modal>
+
+      {/* ── Layer rendering config (flat colour, or classification for GLR Plan) ─ */}
+      <Modal
+        title={<Space><BgColorsOutlined />Layer Rendering</Space>}
+        open={!!classLayer}
+        onCancel={() => setClassLayer(null)}
+        onOk={saveClassConfig}
+        confirmLoading={savingClass}
+        okText="Save Rendering"
+        width={620}
+      >
+        {classLayer && (() => {
+          const isInside = classLayer.cantonment_scope === 'INSIDE'
+          const showClassification = isInside && insideType === 'GLR_PLAN'
+          return (
+            <div style={{ marginTop: 8 }}>
+              <Alert
+                type="info" showIcon style={{ marginBottom: 16 }}
+                message={`Layer: ${classLayer.display_name} · ${isInside ? 'Inside Cantonment' : 'Outside Cantonment'}`}
+                description={
+                  <span style={{ fontSize: 12 }}>
+                    {isInside
+                      ? 'Choose GLR Plan for classification-based colouring, or Others for a single flat colour.'
+                      : 'Outside-cantonment layers use a single flat colour with opacity.'}
+                  </span>
+                }
+              />
+
+              {/* Inside-cantonment: GLR Plan vs Others */}
+              {isInside && (
+                <div style={{ marginBottom: 16 }}>
+                  <Text strong style={{ fontSize: 12, color: '#888', display: 'block', marginBottom: 6 }}>
+                    Rendering Type
+                  </Text>
+                  <Radio.Group
+                    value={insideType}
+                    onChange={(e) => setInsideType(e.target.value)}
+                    optionType="button" buttonStyle="solid"
+                  >
+                    <Radio.Button value="GLR_PLAN">GLR Plan</Radio.Button>
+                    <Radio.Button value="OTHERS">Others</Radio.Button>
+                  </Radio.Group>
+                </div>
+              )}
+
+              {showClassification ? (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: '150px 1fr', gap: 8, alignItems: 'center', marginBottom: 12 }}>
+                    <Text strong style={{ fontSize: 12, color: '#888' }}>Classification Field</Text>
+                    <Select
+                      showSearch allowClear
+                      value={classField || undefined}
+                      placeholder="— select attribute column —"
+                      style={{ width: '100%' }}
+                      onChange={(v) => setClassField(v || '')}
+                      optionFilterProp="label"
+                      disabled={classColsLoad}
+                      options={classCols.map(c => ({
+                        value: c.column_name,
+                        label: `${c.column_name}  (${c.data_type})`,
+                      }))}
+                    />
+                  </div>
+
+                  <Space style={{ marginBottom: 12 }}>
+                    <Button type="primary" ghost loading={classValsLoad}
+                      disabled={!classField}
+                      onClick={autoGenerateClassColors}>
+                      Auto-generate from data
+                    </Button>
+                    {Object.keys(classColors).length > 0 && (
+                      <Button danger onClick={() => setClassColors({})}>Clear all</Button>
+                    )}
+                  </Space>
+
+                  {Object.keys(classColors).length > 0 && (
+                    <>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 70px 90px 32px', gap: 8, marginBottom: 6 }}>
+                        <Text strong style={{ fontSize: 12, color: '#888' }}>Value</Text>
+                        <Text strong style={{ fontSize: 12, color: '#888' }}>Colour</Text>
+                        <Text strong style={{ fontSize: 12, color: '#888' }}>Opacity</Text>
+                        <span />
+                      </div>
+                      <div style={{ maxHeight: 320, overflowY: 'auto' }}>
+                        {Object.entries(classColors).map(([value, cfg]) => (
+                          <div key={value} style={{ display: 'grid', gridTemplateColumns: '1fr 70px 90px 32px', gap: 8, alignItems: 'center', marginBottom: 6 }}>
+                            <Tag style={{ width: 'fit-content' }}>
+                              {value === CLASS_NULL_KEY ? 'Null / Others' : value}
+                            </Tag>
+                            <input
+                              type="color"
+                              value={cfg.color}
+                              onChange={(e) => setClassColor(value, { color: e.target.value })}
+                              style={{ width: 60, height: 28, border: 'none', background: 'none', cursor: 'pointer' }}
+                            />
+                            <InputNumber
+                              size="small" min={0} max={1} step={0.1}
+                              value={cfg.opacity}
+                              onChange={(v) => setClassColor(value, { opacity: v ?? 0.6 })}
+                              style={{ width: 80 }}
+                            />
+                            <Button size="small" type="text" danger icon={<DeleteOutlined />}
+                              onClick={() => removeClassValue(value)} />
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </>
+              ) : (
+                /* Flat single colour + opacity (Outside, or Inside → Others) */
+                <div style={{ display: 'grid', gridTemplateColumns: '150px 80px 1fr', gap: 12, alignItems: 'center' }}>
+                  <Text strong style={{ fontSize: 12, color: '#888' }}>Fill Colour</Text>
+                  <input
+                    type="color"
+                    value={flatColor}
+                    onChange={(e) => setFlatColor(e.target.value)}
+                    style={{ width: 70, height: 32, border: 'none', background: 'none', cursor: 'pointer' }}
+                  />
+                  <span />
+                  <Text strong style={{ fontSize: 12, color: '#888' }}>Opacity</Text>
+                  <InputNumber
+                    size="small" min={0} max={1} step={0.1}
+                    value={flatOpacity}
+                    onChange={(v) => setFlatOpacity(v ?? 0.4)}
+                    style={{ width: 80 }}
+                  />
+                  <span />
+                </div>
+              )}
+            </div>
+          )
+        })()}
       </Modal>
     </div>
   )

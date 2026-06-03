@@ -132,6 +132,22 @@ def org_queryset_filter(user, qs, org_field='organisation'):
     return qs.filter(**{org_field: user.organisation})
 
 
+def deo_subordinate_org_ids(user) -> list:
+    """
+    For a user whose office is at DEO level, return the IDs of all subordinate
+    organisations (CEO/ADEO children + their descendants) — i.e. the office subtree
+    excluding the DEO's own org. Returns [] for any non-DEO-level user.
+
+    These are the orgs whose *opt-in* (deo_visible=True) datasets the DEO may view,
+    in addition to the DEO's own data and any explicit ProjectShare / approved-area grants.
+    """
+    from .models import Organisation
+    org = getattr(user, 'organisation', None)
+    if org is None or org.level != Organisation.DEO:
+        return []
+    return [oid for oid in org.get_subtree_ids() if oid != org.id]
+
+
 def get_shared_project_ids(user) -> list:
     """Return IDs of projects shared to the user's org via ProjectShare grants."""
     from apps.survey_projects.models import ProjectShare

@@ -1,4 +1,5 @@
 from rest_framework import viewsets, permissions
+from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -51,6 +52,14 @@ class BasemapConfigViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("System basemap configurations cannot be deleted.")
         instance.delete()
 
+    @action(detail=True, methods=['post'], permission_classes=[IsSuperAdmin])
+    def set_default(self, request, pk=None):
+        """Mark this basemap as the single default (and ensure it is active)."""
+        basemap = self.get_object()
+        basemap.is_default = True
+        basemap.save()  # model.save() activates it and clears any other default
+        return Response(BasemapConfigSerializer(basemap).data)
+
 
 class TerrainConfigView(APIView):
     """Return terrain / Cesium configuration (read-only, authenticated)."""
@@ -85,12 +94,89 @@ logger = logging.getLogger(__name__)
 @api_view(['POST'])
 @permission_classes([permissions.IsAuthenticated])
 def export_map(request):
-    """Deprecated: Mapnik PNG export replaced by Playwright PDF at /api/core/print-pdf/."""
-    return JsonResponse({
-        'error': 'This endpoint is no longer available.',
-        'detail': 'Mapnik PNG export has been replaced by the Playwright PDF service. '
-                  'Use POST /api/core/print-pdf/ instead.',
-    }, status=410)
+    """
+    Render map to PNG using Mapnik under Python 3.13 system subprocess.
+    Includes Living Provenance DNA watermarking in the output.
+    """
+    import subprocess
+    import os
+    import time
+    from django.conf import settings
+    from apps.core.watermark import embed_watermark
+
+    data = request.data
+    try:
+        width = int(data.get('width', 1200))
+        height = int(data.get('height', 800))
+        zoom = float(data.get('zoom', 10))
+        center_lon = float(data.get('center_lon', 78.0))
+        center_lat = float(data.get('center_lat', 20.0))
+        style = str(data.get('style', 'boundaries'))
+    except (ValueError, TypeError) as exc:
+        return JsonResponse({
+            'error': 'Invalid parameters',
+            'detail': str(exc)
+        }, status=400)
+
+    # Build command line to execute the render_mapnik.py script using python3
+    cmd = [
+        "/usr/bin/python3",
+        "apps/core/render_mapnik.py",
+        "--style", style,
+        "--width", str(width),
+        "--height", str(height),
+        "--zoom", str(zoom),
+        "--center-lon", str(center_lon),
+        "--center-lat", str(center_lat),
+        "--format", "png"
+    ]
+
+    try:
+        # Run subprocess with environment variables preserved
+        env = os.environ.copy()
+        
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            check=True
+        )
+        png_bytes = result.stdout
+        
+        # Apply Living Provenance DNA watermarking
+        filename = f"rakshagis_map_{style}_{int(time.time())}.png"
+        metadata = {
+            "uploaded_by": request.user.username,
+            "export_format": "png",
+            "style": style,
+            "zoom": zoom,
+            "center_lon": center_lon,
+            "center_lat": center_lat,
+        }
+        try:
+            watermarked_png = embed_watermark(png_bytes, filename, 'image/png', metadata)
+        except Exception as wexc:
+            logger.error(f"Failed to embed watermark in map export: {wexc}")
+            watermarked_png = png_bytes
+
+        response = HttpResponse(watermarked_png, content_type='image/png')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
+    except subprocess.CalledProcessError as exc:
+        stderr_msg = exc.stderr.decode('utf-8', errors='ignore')
+        logger.error(f"Mapnik rendering subprocess failed: {stderr_msg}")
+        return JsonResponse({
+            'error': 'Mapnik rendering failed',
+            'detail': stderr_msg.strip() or 'Unknown error in rendering subprocess.'
+        }, status=500)
+    except Exception as exc:
+        logger.exception("Failed to run mapnik rendering")
+        return JsonResponse({
+            'error': 'Export failed',
+            'detail': str(exc)
+        }, status=500)
+
 
 
 @api_view(['GET'])
@@ -161,12 +247,19 @@ def print_pdf(request):
         data = request.data
 
         map_b64 = data.get('map_image_b64', '')
-        if not map_b64:
-            return JsonResponse({'error': 'map_image_b64 is required'}, status=400)
+        basemap_b64 = data.get('basemap_image_b64', '')
+        features_b64 = data.get('features_image_b64', '')
+
+        if not map_b64 and not basemap_b64 and not features_b64:
+            return JsonResponse({'error': 'map_image_b64 or split layer images are required'}, status=400)
 
         # Strip data-URL prefix if the frontend included it
-        if ',' in map_b64:
+        if map_b64 and ',' in map_b64:
             map_b64 = map_b64.split(',', 1)[1]
+        if basemap_b64 and ',' in basemap_b64:
+            basemap_b64 = basemap_b64.split(',', 1)[1]
+        if features_b64 and ',' in features_b64:
+            features_b64 = features_b64.split(',', 1)[1]
 
         paper_size  = data.get('paper_size', 'A4')
         orientation = data.get('orientation', 'landscape')
@@ -178,6 +271,8 @@ def print_pdf(request):
 
         html = generate_arcgis_print_html(
             map_image_b64    = map_b64,
+            basemap_image_b64= basemap_b64,
+            features_image_b64= features_b64,
             title            = str(data.get('title', 'Map')),
             subtitle         = str(data.get('subtitle', '')),
             org_name         = str(data.get('org_name', '')),
@@ -225,7 +320,24 @@ def print_pdf(request):
         filename   = f"{safe_title.strip().replace(' ', '_')}_{paper_size}_{orientation}.pdf"
 
         from django.http import HttpResponse
-        response = HttpResponse(pw_response.content, content_type='application/pdf')
+        from apps.core.watermark import embed_watermark
+        metadata = {
+            "uploaded_by": request.user.username,
+            "export_format": "pdf",
+            "paper_size": paper_size,
+            "orientation": orientation,
+        }
+        layers = data.get('layers')
+        if layers:
+            metadata['layers'] = layers
+
+        try:
+            pdf_bytes = embed_watermark(pw_response.content, filename, 'application/pdf', metadata)
+        except Exception as wexc:
+            logger.error(f"Failed to embed watermark in printed PDF: {wexc}")
+            pdf_bytes = pw_response.content
+
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
         response['Cache-Control'] = 'no-store'
 
@@ -238,3 +350,45 @@ def print_pdf(request):
     except Exception as exc:
         logger.exception('print_pdf error')
         return JsonResponse({'error': 'Print failed', 'detail': str(exc)}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def watermark_file(request):
+    """
+    POST /api/core/watermark-file/
+    Receives any file (PDF, PNG, etc.), applies the LP-DNA/C2PA watermark, and returns it.
+    """
+    uploaded_file = request.FILES.get('file')
+    if not uploaded_file:
+        return JsonResponse({'error': 'No file uploaded'}, status=400)
+
+    filename = uploaded_file.name or 'export_file'
+    mime_type = uploaded_file.content_type
+
+    try:
+        import json
+        from apps.core.watermark import embed_watermark
+        metadata = {
+            "uploaded_by": request.user.username,
+            "export_format": filename.split('.')[-1].lower() if '.' in filename else 'bin',
+            "source": "RakshaGIS/DEMAP",
+            "client_exported": True
+        }
+        layers_raw = request.POST.get('layers')
+        if layers_raw:
+            try:
+                metadata['layers'] = json.loads(layers_raw)
+            except Exception:
+                pass
+        file_bytes = uploaded_file.read()
+        watermarked_bytes = embed_watermark(file_bytes, filename, mime_type, metadata)
+
+        response = HttpResponse(watermarked_bytes, content_type=mime_type)
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        response['Cache-Control'] = 'no-store'
+        return response
+    except Exception as exc:
+        logger.exception("Failed to watermark client-exported file")
+        return JsonResponse({'error': 'Watermarking failed', 'detail': str(exc)}, status=500)
+

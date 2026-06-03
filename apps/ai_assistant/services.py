@@ -297,6 +297,14 @@ class LLMService:
             },
             timeout=300,  # Vision models are slow
         )
+        if r.status_code == 404:
+            # Ollama returns 404 when the model is not installed
+            err_msg = r.json().get('error', '') if r.headers.get('content-type', '').startswith('application/json') else ''
+            raise RuntimeError(
+                f"Vision model '{model}' not found in Ollama. "
+                f"Pull it first: ollama pull {model}  "
+                f"({'Ollama says: ' + err_msg if err_msg else 'Model not installed'})"
+            )
         r.raise_for_status()
         return r.json()['message']['content']
 

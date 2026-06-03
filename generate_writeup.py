@@ -497,53 +497,66 @@ for label, detail in [
 ]:
     add_bullet(doc, label, detail, ACCENT)
 
-# ── 6. Future Scope ───────────────────────────────────────────────────────────
-add_heading(doc, '6. Future Scope', level=1)
+# ── 6. Roadmap & Future Scope ─────────────────────────────────────────────────
+add_heading(doc, '6. Roadmap & Future Scope', level=1)
 
 add_body(doc,
-    'The current platform provides a strong foundation for defence estate management. '
-    'The following enhancements are planned or recommended for future iterations:')
+    'Several items originally identified as future scope have since been delivered. '
+    'The platform status is summarised below, followed by the enhancements that remain '
+    'planned for future iterations.')
 
+add_heading(doc, '6.1  Delivered Since Initial Scope', level=2)
+for label, detail in [
+    ('HTTPS with internal CA',
+     'Nginx TLS is wired up: the docker-compose "https" profile and certbot service are in place; '
+     'activate by supplying the DGDE internal Certificate Authority certificate.'),
+    ('Prometheus / Grafana monitoring',
+     'django-prometheus exposes metrics at /metrics/; Prometheus v2.55 and Grafana 11.4 ship in the '
+     '"monitoring" profile. Import of DGDE-specific dashboards is the remaining step.'),
+    ('Automated boundary dispute detection',
+     'Implemented as a pre-submission check: a PostGIS overlap query flags newly submitted features '
+     'that intersect PUBLISHED features from other organisations and records a DisputeReport.'),
+    ('Advanced AI integration',
+     'Parcel boundaries are auto-extracted from GeoTIFFs and scanned maps (classical GIS pipeline + '
+     'AI vision pipeline) with best-effort Survey-Number OCR; local-LLM training-export and '
+     'DGDE-expert model creation tooling is included for fine-tuning.'),
+    ('Admin boundary data load',
+     'State, district, taluk and village master tables with shapefile import enable spatial filtering '
+     'and boundary overlay on the map.'),
+    ('3D terrain and elevation overlay',
+     'A Cesium 3D viewer provides elevation query, profile and slope analysis over SRTM/Cartosat DEM, '
+     'with survey features and external layers draped on the terrain.'),
+    ('Real-time collaborative editing',
+     'WebSocket-based concurrent editing (Django Channels / Daphne) with live presence lets multiple '
+     'surveyors work on the same project simultaneously.'),
+    ('Multi-language UI',
+     'Localised into English, Hindi, Tamil, Telugu, Bengali, Kannada and Marathi.'),
+    ('Automated disaster-recovery backups',
+     'Scheduled, encrypted PostgreSQL dumps with automated rotation are in place (off-site replication '
+     'to NIC Meghraj remains optional/pending).'),
+    ('Regulatory reporting',
+     'Survey-area report generation (.docx, editable in OnlyOffice) and proximity / encroachment '
+     'analysis reports are delivered; ministry-prescribed template formats are in progress.'),
+]:
+    add_bullet(doc, label, detail, OLIVE)
+
+add_heading(doc, '6.2  Planned for Future Iterations', level=2)
 for label, detail in [
     ('Mobile field surveying app',
      'A Progressive Web App (PWA) or React Native client for GPS-assisted feature capture '
      'in the field with offline sync on reconnection.'),
-    ('HTTPS with internal CA',
-     'Activate Nginx TLS using a DGDE internal Certificate Authority certificate. '
-     'The docker-compose "https" profile and certbot service are already prepared.'),
-    ('Prometheus / Grafana dashboards',
-     'Configure Prometheus scrape targets and import DGDE-specific Grafana dashboards '
-     'for request rates, error rates, PostGIS query counts, and Celery queue depth.'),
-    ('Automated boundary dispute detection',
-     'Cross-project spatial analysis to flag when newly submitted features overlap with '
-     'PUBLISHED features from other organisations — surfaced as a pre-submission check.'),
-    ('Advanced AI integration',
-     'Fine-tuning the local LLM on historical DGDE survey documents for domain-specific accuracy; '
-     'adding vision models to auto-extract parcel boundaries from scanned paper maps.'),
-    ('Admin boundary data load',
-     'Import state, district, taluk, and village shapefiles into the master data tables '
-     'to enable spatial filtering and boundary overlay on the map.'),
-    ('3D terrain and elevation overlay',
-     'Integration of SRTM/Cartosat DEM data for 3D map views and slope/aspect analysis '
-     'using Cesium.js or OpenLayers 3D extensions.'),
-    ('Real-time collaborative editing',
-     'WebSocket-based concurrent feature editing with conflict resolution, enabling multiple '
-     'surveyors to work on the same project simultaneously.'),
     ('National land registry integration',
      'REST API connectors to DILRMP (Digital India Land Records Modernisation Programme) '
      'for cross-referencing defence parcels against state revenue records.'),
-    ('Multi-language UI',
-     'Localisation into Hindi and regional languages (Tamil, Telugu, Bengali, etc.) '
-     'to support field staff across different states.'),
     ('PKI / smart-card authentication',
-     'Integration with DGDE\'s internal PKI for mutual TLS client certificate login, '
+     'Integration with DGDE\'s internal PKI for mutual TLS client-certificate login, '
      'replacing password-based authentication for high-security operations.'),
-    ('Automated disaster-recovery backups',
-     'Scheduled encrypted PostgreSQL dumps with automated rotation and optional push '
-     'to NIC Meghraj cloud object storage for off-site recovery.'),
-    ('Regulatory report automation',
-     'Pre-built report templates that automatically compile survey statistics, ownership summaries, '
-     'and encroachment analysis into ministry-prescribed formats.'),
+    ('Off-site backup replication',
+     'Automated push of encrypted backups to NIC Meghraj cloud object storage for off-site recovery, '
+     'extending the existing local encrypted-backup rotation.'),
+    ('Ministry-format report templates',
+     'Pre-built templates that compile survey statistics, ownership summaries and encroachment '
+     'analysis into ministry-prescribed formats, building on the current reporting engine.'),
 ]:
     add_bullet(doc, label, detail, OLIVE)
 

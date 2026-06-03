@@ -10,6 +10,7 @@ import {
 } from '@ant-design/icons'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import type { ColumnsType } from 'antd/es/table'
+import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 import { useAppStore } from '@/app/store'
 import type { QGISUploadLog, SurveyProject } from '@/types'
@@ -41,12 +42,13 @@ export default function QGISSyncPage() {
   const qc = useQueryClient()
   const [projectFilter, setProjectFilter] = useState<number | null>(null)
   const [statusFilter, setStatusFilter]   = useState<string | null>(null)
+  const { t } = useTranslation()
   const [search, setSearch] = useState('')
 
   const retryMutation = useMutation({
     mutationFn: (id: number) => api.post(`/projects/qgis-uploads/${id}/retry/`),
     onSuccess: () => {
-      message.success('Retry requested — the uploader has been notified to re-run from QGIS.')
+      message.success(t('qgis.retry_sent'))
       qc.invalidateQueries({ queryKey: ['qgis-uploads-global'] })
     },
     onError: (err: any) => {
@@ -203,7 +205,7 @@ export default function QGISSyncPage() {
       render: (_: any, row: QGISUploadLog) =>
         row.status === 'FAILED' ? (
           <Popconfirm
-            title="Request a retry?"
+            title={t("qgis.retry_confirm")}
             description="The uploader will be notified to re-upload this file from QGIS."
             onConfirm={() => retryMutation.mutate(row.id)}
             okText="Yes"
@@ -278,7 +280,7 @@ export default function QGISSyncPage() {
           />
           <Input
             prefix={<SearchOutlined style={{ color: '#555' }} />}
-            placeholder="Search filename / module…"
+            placeholder={t("qgis.search_placeholder")}
             value={search}
             onChange={e => setSearch(e.target.value)}
             style={{ width: 240 }}

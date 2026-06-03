@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Table, Tabs, Tag, Typography, Select, DatePicker, Space, Row, Col, Tooltip } from 'antd'
 import { CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 import { useAppStore } from '@/app/store'
 
@@ -47,6 +48,7 @@ const EXPORT_TYPE_COLOR: Record<string, string> = {
 }
 
 function LoginAuditTab() {
+  const { t } = useTranslation()
   const [successFilter, setSuccessFilter] = useState<string>('')
   const { data, isLoading } = useQuery<{ results: LoginLog[] }>({
     queryKey: ['login-audit', successFilter],

@@ -25,6 +25,8 @@ export interface User {
   role: UserRole
   organisation: number | null
   organisation_name: string
+  organisation_level?: OrgLevel
+  organisation_level_display?: string
   phone: string
   designation: string
   is_active: boolean
@@ -131,6 +133,7 @@ export interface SurveyArea {
   assigned_to_name: string
   status: ProjectStatus
   status_display: string
+  map_enabled?: boolean
   created_by: number | null
   created_by_name: string
   created_at: string
@@ -144,6 +147,7 @@ export interface SurveyProject {
   organisation: number
   organisation_name: string
   status: ProjectStatus
+  map_enabled?: boolean
   created_by: number
   created_by_name: string
   created_at: string
@@ -268,6 +272,7 @@ export interface BasemapConfig {
   url_template: string
   attribution: string
   is_active: boolean
+  is_default: boolean
   is_system: boolean
 }
 

@@ -451,18 +451,46 @@ if [[ "$NO_BUILD" == false ]]; then
   fi
 fi
 
-# ── Step 6: Pull all dependency images ──────────────────────────────────────
+# ── Step 6: Pull dependency images (only if not already present locally) ─────
 # Skipped when --load-images is supplied (offline deployment from tarballs).
 if [[ -z "$LOAD_IMAGES_DIR" ]]; then
   echo ""
-  echo ">>> Pulling dependency images..."
-  PULL_SERVICES="db redis nginx pg_tileserv prometheus grafana onlyoffice osm-tiles"
-  # Add Ollama image only if we're managing it via Docker (OLLAMA_BASE_URL points to Docker)
+  echo ">>> Checking dependency images..."
+
+  # Map service name → expected image (must match docker-compose.yml)
+  declare -A SVC_IMAGE=(
+    [db]="postgis/postgis:16-3.4"
+    [redis]="redis:7-alpine"
+    [nginx]="nginx:1.27-alpine"
+    [pg_tileserv]="pramsey/pg_tileserv:latest"
+    [prometheus]="prom/prometheus:v2.55.1"
+    [grafana]="grafana/grafana:11.4.2"
+    [onlyoffice]="onlyoffice/documentserver:8.2.2"
+    [osm-tiles]="overv/openstreetmap-tile-server:2.3.0"
+  )
   [[ "$OLLAMA_BASE_URL_VAL" == "http://ollama:11434" ]] && \
-    PULL_SERVICES="$PULL_SERVICES ollama${GPU_PROFILE_SUFFIX}"
-  # shellcheck disable=SC2086
-  docker compose $ALL_PROFILE_FLAGS pull --ignore-pull-failures $PULL_SERVICES
-  echo "    ✓ Images pulled"
+    SVC_IMAGE["ollama${GPU_PROFILE_SUFFIX}"]="ollama/ollama:latest"
+
+  MISSING_SVCS=""
+  for svc in "${!SVC_IMAGE[@]}"; do
+    img="${SVC_IMAGE[$svc]}"
+    if docker image inspect "$img" &>/dev/null; then
+      echo "    ✓ $img already present — skip pull"
+    else
+      echo "    ↓ $img not found — will pull"
+      MISSING_SVCS="$MISSING_SVCS $svc"
+    fi
+  done
+
+  if [[ -n "$MISSING_SVCS" ]]; then
+    echo ""
+    echo "    Pulling missing images:$MISSING_SVCS"
+    # shellcheck disable=SC2086
+    docker compose $ALL_PROFILE_FLAGS pull --ignore-pull-failures $MISSING_SVCS
+    echo "    ✓ Missing images pulled"
+  else
+    echo "    ✓ All dependency images already present — no pull needed"
+  fi
 else
   echo ""
   echo "    ✓ Skipping image pull (using loaded images from $LOAD_IMAGES_DIR)"
@@ -606,16 +634,77 @@ if [[ "$IMPORT_OSM" == true ]]; then
   echo ""
 fi
 
-# ── Step 9: Build frontend ────────────────────────────────────────────────────
+# ── Step 9: Build frontend (skip when source files unchanged) ────────────────
 if command -v node &> /dev/null && [[ -d "$SCRIPT_DIR/frontend" ]]; then
   echo ""
-  echo ">>> Building React frontend..."
-  cd "$SCRIPT_DIR/frontend"
-  npm install --silent
-  npm run build
-  cd "$SCRIPT_DIR"
-  docker compose run --rm web python manage.py collectstatic --no-input
-  echo "    ✓ Frontend built and static files collected"
+  echo ">>> Checking React frontend..."
+
+  FE_HASH_FILE="$SCRIPT_DIR/.frontend-hash"
+  # Hash: src files + package.json + vite config (excludes node_modules/staticfiles)
+  FE_HASH=$(find "$SCRIPT_DIR/frontend/src" \
+      "$SCRIPT_DIR/frontend/package.json" "$SCRIPT_DIR/frontend/vite.config"* \
+      "$SCRIPT_DIR/frontend/tsconfig"* \
+      -type f 2>/dev/null | sort | xargs sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)
+
+  FE_NEEDS_BUILD=true
+  if [[ -f "$FE_HASH_FILE" ]] && [[ "$(cat "$FE_HASH_FILE" 2>/dev/null)" == "$FE_HASH" ]]; then
+    # Verify the actual build output exists (outDir is ../staticfiles, not frontend/dist)
+    if [[ -f "$SCRIPT_DIR/staticfiles/index.html" ]]; then
+      FE_NEEDS_BUILD=false
+    fi
+  fi
+
+  if [[ "$FE_NEEDS_BUILD" == true ]]; then
+    echo "    Frontend source changed — rebuilding..."
+    cd "$SCRIPT_DIR/frontend"
+
+    # ── Skip npm install when package.json / lockfile unchanged ──────────────
+    NPM_HASH_FILE="$SCRIPT_DIR/.npm-hash"
+    NPM_HASH=$(sha256sum package.json package-lock.json 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [[ "$(cat "$NPM_HASH_FILE" 2>/dev/null)" != "$NPM_HASH" ]] || [[ ! -d node_modules ]]; then
+      echo "    Installing npm dependencies..."
+      npm install --silent
+      echo "$NPM_HASH" > "$NPM_HASH_FILE"
+    else
+      echo "    npm deps unchanged — skipping install"
+    fi
+
+    # ── Cesium asset cache: avoid re-copying 14 MB on every app-code change ──
+    # Cesium assets live in staticfiles/cesium/ but emptyOutDir wipes that dir.
+    # We keep a persistent copy in .cesium-build/ keyed by the cesium npm version.
+    CESIUM_VER=$(node -p "require('./package.json').dependencies.cesium" 2>/dev/null || echo "unknown")
+    CESIUM_CACHE="$SCRIPT_DIR/.cesium-build"
+    CESIUM_VER_FILE="$CESIUM_CACHE/.version"
+    CESIUM_CACHED=false
+    if [[ -f "$CESIUM_VER_FILE" ]] && [[ "$(cat "$CESIUM_VER_FILE")" == "$CESIUM_VER" ]] \
+       && [[ -f "$CESIUM_CACHE/cesium/Cesium.js" ]]; then
+      CESIUM_CACHED=true
+    fi
+
+    if [[ "$CESIUM_CACHED" == true ]]; then
+      echo "    Cesium assets cached (v${CESIUM_VER}) — skipping copy"
+      SKIP_CESIUM_COPY=1 node_modules/.bin/vite build
+      node deploy.cjs
+      # Restore cached cesium into the freshly emptied staticfiles/
+      cp -r "$CESIUM_CACHE/cesium" "$SCRIPT_DIR/staticfiles/cesium"
+    else
+      echo "    Cesium version changed or not cached — full build"
+      npm run build
+      # Save cesium assets to persistent cache for next build
+      mkdir -p "$CESIUM_CACHE"
+      rm -rf "$CESIUM_CACHE/cesium"
+      cp -r "$SCRIPT_DIR/staticfiles/cesium" "$CESIUM_CACHE/cesium"
+      echo "$CESIUM_VER" > "$CESIUM_VER_FILE"
+    fi
+
+    cd "$SCRIPT_DIR"
+    docker compose run --rm web python manage.py collectstatic --no-input
+    echo "$FE_HASH" > "$FE_HASH_FILE"
+    echo "    ✓ Frontend built and static files collected"
+  else
+    echo "    ✓ Frontend source unchanged — skipping build"
+    echo "      (Delete .frontend-hash or modify src/ to force a rebuild)"
+  fi
 else
   echo ""
   echo "    ⚠ Node.js not found — skipping frontend build."

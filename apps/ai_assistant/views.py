@@ -4,10 +4,10 @@ import tempfile
 
 import httpx
 from django.conf import settings
-from django.http import FileResponse, Http404
+from django.http import FileResponse, Http404, HttpResponse
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 
 from .models import ChatSession, ChatMessage, AITask, LLMConfig, BoundaryExtractionJob, DocumentChunk
@@ -176,12 +176,25 @@ class AITaskViewSet(viewsets.ReadOnlyModelViewSet):
         if not os.path.exists(abs_path):
             raise Http404
 
-        return FileResponse(
-            open(abs_path, 'rb'),
-            as_attachment=True,
-            filename=os.path.basename(abs_path),
-            content_type='text/plain; charset=utf-8',
-        )
+        fname = os.path.basename(abs_path)
+        with open(abs_path, 'rb') as fh:
+            content = fh.read()
+
+        # Apply provenance watermark + Trust Registry entry to the generated report.
+        try:
+            from apps.core.watermark import embed_watermark
+            metadata = {
+                "title": fname,
+                "export_format": "txt",
+                "generated_by": request.user.username,
+            }
+            content = embed_watermark(content, fname, 'text/plain', metadata)
+        except Exception:
+            pass
+
+        resp = HttpResponse(content, content_type='text/plain; charset=utf-8')
+        resp['Content-Disposition'] = f'attachment; filename="{fname}"'
+        return resp
 
     @action(
         detail=False, methods=['post'], url_path='index-gis/preview',
@@ -639,59 +652,530 @@ PARAMETER num_ctx 4096
 
 class BoundaryExtractionViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
-    @action(detail=False, methods=['post'], url_path='submit')
-    def submit(self, request):
+    @action(detail=False, methods=['post'], url_path='extract-classical',
+            parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def extract_classical(self, request):
         """
-        Submit a scanned map image for vision-based boundary extraction.
-        Body (multipart): project_id, vision_model, image (file) OR source_document_id
+        POST /ai/vision/extract-classical/
+
+        Industry-standard classical GIS pipeline:
+          GeoTIFF → edge detection → morphological closing
+          → connected components → GDAL Polygonize → GeoJSON features
+
+        No vision LLM required. Output saved as draft_features on a
+        BoundaryExtractionJob so the same accept-features flow applies.
+
+        Body (JSON or form):
+          project_id         — required
+          source_geotiff_id  — required: GeoTiffLayer id
+          edge_sensitivity   — float 0.0–1.0  (default 0.3; higher = more edges)
+          min_area_m2        — float m²       (default 500)
+          dilation_px        — int            (default 3)
+          simplify_tolerance — float degrees  (default 0.00005)
+          ai_label           — bool: run vision LLM to label each polygon type after
+                               classical extraction (default false)
+          vision_model       — model name for ai_label step (default llava:7b)
         """
-        from apps.survey_projects.models import SurveyProject
-        from apps.documents.models import Document
-        from .tasks import extract_map_boundaries
+        import json as _json
+        from apps.survey_projects.models import SurveyProject, GeoTiffLayer
+        from .tasks import extract_polygons_classical
 
         project_id        = request.data.get('project_id')
-        vision_model      = request.data.get('vision_model', 'llava:7b')
-        source_doc_id     = request.data.get('source_document_id')
-        uploaded_image    = request.FILES.get('image')
+        source_geotiff_id = request.data.get('source_geotiff_id')
 
         if not project_id:
-            return Response({'detail': 'project_id required.'}, status=400)
-        if not source_doc_id and not uploaded_image:
-            return Response({'detail': 'Provide either source_document_id or an image file.'}, status=400)
+            return Response({'detail': 'project_id is required.'}, status=400)
+        if not source_geotiff_id:
+            return Response({'detail': 'source_geotiff_id is required.'}, status=400)
 
         try:
             project = SurveyProject.objects.get(pk=project_id)
         except SurveyProject.DoesNotExist:
             return Response({'detail': 'Project not found.'}, status=404)
 
+        try:
+            geotiff = GeoTiffLayer.objects.get(pk=source_geotiff_id, project=project)
+        except GeoTiffLayer.DoesNotExist:
+            return Response({'detail': 'GeoTiff layer not found in this project.'}, status=404)
+
+        if geotiff.status != GeoTiffLayer.DONE:
+            return Response(
+                {'detail': f'GeoTiff COG conversion is {geotiff.status}. Wait until status is DONE.'},
+                status=400,
+            )
+
+        # Collect pipeline parameters
+        pipeline_params = {
+            'edge_sensitivity':   float(request.data.get('edge_sensitivity',   0.3)),
+            'min_area_m2':        float(request.data.get('min_area_m2',        500.0)),
+            'dilation_px':        int(request.data.get('dilation_px',          3)),
+            'simplify_tolerance': float(request.data.get('simplify_tolerance', 0.00005)),
+            'ai_label':           str(request.data.get('ai_label', 'false')).lower() == 'true',
+            'vision_model':       request.data.get('vision_model', 'llava:7b'),
+        }
+
+        job = BoundaryExtractionJob(
+            project=project,
+            source_geotiff=geotiff,
+            vision_model=pipeline_params['vision_model'],
+            requested_by=request.user,
+            # Temporarily store params in raw_response; task reads and clears it
+            raw_response=_json.dumps(pipeline_params),
+        )
+        job.save()
+
+        extract_polygons_classical.delay(job.id)
+
+        return Response({
+            'job_id':  job.id,
+            'status':  job.status,
+            'mode':    'classical_gis',
+            'params':  pipeline_params,
+        }, status=201)
+
+    @action(detail=False, methods=['post'], url_path='extract-pipeline',
+            parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def extract_pipeline(self, request):
+        """
+        POST /ai/vision/extract-pipeline/
+
+        Advanced 10-stage AI Vision pipeline:
+          GeoTIFF → Rasterio/GDAL → Tile Generation → SAM 2.1 → U-Net++
+          → Boundary Graph → Polygonize → PaddleOCR/TrOCR → Geospatial Validation
+          → LLM QA Review → Database Output
+
+        Body (JSON or form):
+          project_id         — required
+          source_geotiff_id  — required: GeoTiffLayer id
+          tile_size          — int (1024 or 2048, default 1024)
+          vision_model       — model name for AI steps (default llava:7b)
+          min_area_m2        — float m² (default 500)
+          simplify_tolerance — float degrees (default 0.00005)
+          edge_sensitivity   — float 0.0–1.0 (default 0.3)
+          dilation_px        — int (default 3)
+        """
+        import json as _json
+        from apps.survey_projects.models import SurveyProject, GeoTiffLayer
+        from .tasks import extract_polygons_ai_pipeline
+
+        project_id        = request.data.get('project_id')
+        source_geotiff_id = request.data.get('source_geotiff_id')
+
+        if not project_id:
+            return Response({'detail': 'project_id is required.'}, status=400)
+        if not source_geotiff_id:
+            return Response({'detail': 'source_geotiff_id is required.'}, status=400)
+
+        try:
+            project = SurveyProject.objects.get(pk=project_id)
+        except SurveyProject.DoesNotExist:
+            return Response({'detail': 'Project not found.'}, status=404)
+
+        try:
+            geotiff = GeoTiffLayer.objects.get(pk=source_geotiff_id, project=project)
+        except GeoTiffLayer.DoesNotExist:
+            return Response({'detail': 'GeoTiff layer not found in this project.'}, status=404)
+
+        if geotiff.status != GeoTiffLayer.DONE:
+            return Response(
+                {'detail': f'GeoTiff COG conversion is {geotiff.status}. Wait until status is DONE.'},
+                status=400,
+            )
+
+        # The Advanced AI Vision Pipeline runs vision LLM inference and requires GPU.
+        if not settings.AI_GPU_ENABLED:
+            return Response(
+                {
+                    'detail': (
+                        'The Advanced AI Vision Pipeline requires GPU mode, but the AI '
+                        'backend is running in CPU mode (AI_BACKEND_GPU). Use the '
+                        'classical extraction pipeline on CPU, or start a GPU backend '
+                        '(docker compose --profile docker-ollama-gpu up -d and set '
+                        'AI_BACKEND_GPU=true).'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Collect parameters
+        pipeline_params = {
+            'tile_size':          int(request.data.get('tile_size', 1024)),
+            'vision_model':       request.data.get('vision_model', 'llava:7b'),
+            'min_area_m2':        float(request.data.get('min_area_m2', 500.0)),
+            'simplify_tolerance': float(request.data.get('simplify_tolerance', 0.00005)),
+            'edge_sensitivity':   float(request.data.get('edge_sensitivity', 0.3)),
+            'dilation_px':        int(request.data.get('dilation_px', 3)),
+        }
+
+        # Resolve vision model to installed variants if needed
+        from .services import LLMService
+        svc = LLMService()
+        installed = svc.list_vision_models()
+
+        resolved_model = pipeline_params['vision_model']
+        if installed:
+            if resolved_model in installed:
+                pass
+            else:
+                family = resolved_model.split(':')[0].lower()
+                family_matches = [m for m in installed if m.split(':')[0].lower() == family]
+                if family_matches:
+                    resolved_model = family_matches[0]
+                else:
+                    return Response(
+                        {
+                            'detail': (
+                                f"Vision model '{resolved_model}' is not installed in Ollama. "
+                                f"Pull it first:  ollama pull {resolved_model}. "
+                                f"Installed vision models: {', '.join(installed)}."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+        job = BoundaryExtractionJob(
+            project=project,
+            source_geotiff=geotiff,
+            vision_model=resolved_model,
+            requested_by=request.user,
+            raw_response=_json.dumps(pipeline_params),
+        )
+        job.save()
+
+        extract_polygons_ai_pipeline.delay(job.id)
+
+        return Response({
+            'job_id':  job.id,
+            'status':  job.status,
+            'mode':    'ai_pipeline',
+            'params':  pipeline_params,
+        }, status=201)
+
+    @action(detail=False, methods=['get'], url_path='list-vision-models')
+    def list_vision_models(self, request):
+        """
+        GET /ai/vision/list-vision-models/
+        Returns the list of vision-capable models currently installed in Ollama.
+        Empty list means Ollama is unreachable or no vision model is installed.
+        """
+        from .services import LLMService
+        try:
+            svc = LLMService()
+            models = svc.list_vision_models()
+        except Exception:
+            models = []
+        return Response({'models': models, 'ollama_url': getattr(svc, 'base_url', '')})
+
+    @action(detail=False, methods=['get'], url_path='capabilities')
+    def capabilities(self, request):
+        """
+        GET /ai/vision/capabilities/
+        Reports which extraction pipelines are available in the current AI compute
+        mode. The classical CV pipeline always runs (CPU or GPU); the vision
+        pipelines require GPU mode (AI_BACKEND_GPU).
+        """
+        gpu = bool(settings.AI_GPU_ENABLED)
+        return Response({
+            'gpu_enabled': gpu,
+            'mode': 'gpu' if gpu else 'cpu',
+            'pipelines': {
+                'classical':   {'available': True, 'requires_gpu': False},
+                'ai_vision':   {'available': gpu,  'requires_gpu': True},
+                'ai_pipeline': {'available': gpu,  'requires_gpu': True},
+            },
+        })
+
+    @action(detail=False, methods=['post'], url_path='submit')
+    def submit(self, request):
+        """
+        Submit a map image for vision-based boundary extraction.
+
+        Body (multipart/form-data):
+          project_id        — required
+          vision_model      — default llava:7b
+          image             — uploaded scanned map image  (mode A: scan)
+          source_document_id— existing document id        (mode A: scan)
+          source_geotiff_id — GeoTiffLayer id             (mode B: geotiff → real coords)
+        """
+        from apps.survey_projects.models import SurveyProject, GeoTiffLayer
+        from apps.documents.models import Document
+        from .tasks import extract_map_boundaries
+
+        project_id        = request.data.get('project_id')
+        vision_model      = request.data.get('vision_model', 'llava:7b')
+        source_doc_id     = request.data.get('source_document_id')
+        source_geotiff_id = request.data.get('source_geotiff_id')
+        uploaded_image    = request.FILES.get('image')
+
+        if not project_id:
+            return Response({'detail': 'project_id required.'}, status=400)
+        if not source_doc_id and not uploaded_image and not source_geotiff_id:
+            return Response(
+                {'detail': 'Provide source_geotiff_id, source_document_id, or an image file.'},
+                status=400,
+            )
+
+        try:
+            project = SurveyProject.objects.get(pk=project_id)
+        except SurveyProject.DoesNotExist:
+            return Response({'detail': 'Project not found.'}, status=404)
+
+        # AI Vision (LLaVA) runs vision LLM inference and requires GPU mode.
+        if not settings.AI_GPU_ENABLED:
+            return Response(
+                {
+                    'detail': (
+                        'AI Vision (LLaVA) requires GPU mode, but the AI backend is '
+                        'running in CPU mode (AI_BACKEND_GPU). Use the classical '
+                        'extraction pipeline on CPU, or start a GPU backend '
+                        '(docker compose --profile docker-ollama-gpu up -d and set '
+                        'AI_BACKEND_GPU=true).'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         job = BoundaryExtractionJob(
             project=project,
             vision_model=vision_model,
             requested_by=request.user,
         )
-        if source_doc_id:
+        if source_geotiff_id:
+            try:
+                job.source_geotiff = GeoTiffLayer.objects.get(pk=source_geotiff_id, project=project)
+            except GeoTiffLayer.DoesNotExist:
+                return Response({'detail': 'GeoTiff layer not found in this project.'}, status=404)
+        elif source_doc_id:
             job.source_document_id = source_doc_id
-        if uploaded_image:
+        elif uploaded_image:
             job.source_image = uploaded_image
         job.save()
 
+        # Pre-flight: resolve the vision model to whatever is actually installed.
+        # The user may request 'llava:7b' but Ollama only has 'llava:latest' or 'llava'.
+        # Strategy: exact match → same family → error.
+        from .services import LLMService
+        svc = LLMService()
+        installed = svc.list_vision_models()
+
+        resolved_model = vision_model
+        if installed:
+            if vision_model in installed:
+                # Exact match — use as-is
+                resolved_model = vision_model
+            else:
+                # Try to find an installed model from the same family (before the colon)
+                family = vision_model.split(':')[0].lower()
+                family_matches = [m for m in installed if m.split(':')[0].lower() == family]
+                if family_matches:
+                    # Use the closest installed variant (prefer same family)
+                    resolved_model = family_matches[0]
+                else:
+                    # No match at all — fail fast
+                    job.delete()
+                    return Response(
+                        {
+                            'detail': (
+                                f"Vision model '{vision_model}' is not installed in Ollama "
+                                f"and no matching model was found. "
+                                f"Pull it first:  ollama pull {vision_model}  "
+                                f"Installed vision models: {', '.join(installed)}."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            # Persist the resolved model name on the job so the task uses the right tag
+            if resolved_model != vision_model:
+                job.vision_model = resolved_model
+                job.save(update_fields=['vision_model'])
+
         extract_map_boundaries.delay(job.id)
-        return Response({'job_id': job.id, 'status': job.status}, status=201)
+        return Response({
+            'job_id': job.id,
+            'status': job.status,
+            'mode': 'geotiff' if source_geotiff_id else 'scan',
+        }, status=201)
+
+    @action(detail=False, methods=['post'], url_path='accept-features/(?P<job_pk>[^/.]+)')
+    def accept_features(self, request, job_pk=None):
+        """
+        POST /ai/vision/accept-features/{job_id}/
+
+        Save draft polygon features from a completed GeoTiff extraction job as
+        GISFeature records in the project, linked to a survey area.
+
+        Body (JSON):
+          layer_name       — GIS layer name for the created features (required)
+          survey_area_id   — existing SurveyArea id  (provide this OR new_area_name)
+          new_area_name    — create a new SurveyArea with this name
+          features         — edited GeoJSON Feature list to save (from the review
+                             editor). Takes precedence over the stored draft, so
+                             reshaped/split/merged geometry and edited Survey
+                             Numbers are persisted.
+          feature_indices  — list of draft_feature indices to save; omit = all
+                             (ignored when `features` is provided)
+        """
+        from apps.survey_projects.models import (
+            SurveyArea, GISFeature, ProjectLayerFolder,
+        )
+        from django.contrib.gis.geos import GEOSGeometry
+
+        try:
+            job = BoundaryExtractionJob.objects.select_related('project').get(
+                pk=job_pk,
+            )
+        except BoundaryExtractionJob.DoesNotExist:
+            return Response({'detail': 'Job not found.'}, status=404)
+
+        if job.status != BoundaryExtractionJob.DONE:
+            return Response({'detail': f'Job is not DONE yet (status={job.status}).'}, status=400)
+
+        draft = job.draft_features or []
+        edited_features  = request.data.get('features')  # edited GeoJSON list or None
+        if not draft and not edited_features:
+            return Response({'detail': 'No draft features to save.'}, status=400)
+
+        layer_name       = (request.data.get('layer_name') or '').strip()
+        survey_area_id   = request.data.get('survey_area_id')
+        new_area_name    = (request.data.get('new_area_name') or '').strip()
+        feature_indices  = request.data.get('feature_indices')  # list or None
+
+        if not layer_name:
+            return Response({'detail': 'layer_name is required.'}, status=400)
+        if not survey_area_id and not new_area_name:
+            return Response(
+                {'detail': 'Provide survey_area_id or new_area_name.'}, status=400
+            )
+
+        project = job.project
+
+        # ── Resolve / create survey area ──────────────────────────────────────
+        if survey_area_id:
+            try:
+                area = SurveyArea.objects.get(pk=survey_area_id, project=project)
+            except SurveyArea.DoesNotExist:
+                return Response({'detail': 'Survey area not found in this project.'}, status=404)
+        else:
+            area, created = SurveyArea.objects.get_or_create(
+                project=project,
+                name=new_area_name,
+                defaults={'created_by': request.user, 'status': SurveyArea.DRAFT},
+            )
+            if created:
+                # Auto-create root folder for the new area
+                root = ProjectLayerFolder.objects.create(
+                    project=project,
+                    name=new_area_name,
+                    folder_type=ProjectLayerFolder.ZONE,
+                    created_by=request.user,
+                    order=0,
+                )
+                area.folder = root
+                area.save(update_fields=['folder'])
+
+        target_folder = area.folder  # may be None if area has no folder yet
+
+        # ── Pick which features to save ────────────────────────────────────────
+        # Edited features from the review editor win over the stored draft.
+        if isinstance(edited_features, list):
+            selected = edited_features
+        elif feature_indices is not None:
+            selected = [draft[i] for i in feature_indices if 0 <= i < len(draft)]
+        else:
+            selected = draft
+
+        import json as _json
+        created_count = 0
+        skipped_count = 0
+        created_features = []
+
+        for feat in selected:
+            geom_json = feat.get('geometry')
+            if not geom_json:
+                skipped_count += 1
+                continue
+            try:
+                geom = GEOSGeometry(_json.dumps(geom_json), srid=4326)
+            except Exception:
+                skipped_count += 1
+                continue
+
+            props = feat.get('properties', {})
+            geom_type = (getattr(geom, 'geom_type', '') or 'POLYGON').upper()
+            gf = GISFeature.objects.create(
+                project=project,
+                folder=target_folder,
+                layer_name=layer_name,
+                geometry_type=geom_type,
+                geometry=geom,
+                attributes={k: v for k, v in props.items() if k not in ('source', 'has_coordinates')},
+                created_by=request.user,
+            )
+            created_count += 1
+            created_features.append(gf)
+
+        # Broadcast each created feature via WebSocket so the map viewer
+        # updates in real-time without requiring a manual page refresh.
+        if created_features:
+            try:
+                from channels.layers import get_channel_layer
+                from asgiref.sync import async_to_sync
+                channel_layer = get_channel_layer()
+                if channel_layer:
+                    room = f'project_{project.id}'
+                    for gf in created_features:
+                        async_to_sync(channel_layer.group_send)(room, {
+                            'type': 'collab.feature_created',
+                            'feature': {
+                                'id': gf.id,
+                                'geometry': _json.loads(gf.geometry.geojson),
+                                'layer_name': gf.layer_name,
+                                'geometry_type': gf.geometry_type,
+                                'attributes': gf.attributes,
+                                'folder': gf.folder_id,
+                                'feature_id': gf.feature_id or '',
+                            },
+                            'sender_id': request.user.id,
+                        })
+            except Exception:
+                pass  # WebSocket broadcast is best-effort; don't fail the save
+
+        return Response({
+            'created': created_count,
+            'skipped': skipped_count,
+            'survey_area_id': area.id,
+            'survey_area_name': area.name,
+            'layer_name': layer_name,
+            'project_id': project.id,
+        })
 
     @action(detail=False, methods=['get'], url_path='status/(?P<job_pk>[^/.]+)')
     def job_status(self, request, job_pk=None):
         try:
-            job = BoundaryExtractionJob.objects.get(pk=job_pk, project__organisation=request.user.organisation)
+            job = BoundaryExtractionJob.objects.select_related('source_geotiff', 'project').get(
+                pk=job_pk, project__organisation=request.user.organisation)
         except BoundaryExtractionJob.DoesNotExist:
             return Response({'detail': 'Not found.'}, status=404)
+        # Source GeoTIFF (COG) so the review viewer can overlay it for context.
+        source_geotiff = None
+        gt = job.source_geotiff
+        if gt and gt.cog_file:
+            try:
+                cog_url = request.build_absolute_uri(gt.cog_file.url)
+            except Exception:
+                cog_url = gt.cog_file.url
+            source_geotiff = {'id': gt.id, 'name': gt.name, 'cog_url': cog_url, 'status': gt.status}
         return Response({
             'id': job.id,
             'status': job.status,
+            'project_id': job.project_id,
             'vision_model': job.vision_model,
             'parsed_result': job.parsed_result,
             'draft_features': job.draft_features,
+            'source_geotiff': source_geotiff,
             'raw_response': job.raw_response[:500] if job.raw_response else '',
             'error_log': job.error_log,
             'created_at': job.created_at,

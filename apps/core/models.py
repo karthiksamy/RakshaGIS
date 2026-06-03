@@ -56,6 +56,10 @@ class BasemapConfig(models.Model):
     )
     attribution  = models.CharField(max_length=300, blank=True)
     is_active    = models.BooleanField(default=True)
+    is_default   = models.BooleanField(
+        default=False,
+        help_text='Default basemap loaded when the map opens. Only one may be default.'
+    )
     is_system    = models.BooleanField(
         default=False,
         help_text='Built-in config — cannot be deleted via API'
@@ -66,7 +70,39 @@ class BasemapConfig(models.Model):
     created_at   = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ['name']
+        ordering = ['-is_default', 'name']
 
     def __str__(self):
         return f"{self.name} ({self.get_provider_display()})"
+
+    def save(self, *args, **kwargs):
+        # A default basemap must also be active.
+        if self.is_default and not self.is_active:
+            self.is_active = True
+        super().save(*args, **kwargs)
+        # Enforce a single default across all configs.
+        if self.is_default:
+            BasemapConfig.objects.exclude(pk=self.pk).filter(is_default=True).update(is_default=False)
+
+
+class ProvenanceRecord(models.Model):
+    """
+    Trust Registry DB model for Living Provenance DNA (LP-DNA).
+    Logs all files exported or saved from the RakshaGIS/DEMAP platform.
+    """
+    dna_hash       = models.CharField(max_length=64, unique=True, db_index=True)
+    file_name      = models.CharField(max_length=255)
+    project_id     = models.IntegerField(null=True, blank=True)
+    project_number = models.CharField(max_length=100, null=True, blank=True)
+    generated_by   = models.CharField(max_length=150)
+    generated_at   = models.DateTimeField(auto_now_add=True)
+    file_hash      = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+
+    class Meta:
+        ordering = ['-generated_at']
+        verbose_name = 'Provenance Record'
+        verbose_name_plural = 'Provenance Records'
+
+    def __str__(self):
+        return f"{self.file_name} ({self.project_number or 'No Project'})"
+

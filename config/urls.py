@@ -10,12 +10,25 @@ import os
 
 
 def spa_index(request):
-    """Serve the Vite-built index.html for all SPA routes."""
+    """Serve the Vite-built index.html for all SPA routes.
+
+    index.html is the only un-hashed entry point: it references the hashed
+    JS/CSS chunks (which ARE safe to cache forever). It must therefore be sent
+    with no-cache so browsers re-validate it on every load and pick up the new
+    chunk hashes after each deploy. Without this, a browser keeps loading a
+    stale index.html that points at old chunks — causing "phantom" bugs that
+    were already fixed on the server.
+    """
     index_path = os.path.join(settings.BASE_DIR, 'static', 'frontend', 'index.html')
     if not os.path.exists(index_path):
         # Fallback to templates/index.html during development before first build
-        return TemplateView.as_view(template_name='index.html')(request)
-    return FileResponse(open(index_path, 'rb'), content_type='text/html')
+        response = TemplateView.as_view(template_name='index.html')(request)
+    else:
+        response = FileResponse(open(index_path, 'rb'), content_type='text/html')
+    response['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response['Pragma'] = 'no-cache'
+    response['Expires'] = '0'
+    return response
 
 urlpatterns = [
     path('admin/', admin.site.urls),

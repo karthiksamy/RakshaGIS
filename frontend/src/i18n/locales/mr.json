@@ -1,63 +1,23 @@
 {
-  "nav": {
-    "dashboard": "डॅशबोर्ड",
-    "map": "नकाशा",
-    "terrain": "3D भूप्रदेश",
-    "projects": "प्रकल्प",
-    "documents": "दस्तऐवज",
-    "ai_assistant": "AI सहाय्यक",
-    "users": "वापरकर्ते",
-    "organisations": "संस्था",
-    "reports": "अहवाल",
-    "backups": "बॅकअप",
-    "master_data": "मास्टर डेटा",
-    "states": "राज्ये",
-    "districts": "जिल्हे",
-    "taluks": "तालुके",
-    "villages": "गावे"
-  },
-  "common": {
-    "save": "जतन करा",
-    "cancel": "रद्द करा",
-    "delete": "हटवा",
-    "edit": "संपादित करा",
-    "add": "जोडा",
-    "create": "तयार करा",
-    "close": "बंद करा",
-    "search": "शोधा",
-    "submit": "सादर करा",
-    "yes": "होय",
-    "no": "नाही",
-    "ok": "ठीक आहे",
-    "loading": "लोड होत आहे...",
-    "error": "त्रुटी",
-    "success": "यश",
-    "logout": "लॉगआउट",
-    "settings": "सेटिंग्ज",
-    "status": "स्थिती"
-  },
-  "status": {
-    "draft": "मसुदा",
-    "submitted": "सादर केले",
-    "under_review": "पुनरावलोकनात",
-    "approved": "मंजूर",
-    "published": "प्रकाशित",
-    "returned": "सुधारणेसाठी परत",
-    "pending": "प्रलंबित"
-  },
-  "auth": {
-    "login": "लॉगिन",
-    "username": "वापरकर्तानाव",
-    "password": "पासवर्ड",
-    "login_title": "RakshaGIS मध्ये लॉगिन करा",
-    "login_subtitle": "संरक्षण भूमि GIS व्यासपीठ — भारत सरकार"
-  },
-  "workflow": {
-    "submit_to_checker": "तपासणीसाठी सादर करा",
-    "approve": "मंजूर करा",
-    "publish": "प्रकाशित करा"
-  },
-  "language": {
-    "select": "भाषा"
-  }
+  "nav": { "dashboard": "डॅशबोर्ड", "map": "नकाशा", "terrain": "3D भूप्रदेश", "projects": "प्रकल्प", "documents": "दस्तऐवज", "access_requests": "डेटा प्रवेश", "ai_assistant": "AI सहाय्यक", "ai_vision": "AI दृष्टी", "users": "वापरकर्ते", "organisations": "संस्था", "basemaps": "बेसमॅप्स", "reports": "अहवाल", "audit": "ऑडिट लॉग", "qgis_sync": "QGIS सिंक", "backups": "बॅकअप", "master_data": "मास्टर डेटा", "states": "राज्ये", "districts": "जिल्हे", "taluks": "तालुके", "villages": "गावे", "boundary_import": "सीमा आयात", "branding": "ब्रँडिंग", "ai_config": "AI कॉन्फिग", "external_data": "बाह्य डेटा" },
+  "common": { "save": "जतन करा", "cancel": "रद्द करा", "delete": "हटवा", "edit": "संपादित करा", "add": "जोडा", "create": "तयार करा", "update": "अद्यतनित करा", "close": "बंद करा", "download": "डाउनलोड", "upload": "अपलोड", "search": "शोधा", "filter": "फिल्टर", "reset": "रीसेट", "confirm": "पुष्टी करा", "submit": "सादर करा", "back": "मागे", "next": "पुढे", "yes": "हो", "no": "नाही", "ok": "ठीक आहे", "loading": "लोड होत आहे...", "error": "त्रुटी", "success": "यश", "warning": "इशारा", "actions": "क्रिया", "name": "नाव", "code": "कोड", "date": "तारीख", "status": "स्थिती", "type": "प्रकार", "description": "वर्णन", "notes": "नोट्स", "remarks": "टिपणी", "view": "पहा", "refresh": "रिफ्रेश", "export": "निर्यात", "print": "मुद्रण", "logout": "लॉगआउट", "profile": "प्रोफाइल", "settings": "सेटिंग्ज", "retry": "पुन्हा प्रयत्न", "open": "उघडा", "run": "चालवा", "generate": "तयार करा", "processing": "प्रक्रिया होत आहे...", "no_data": "डेटा नाही", "clear": "साफ करा", "active": "सक्रिय", "inactive": "निष्क्रिय", "apply": "लागू करा", "optional": "पर्यायी", "required": "आवश्यक", "organisation": "संस्था", "created": "तयार केले", "updated": "अद्यतनित केले", "deleted": "हटवले", "all": "सर्व", "none": "काहीही नाही", "select": "निवडा", "features": "वैशिष्ट्ये", "source": "स्रोत", "total": "एकूण", "by": "द्वारे" },
+  "status": { "draft": "मसुदा", "submitted": "तपासणीसाठी सादर", "under_review": "पुनरावलोकनात", "approved": "मंजूर", "published": "प्रकाशित", "returned": "सुधारणेसाठी परत", "pending": "प्रलंबित", "running": "चालू आहे", "done": "पूर्ण", "failed": "अयशस्वी", "clean": "स्वच्छ", "has_disputes": "वाद आहेत" },
+  "auth": { "login": "लॉगिन", "logout": "लॉगआउट", "username": "वापरकर्ता नाव", "password": "संकेतशब्द", "login_title": "RakshaGIS मध्ये लॉगिन करा", "login_subtitle": "संरक्षण भू GIS व्यासपीठ — भारत सरकार", "change_password": "संकेतशब्द बदला", "current_password": "सध्याचा संकेतशब्द", "new_password": "नवीन संकेतशब्द", "confirm_password": "संकेतशब्द पुष्टी करा", "login_failed": "चुकीचे वापरकर्ता नाव किंवा संकेतशब्द", "session_expired": "तुमचे सत्र संपले. कृपया पुन्हा लॉगिन करा." },
+  "workflow": { "submit_to_checker": "तपासणीकर्त्याकडे सादर करा", "resubmit_to_checker": "पुन्हा सादर करा", "send_to_approver": "मंजूरकर्त्याकडे पाठवा", "approve": "मंजूर करा", "return_to_sdo": "SDO ला परत करा", "return_from_review": "सुधारणेसाठी परत करा", "publish": "प्रकाशित करा", "remarks_required": "परत करताना टिपणी आवश्यक", "optional_remarks": "पर्यायी टिपणी...", "confirm_action": "क्रिया पुष्टी करा", "workflow_updated": "वर्कफ्लो अद्यतनित", "survey_area": "सर्वेक्षण क्षेत्र", "select_folder": "फोल्डरशी जोडा (पर्यायी)" },
+  "map": { "pan": "पॅन", "zoom_in": "झूम इन", "zoom_out": "झूम आउट", "draw_point": "बिंदू काढा", "draw_line": "रेषा काढा", "draw_polygon": "बहुभुज काढा", "edit_feature": "वैशिष्ट्य संपादित करा", "delete_feature": "वैशिष्ट्य हटवा", "measure": "मोजमाप", "buffer": "बफर विश्लेषण", "print_map": "नकाशा मुद्रित करा", "select_features": "बॉक्स निवड", "identify": "ओळखा", "base_map": "बेस मॅप", "layers": "थर", "features": "वैशिष्ट्ये", "add_layer": "थर जोडा", "layer_name": "थराचे नाव", "attributes": "गुणधर्म", "save_feature": "वैशिष्ट्य जतन करा", "feature_saved": "वैशिष्ट्य जतन केले", "feature_deleted": "वैशिष्ट्य हटवले", "no_project": "प्रकल्प निवडला नाही", "select_project": "संपादन सुरू करण्यासाठी प्रकल्प निवडा", "locked_area": "हे क्षेत्र सादर केले आहे — संपादन लॉक", "topology_check": "टोपोलॉजी तपासणी", "zoom_to": "वैशिष्ट्यांवर झूम करा", "coordinates": "निर्देशांक", "area": "क्षेत्र", "length": "लांबी", "go_to": "निर्देशांकावर जा" },
+  "project": { "survey_project": "सर्वेक्षण प्रकल्प", "survey_projects": "सर्वेक्षण प्रकल्प", "project_number": "प्रकल्प क्रमांक", "project_name": "प्रकल्पाचे नाव", "create_project": "प्रकल्प तयार करा", "new_project": "नवीन प्रकल्प", "add_survey_area": "सर्वेक्षण क्षेत्र जोडा", "area_name": "क्षेत्र / पॉकेट नाव", "area_code": "क्षेत्र कोड", "generate_report": "AI सर्वेक्षण अहवाल तयार करा", "create_online_report": "ऑनलाइन अहवाल तयार करा", "check_disputes": "वाद तपासा", "dispute_detected": "सीमा वाद आढळला", "disputes_found_one": "{{count}} अतिव्यापी आढळले", "disputes_found_other": "{{count}} अतिव्यापी आढळले", "acknowledge_submit": "मान्य करून सादर करा", "cancel_submission": "सादरीकरण रद्द करा", "assigned_to": "नियुक्त केले", "history": "इतिहास", "details": "तपशील", "version_compare": "आवृत्ती तुलना", "bulk_transition": "एकत्रित स्थिती बदल", "transition": "बदल", "comment_optional": "टिपणी (पर्यायी)", "review_comment": "पुनरावलोकन टिपणी…", "select_transition": "बदल निवडा", "project_created": "प्रकल्प तयार केला", "project_failed": "प्रकल्प तयार करण्यात अयशस्वी", "select_org": "संस्था निवडा" },
+  "org": { "organisation": "संस्था", "organisations": "संस्था", "add_org": "संस्था जोडा", "edit_org": "संस्था संपादित करा", "delete_org": "ही संस्था हटवायची का?", "level": "पातळी", "dgde": "DGDE (राष्ट्रीय)", "pdde": "PDDE (कमांड)", "deo": "DEO (जिल्हा/क्षेत्र)", "ceo": "CEO (छावणी)", "adeo": "ADEO (उप-क्षेत्र)", "parent": "मूळ संस्था", "office_id": "कार्यालय ID", "office_id_5": "कार्यालय ID (5 अक्षरे)", "office_name": "कार्यालयाचे नाव", "officer_name": "अधिकाऱ्याचे नाव", "address": "पत्ता", "state": "राज्य", "district": "जिल्हा", "pincode": "पिनकोड", "mobile": "मोबाइल", "landline": "लँडलाइन", "select_parent": "मूळ निवडा (असल्यास)", "select_state": "राज्य निवडा", "select_state_first": "आधी राज्य निवडा", "select_district": "जिल्हा निवडा", "org_created": "संस्था तयार केली", "org_updated": "संस्था अद्यतनित केली" },
+  "user": { "users": "वापरकर्ते", "full_name": "पूर्ण नाव", "first_name": "पहिले नाव", "last_name": "आडनाव", "email": "ईमेल", "username": "वापरकर्ता नाव", "employee_id": "कर्मचारी ID", "designation": "पदनाम", "phone": "फोन", "role": "भूमिका", "add_user": "वापरकर्ता जोडा", "create_user": "वापरकर्ता तयार करा", "edit_user": "वापरकर्ता संपादित करा", "delete_user": "हा वापरकर्ता हटवायचा का?", "deactivate_user": "निष्क्रिय करा", "activate_user": "सक्रिय करा", "reset_password": "संकेतशब्द रीसेट", "change_password": "संकेतशब्द बदला", "change_pwd_for": "संकेतशब्द बदला — {{name}}", "force_logout": "जबरदस्ती लॉगआउट", "user_created": "वापरकर्ता तयार केला", "user_updated": "वापरकर्ता अद्यतनित केला", "min_8_chars": "किमान 8 अक्षरे", "superadmin": "सुपर अॅडमिन", "sdo": "SDO", "surveyor": "सर्वेक्षक", "checker": "तपासणीकर्ता", "approver": "मंजूरकर्ता", "viewer": "पाहणारा", "pdde_viewer": "PDDE पाहणारा", "activate": "सक्रिय करा", "deactivate": "निष्क्रिय करा" },
+  "document": { "documents": "दस्तऐवज", "upload_document": "दस्तऐवज अपलोड", "open_in_editor": "OnlyOffice मध्ये उघडा", "ai_process": "AI विश्लेषण चालवा", "ai_processed": "AI प्रक्रिया झाली", "generate_report": "अहवाल तयार करा", "category": "श्रेणी", "size": "आकार", "uploaded_by": "अपलोड केले", "uploaded_at": "अपलोड वेळ" },
+  "ai": { "ai_assistant": "AI सहाय्यक", "chat": "चॅट", "new_chat": "नवीन चॅट", "ask_placeholder": "GIS डेटा, सर्वेक्षण प्रकल्प किंवा संरक्षण भूमीबद्दल विचारा…", "rag_context": "RAG संदर्भ", "no_project_rag": "प्रकल्प नाही (सामान्य चॅट)", "sources_used": "{{count}} स्रोत वापरले", "vision_extraction": "नकाशा सीमा काढणे", "extract_boundaries": "सीमा काढा", "embed_docs": "RAG साठी दस्तऐवज एम्बेड करा", "export_training": "प्रशिक्षण डेटा निर्यात" },
+  "backup": { "title": "बॅकअप आणि पुनर्प्राप्ती", "manual_backup": "मॅन्युअल बॅकअप", "schedules": "वेळापत्रके", "history": "इतिहास", "full_db": "पूर्ण डेटाबेस", "start_backup": "बॅकअप सुरू करा", "download": "डाउनलोड", "backup_queued": "बॅकअप रांगेत आहे", "encrypted": "एन्क्रिप्टेड", "not_encrypted": "एन्क्रिप्ट नाही", "run_now": "आत्ताच चालवा", "daily": "दैनिक", "weekly": "साप्ताहिक", "monthly": "मासिक", "schedule_name": "वेळापत्रकाचे नाव" },
+  "terrain": { "title": "3D भूप्रदेश दर्शक", "load_features": "वैशिष्ट्ये लोड करा", "elevation_query": "उंची", "elevation_profile": "प्रोफाइल", "slope_analysis": "उतार", "fly_to_india": "भारतात जा", "select_project": "प्रकल्प निवडा", "terrain_source": "भूप्रदेश", "clear": "साफ करा", "min_slope": "किमान उतार", "avg_slope": "सरासरी उतार", "max_slope": "कमाल उतार" },
+  "dashboard": { "title": "डॅशबोर्ड", "total_projects": "एकूण प्रकल्प", "total_features": "एकूण वैशिष्ट्ये", "active_users": "सक्रिय वापरकर्ते", "organisations": "संस्था", "status_breakdown": "प्रकल्प स्थिती विश्लेषण", "monthly_trend": "मासिक प्रकल्प निर्मिती", "recent_projects": "अलीकडील प्रकल्प (7 दिवस)", "recent_activity": "अलीकडील क्रियाकलाप", "no_recent_projects": "अलीकडील प्रकल्प नाहीत", "no_recent_activity": "अलीकडील क्रियाकलाप नाही", "published_pct": "{{pct}}% प्रकाशित", "no_data": "अद्याप डेटा नाही" },
+  "reports": { "title": "अहवाल", "add_schedule": "वेळापत्रक जोडा", "edit_schedule": "वेळापत्रक संपादित करा", "schedule_name": "वेळापत्रकाचे नाव", "report_type": "अहवाल प्रकार", "frequency": "वारंवारता", "recipients": "प्राप्तकर्ते (स्वल्पविराम वेगळे ईमेल)", "delete_schedule": "हे वेळापत्रक हटवायचे का?", "send_now": "आत्ताच पाठवा", "schedule_updated": "वेळापत्रक अद्यतनित", "schedule_created": "वेळापत्रक तयार केले", "last_sent": "शेवटचे पाठवले", "next_run": "पुढील रन", "org": "संस्था" },
+  "audit": { "title": "ऑडिट लॉग", "login_logs": "लॉगिन लॉग", "export_logs": "निर्यात लॉग", "sessions": "सत्र", "all_results": "सर्व निकाल", "success": "यशस्वी", "failed": "अयशस्वी", "ip_address": "IP पत्ता", "username": "वापरकर्ता नाव", "timestamp": "वेळ शिक्का", "reason": "कारण" },
+  "qgis": { "title": "QGIS सिंक", "all_projects": "सर्व प्रकल्प", "all_statuses": "सर्व स्थिती", "no_uploads": "अद्याप QGIS अपलोड नाहीत", "request_retry": "पुन्हा प्रयत्न विनंती", "retry_confirm": "पुन्हा प्रयत्न विनंती करायची का?", "search_placeholder": "फाइलनाव / मॉड्यूल शोधा…", "retry_sent": "पुन्हा प्रयत्न विनंती केली." },
+  "branding": { "title": "ब्रँडिंग सेटिंग्ज", "app_title": "अॅप्लिकेशन शीर्षक", "org_subtitle": "उप शीर्षक / संस्थेचे नाव", "tagline": "लॉगिन पेज टॅगलाइन", "logo_url": "लोगो URL", "accent_color": "एक्सेंट रंग", "updated": "ब्रँडिंग अद्यतनित", "save": "ब्रँडिंग जतन करा", "access_denied": "प्रवेश नाकारला — फक्त सुपर अॅडमिन" },
+  "external": { "title": "बाह्य डेटा स्रोत", "add_database": "डेटाबेस जोडा", "test": "चाचणी", "sync_orgs": "संस्था सिंक", "level_filters": "पातळी फिल्टर", "all_rows": "सर्व वापरकर्ते सर्व ओळी पाहतात", "filter_title": "पातळी-निहाय कार्यालय फिल्टर कॉन्फिगर करा", "no_filter_row": "फिल्टर नाही — सर्व ओळी पाहतात", "save_filters": "फिल्टर जतन करा", "add_to_map": "नकाशात जोडा", "read_only_info": "फक्त वाचण्यासाठी थर.", "layer_empty": "\"{{name}}\" लोड झाले पण 0 वैशिष्ट्ये." },
+  "master": { "states": "राज्ये", "districts": "जिल्हे", "taluks": "तालुके", "villages": "गावे", "boundary_import": "सीमा आयात", "import_running": "आयात पार्श्वभूमीत चालू आहे…", "no_jobs": "अद्याप आयात कार्ये नाहीत" },
+  "language": { "select": "भाषा", "en": "English", "hi": "हिन्दी (Hindi)", "ta": "தமிழ் (Tamil)", "te": "తెలుగు (Telugu)", "bn": "বাংলা (Bengali)", "kn": "ಕನ್ನಡ (Kannada)", "mr": "मराठी (Marathi)" }
 }

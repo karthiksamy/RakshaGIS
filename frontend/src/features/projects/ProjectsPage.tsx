@@ -3,10 +3,11 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Table, Button, Tag, Space, Modal, Form, Input, Select,
-  Typography, Tooltip, message, Alert,
+  Typography, Tooltip, message, Alert, Switch,
 } from 'antd'
 import { PlusOutlined, EyeOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
+import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 import { qk } from '@/services/queryKeys'
 import { useAppStore } from '@/app/store'
@@ -41,6 +42,7 @@ export default function ProjectsPage() {
   const [bulkModalOpen, setBulkModalOpen] = useState(false)
   const [bulkTransition, setBulkTransition] = useState('')
   const [bulkComment, setBulkComment] = useState('')
+  const { t } = useTranslation()
   const [bulkLoading, setBulkLoading] = useState(false)
   const [bulkResult, setBulkResult] = useState<{ succeeded: number[]; failed: { id: number; error: string }[] } | null>(null)
 
@@ -59,13 +61,23 @@ export default function ProjectsPage() {
     mutationFn: (values: { name: string; description: string; organisation?: number }) =>
       api.post('/projects/', values).then((r) => r.data),
     onSuccess: () => {
-      message.success('Project created')
+      message.success(t('project.project_created'))
       qc.invalidateQueries({ queryKey: qk.projects() })
       setModalOpen(false)
       form.resetFields()
     },
-    onError: () => message.error('Failed to create project'),
+    onError: () => message.error(t('project.project_failed')),
   })
+
+  // Enable/disable exposure of a project's published data to higher levels (PDDE/DGDE).
+  const toggleEnabledMutation = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      api.post(`/projects/${id}/set-map-enabled/`, { map_enabled: enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.projects() }),
+    onError: (e: any) => message.error(e?.response?.data?.detail || 'Failed to update visibility'),
+  })
+
+  const isAdmin = user && ['SUPERADMIN', 'DEO_ADMIN', 'CEO_ADMIN', 'ADEO_ADMIN'].includes(user.role)
 
   async function handleBulkTransition() {
     if (!bulkTransition) { message.warning('Select a transition'); return }
@@ -129,12 +141,29 @@ export default function ProjectsPage() {
       render: (v) => new Date(v).toLocaleDateString(),
       responsive: ['lg'],
     },
+    ...(isAdmin ? [{
+      title: 'Map',
+      key: 'map_enabled',
+      width: 90,
+      render: (_: any, record: SurveyProject) => (
+        <Tooltip title={record.map_enabled === false
+          ? 'Disabled — hidden from PDDE/DGDE map'
+          : 'Enabled — published data visible to PDDE/DGDE'}>
+          <Switch
+            size="small"
+            checked={record.map_enabled !== false}
+            loading={toggleEnabledMutation.isPending}
+            onChange={(checked) => toggleEnabledMutation.mutate({ id: record.id, enabled: checked })}
+          />
+        </Tooltip>
+      ),
+    }] : []) as ColumnsType<SurveyProject>,
     {
       title: '',
       key: 'actions',
       width: 60,
       render: (_, record) => (
-        <Tooltip title="View">
+        <Tooltip title={t('common.view')}>
           <Button
             type="text"
             icon={<EyeOutlined />}
@@ -145,13 +174,11 @@ export default function ProjectsPage() {
     },
   ]
 
-  const isAdmin = user && ['SUPERADMIN', 'DEO_ADMIN', 'CEO_ADMIN', 'ADEO_ADMIN'].includes(user.role)
-
   return (
     <div style={{ padding: 24, height: '100%', overflow: 'auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
         <Typography.Title level={4} style={{ margin: 0, color: '#e8e8e8' }}>
-          Survey Projects
+          {t('project.survey_projects')}
         </Typography.Title>
         <Space>
           {selectedRowKeys.length > 0 && isAdmin && (
@@ -192,11 +219,11 @@ export default function ProjectsPage() {
 
       {/* Bulk transition modal */}
       <Modal
-        title={<><ThunderboltOutlined style={{ marginRight: 8 }} />Bulk Status Transition</>}
+        title={<><ThunderboltOutlined style={{ marginRight: 8 }} />{t('project.bulk_transition')}</>}
         open={bulkModalOpen}
         onCancel={() => { setBulkModalOpen(false); setBulkComment(''); setBulkTransition('') }}
         onOk={handleBulkTransition}
-        okText="Apply"
+        okText={t("common.apply")}
         confirmLoading={bulkLoading}
         width={480}
       >
@@ -208,7 +235,7 @@ export default function ProjectsPage() {
             <div style={{ color: '#aaa', fontSize: 12, marginBottom: 4 }}>Transition *</div>
             <Select
               style={{ width: '100%' }}
-              placeholder="Select transition"
+              placeholder={t("project.select_transition")}
               value={bulkTransition || undefined}
               onChange={setBulkTransition}
               options={TRANSITIONS.map((t) => ({
@@ -223,7 +250,7 @@ export default function ProjectsPage() {
               rows={2}
               value={bulkComment}
               onChange={(e) => setBulkComment(e.target.value)}
-              placeholder="Review comment…"
+              placeholder={t("project.review_comment")}
             />
           </div>
           {bulkResult && (
@@ -257,23 +284,23 @@ export default function ProjectsPage() {
 
       {/* Create project modal */}
       <Modal
-        title="Create Project"
+        title={t('project.create_project')}
         open={modalOpen}
         onCancel={() => { setModalOpen(false); form.resetFields() }}
         onOk={() => form.submit()}
         confirmLoading={createMutation.isPending}
       >
         <Form form={form} layout="vertical" onFinish={createMutation.mutate}>
-          <Form.Item name="name" label="Project Name" rules={[{ required: true }]}>
+          <Form.Item name="name" label={t("project.project_name")} rules={[{ required: true }]}>
             <Input />
           </Form.Item>
-          <Form.Item name="description" label="Description">
+          <Form.Item name="description" label={t("common.description")}>
             <Input.TextArea rows={3} />
           </Form.Item>
           {user?.role === 'SUPERADMIN' ? (
-            <Form.Item name="organisation" label="Organisation" rules={[{ required: true, message: 'Select an organisation' }]}>
+            <Form.Item name="organisation" label={t("common.organisation")} rules={[{ required: true, message: 'Select an organisation' }]}>
               <Select
-                placeholder="Select organisation"
+                placeholder={t("project.select_org")}
                 options={orgs?.map((o: any) => ({ label: o.name, value: o.id }))}
                 showSearch
                 filterOption={(input, option) =>
@@ -282,7 +309,7 @@ export default function ProjectsPage() {
               />
             </Form.Item>
           ) : (
-            <Form.Item label="Organisation">
+            <Form.Item label={t("common.organisation")}>
               <Input disabled value={user?.organisation_name ?? ''} />
             </Form.Item>
           )}

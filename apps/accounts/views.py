@@ -34,6 +34,7 @@ def _get_device_name(user_agent: str) -> str:
 class OrganisationViewSet(viewsets.ModelViewSet):
     queryset = Organisation.objects.select_related('parent').order_by('level', 'name')
     serializer_class = OrganisationSerializer
+    pagination_class = None  # small hierarchy dataset — return all at once
 
     def get_permissions(self):
         if self.action in ['list', 'retrieve']:

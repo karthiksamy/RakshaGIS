@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Card, Tag, Button, Space, Typography, Tabs, Descriptions, Timeline,
   Upload, Input, Modal, Form, Select, Table, Tree, Spin, message, Alert, Dropdown,
-  Image, Tooltip, Popconfirm,
+  Image, Tooltip, Popconfirm, Checkbox, Switch,
 } from 'antd'
 import {
   ArrowLeftOutlined, UploadOutlined, SendOutlined,
@@ -17,7 +17,8 @@ import {
   SyncOutlined, CheckSquareOutlined, ExclamationCircleOutlined, MinusCircleOutlined,
   CodeOutlined, EnvironmentOutlined, LockOutlined, EditOutlined, RollbackOutlined,
   StopOutlined, ClockCircleOutlined, RobotOutlined, LoadingOutlined, FileAddOutlined,
-  FileWordOutlined, DownloadOutlined,
+  FileWordOutlined, DownloadOutlined, FileExcelOutlined, FilePptOutlined,
+  FileProtectOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import type { DataNode } from 'antd/es/tree'
@@ -170,11 +171,21 @@ function buildTreeData(
           icon: fileIcon(doc.mime_type),
           title: (
             <span style={{ display: 'flex', alignItems: 'center', gap: 4, maxWidth: 180 }}>
-              <a href={doc.file} target="_blank" rel="noreferrer"
-                style={{ color: '#aaa', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}
-                title={doc.title} onClick={(e) => e.stopPropagation()}>
-                {doc.title}
-              </a>
+              {isOfficeDoc && onOpenInOffice ? (
+                <span
+                  style={{ color: '#aaa', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, cursor: 'pointer', textDecoration: 'underline' }}
+                  title={doc.title}
+                  onClick={(e) => { e.stopPropagation(); e.preventDefault(); onOpenInOffice(doc.id); }}
+                >
+                  {doc.title}
+                </span>
+              ) : (
+                <a href={doc.file} target="_blank" rel="noreferrer"
+                  style={{ color: '#aaa', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}
+                  title={doc.title} onClick={(e) => e.stopPropagation()}>
+                  {doc.title}
+                </a>
+              )}
               {doc.file_size > 0 && (
                 <span style={{ color: '#555', fontSize: 10, flexShrink: 0 }}>{formatBytes(doc.file_size)}</span>
               )}
@@ -373,6 +384,7 @@ export default function ProjectDetailPage() {
 
   // Report generation state
   const [reportLoading, setReportLoading] = useState<number | null>(null)
+  const [templateReportLoading, setTemplateReportLoading] = useState<number | null>(null)
   const [reportResult, setReportResult] = useState<{
     areaName: string; docId: number; docUrl: string; pdfUrl: string | null
   } | null>(null)
@@ -470,6 +482,14 @@ export default function ProjectDetailPage() {
     queryFn: () => api.get(`/projects/survey-areas/?project=${pid}&page_size=200`).then(r => r.data.results ?? r.data),
   })
 
+  // Enable/disable exposure of this area's published data to higher levels (PDDE/DGDE).
+  const toggleAreaEnabled = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      api.post(`/projects/survey-areas/${id}/set-map-enabled/`, { map_enabled: enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.surveyAreas(pid) }),
+    onError: (e: any) => message.error(e?.response?.data?.detail || 'Failed to update visibility'),
+  })
+
   const createArea = useMutation({
     mutationFn: (values: any) => api.post('/projects/survey-areas/', { ...values, project: pid }),
     onSuccess: () => {
@@ -495,7 +515,15 @@ export default function ProjectDetailPage() {
 
   const deleteArea = useMutation({
     mutationFn: (id: number) => api.delete(`/projects/survey-areas/${id}/`),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: qk.surveyAreas(pid) }); message.success('Survey area deleted') },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.surveyAreas(pid) })
+      // Its features/rasters/docs were purged server-side — refresh the map + tree too.
+      qc.invalidateQueries({ queryKey: ['map-features'] })
+      qc.invalidateQueries({ queryKey: qk.geotiffs(pid) })
+      qc.invalidateQueries({ queryKey: ['documents', pid] })
+      qc.invalidateQueries({ queryKey: ['folders', pid] })
+      message.success('Survey area and all its data deleted')
+    },
     onError: (e: any) => message.error(e?.response?.data?.detail || 'Cannot delete — may already be submitted'),
   })
 
@@ -539,6 +567,15 @@ export default function ProjectDetailPage() {
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['folders', pid] }); message.success('Folder deleted') },
   })
 
+  const deleteDocument = useMutation({
+    mutationFn: (docId: number) => api.delete(`/documents/${docId}/`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.documents({ project: pid }) })
+      message.success('Document deleted')
+    },
+    onError: (e: any) => message.error(e?.response?.data?.detail || 'Failed to delete document'),
+  })
+
   // Computed values that are safe before early returns (foldersRaw defaults to [])
   const activeVersionId = findActiveVersionId(foldersRaw)
   const allDocs: Document[] = docs?.results ?? []
@@ -552,6 +589,11 @@ export default function ProjectDetailPage() {
     }
   }, [activeVersionId])
 
+  // SURVEYOR works at CEO/ADEO level — their uploads can be shared with the parent DEO.
+  // Default Yes; only shown to cantonment-level uploaders. (Must stay above the early
+  // returns below — calling it after them changes the hook count once data loads → React #310.)
+  const [deoVisible, setDeoVisible] = useState(true)
+
   if (isLoading) return <div style={{ padding: 24 }}><Spin /></div>
   if (!project) return <Alert type="error" message="Project not found" style={{ margin: 24 }} />
 
@@ -560,6 +602,15 @@ export default function ProjectDetailPage() {
   const canApprove = user?.role && ['APPROVER', 'SUPERADMIN'].includes(user.role)
   const canPublish = user?.role && ['DEO_ADMIN', 'CEO_ADMIN', 'ADEO_ADMIN', 'SUPERADMIN'].includes(user.role)
   const canEdit = user?.role && ['SDO', 'SURVEYOR', 'SUPERADMIN'].includes(user.role)
+
+  const isCantonmentUploader = user?.role === 'SURVEYOR'
+  const deoVisibleToggle = isCantonmentUploader ? (
+    <Tooltip title="If checked, the parent DEO office can view this data in the Map Viewer.">
+      <Checkbox checked={deoVisible} onChange={(e) => setDeoVisible(e.target.checked)}>
+        Allow parent DEO to view
+      </Checkbox>
+    </Tooltip>
+  ) : null
 
   // Per-area actions helper
   function areaActions(area: SurveyArea) {
@@ -652,7 +703,30 @@ export default function ProjectDetailPage() {
       title: 'Folder', dataIndex: 'folder_name', width: 100,
       render: (v) => v ? <Tag style={{ fontSize: 10 }}>{v}</Tag> : <span style={{ color: '#555' }}>—</span>,
     },
-    { title: 'Title', dataIndex: 'title', ellipsis: true },
+    {
+      title: 'Title',
+      dataIndex: 'title',
+      ellipsis: true,
+      render: (v, doc) => {
+        const ext = (doc.file ?? '').split('.').pop()?.toLowerCase() ?? ''
+        const isOfficeDoc = ['doc', 'docx', 'odt', 'rtf', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf'].includes(ext)
+        if (isOfficeDoc) {
+          return (
+            <a
+              style={{ cursor: 'pointer', color: '#1677ff', textDecoration: 'underline' }}
+              onClick={(e) => { e.preventDefault(); openDocumentInNewTab(doc.id); }}
+            >
+              {v}
+            </a>
+          )
+        }
+        return doc.file_url ? (
+          <a href={doc.file_url} target="_blank" rel="noreferrer" style={{ color: '#aaa' }}>
+            {v}
+          </a>
+        ) : v
+      }
+    },
     {
       title: 'Category', dataIndex: 'category_display', width: 100,
       render: (v, doc) => <Tag style={{ fontSize: 10 }}>{v || doc.category}</Tag>,
@@ -771,8 +845,12 @@ export default function ProjectDetailPage() {
             treeData={treeData}
             onSelect={(keys) => {
               const key = keys[0]
-              if (key) {
-                setSelectedFolderId(Number(key))
+              if (!key) return
+              const keyStr = String(key)
+              if (/^(doc|geotiff|shp)-/.test(keyStr)) return
+              const folderId = Number(keyStr)
+              if (!Number.isNaN(folderId)) {
+                setSelectedFolderId(folderId)
                 setSelectedProjectId(pid)
               }
             }}
@@ -788,62 +866,102 @@ export default function ProjectDetailPage() {
                 : false
 
               const menuItems: any[] = []
+              const docLeafMatch = /^doc-(\d+)$/.exec(String(node.key))
+              const isDocLeaf = Boolean(docLeafMatch)
+              const docLeafId = docLeafMatch ? Number(docLeafMatch[1]) : null
 
-              if (isDoc) {
-                menuItems.push({
-                  key: 'doc', label: 'Upload Document', icon: <UploadOutlined />,
-                  disabled: folderLocked,
-                  onClick: folderLocked ? undefined : () => setDocModal({ folderId: folderObj!.id, folderName: folderObj!.name }),
-                })
-                menuItems.push({
-                  key: 'new-doc', label: 'New Online Document', icon: <FileAddOutlined />,
-                  disabled: folderLocked,
-                  onClick: folderLocked ? undefined : () => {
-                    const docType = 'docx'
-                    const title = `New Document — ${folderObj!.name}`
-                    api.post('/documents/create-blank/', { folder: folderObj!.id, title, doc_type: docType })
+              if (folderObj) {
+                if (isDoc) {
+                  menuItems.push({
+                    key: 'doc', label: 'Upload Document', icon: <UploadOutlined />,
+                    disabled: folderLocked,
+                    onClick: folderLocked ? undefined : () => setDocModal({ folderId: folderObj.id, folderName: folderObj.name }),
+                  })
+                  const createBlankDoc = (docType: string) => {
+                    const title = `New ${docType.toUpperCase()} — ${folderObj.name}`
+                    api.post('/documents/create-blank/', { folder: folderObj.id, title, doc_type: docType })
                       .then((r) => {
-                        qc.invalidateQueries({ queryKey: ['documents', pid] })
+                        qc.invalidateQueries({ queryKey: qk.documents({ project: pid }) })
                         openDocumentInNewTab(r.data.doc_id)
                       })
                       .catch((e) => message.error(e?.response?.data?.detail || 'Failed to create document'))
-                  },
-                })
-              } else if (isShp) {
-                menuItems.push({
-                  key: 'shp', label: 'Upload Shape File / Vector GIS', icon: <ImportOutlined />,
-                  disabled: folderLocked,
-                  onClick: folderLocked ? undefined : () => {
-                    setShpLayerName(folderObj!.name.toLowerCase().replace(/\s+/g, '_'))
-                    setShpNameField('')
-                    setShpGisType('zip')   // default to shapefile zip for Shape Files folder
-                    setShpModal({ folderId: folderObj!.id, folderName: folderObj!.name })
-                  },
-                })
-              } else if (isRaster) {
-                menuItems.push({
-                  key: 'raster', label: 'Upload GeoTIFF / Raster', icon: <PictureOutlined />,
-                  disabled: folderLocked,
-                  onClick: folderLocked ? undefined : () => {
-                    setShpLayerName(folderObj!.name.toLowerCase().replace(/\s+/g, '_'))
-                    setShpNameField('')
-                    setShpGisType('tiff')   // force raster for Raster folders
-                    setShpModal({ folderId: folderObj!.id, folderName: folderObj!.name })
-                  },
-                })
-              } else {
-                // Non-leaf folder: allow adding sub-folders except system-managed BOUNDARY/COMMON
-                if (ft !== 'BOUNDARY' && ft !== 'COMMON') {
-                  menuItems.push({ key: 'add', label: 'Add Sub-folder', icon: <PlusOutlined />,
-                    disabled: folderLocked,
-                    onClick: folderLocked ? undefined : () => { folderForm.resetFields(); setAddFolderModal({ parentId: Number(node.key) }) } })
-                }
-              }
+                  }
 
-              if (!isLeafFolder) {
-                menuItems.push({ key: 'del', label: 'Delete', icon: <DeleteOutlined />, danger: true,
-                  disabled: folderLocked,
-                  onClick: folderLocked ? undefined : () => deleteFolder.mutate(Number(node.key)) })
+                  menuItems.push({
+                    key: 'new-doc-onlyoffice',
+                    label: 'New Document OnlyOffice',
+                    icon: <FileAddOutlined />,
+                    disabled: folderLocked,
+                    children: [
+                      {
+                        key: 'new-doc-docx',
+                        label: 'Word Document (.docx)',
+                        icon: <FileWordOutlined />,
+                        onClick: () => createBlankDoc('docx'),
+                      },
+                      {
+                        key: 'new-doc-xlsx',
+                        label: 'Excel Spreadsheet (.xlsx)',
+                        icon: <FileExcelOutlined />,
+                        onClick: () => createBlankDoc('xlsx'),
+                      },
+                      {
+                        key: 'new-doc-pptx',
+                        label: 'PowerPoint Presentation (.pptx)',
+                        icon: <FilePptOutlined />,
+                        onClick: () => createBlankDoc('pptx'),
+                      },
+                    ],
+                  })
+                } else if (isShp) {
+                  menuItems.push({
+                    key: 'shp', label: 'Upload Shape File / Vector GIS', icon: <ImportOutlined />,
+                    disabled: folderLocked,
+                    onClick: folderLocked ? undefined : () => {
+                      setShpLayerName(folderObj.name.toLowerCase().replace(/\s+/g, '_'))
+                      setShpNameField('')
+                      setShpGisType('zip')   // default to shapefile zip for Shape Files folder
+                      setShpModal({ folderId: folderObj.id, folderName: folderObj.name })
+                    },
+                  })
+                } else if (isRaster) {
+                  menuItems.push({
+                    key: 'raster', label: 'Upload GeoTIFF / Raster', icon: <PictureOutlined />,
+                    disabled: folderLocked,
+                    onClick: folderLocked ? undefined : () => {
+                      setShpLayerName(folderObj.name.toLowerCase().replace(/\s+/g, '_'))
+                      setShpNameField('')
+                      setShpGisType('tiff')   // force raster for Raster folders
+                      setShpModal({ folderId: folderObj.id, folderName: folderObj.name })
+                    },
+                  })
+                } else {
+                  // Non-leaf folder: allow adding sub-folders except system-managed BOUNDARY/COMMON
+                  if (ft !== 'BOUNDARY' && ft !== 'COMMON') {
+                    menuItems.push({ key: 'add', label: 'Add Sub-folder', icon: <PlusOutlined />,
+                      disabled: folderLocked,
+                      onClick: folderLocked ? undefined : () => { folderForm.resetFields(); setAddFolderModal({ parentId: folderObj.id }) } })
+                  }
+                }
+
+                if (!isLeafFolder) {
+                  menuItems.push({ key: 'del', label: 'Delete', icon: <DeleteOutlined />, danger: true,
+                    disabled: folderLocked,
+                    onClick: folderLocked ? undefined : () => deleteFolder.mutate(folderObj.id) })
+                }
+              } else if (isDocLeaf && canEdit && docLeafId !== null) {
+                menuItems.push({
+                  key: 'del-doc', label: 'Delete Document', icon: <DeleteOutlined />, danger: true,
+                  onClick: () => {
+                    Modal.confirm({
+                      title: 'Delete document?',
+                      content: 'This document will be permanently removed.',
+                      okText: 'Delete',
+                      okButtonProps: { danger: true },
+                      onOk: () => deleteDocument.mutate(docLeafId),
+                    })
+                  },
+                })
               }
 
               return (
@@ -970,6 +1088,19 @@ export default function ProjectDetailPage() {
                         }}
                         extra={
                           <Space>
+                            {canPublish && (
+                              <Tooltip title={area.map_enabled === false
+                                ? 'Disabled — hidden from PDDE/DGDE map'
+                                : 'Enabled — published data visible to PDDE/DGDE'}>
+                                <Switch
+                                  size="small"
+                                  checkedChildren="On" unCheckedChildren="Off"
+                                  checked={area.map_enabled !== false}
+                                  loading={toggleAreaEnabled.isPending}
+                                  onChange={(checked) => toggleAreaEnabled.mutate({ id: area.id, enabled: checked })}
+                                />
+                              </Tooltip>
+                            )}
                             {(area.status === 'APPROVED' || area.status === 'PUBLISHED') && (
                               <Tag color="success" icon={<LockOutlined />}>Read-only</Tag>
                             )}
@@ -1009,6 +1140,26 @@ export default function ProjectDetailPage() {
                                     message.success('Blank report created — OnlyOffice opening…')
                                   } catch (e: any) {
                                     message.error(e?.response?.data?.detail || 'Failed to create blank report')
+                                  }
+                                }}
+                              />
+                            </Tooltip>
+                            <Tooltip title="Create DGDE ministry-format survey report (template, auto-filled) and edit online">
+                              <Button
+                                size="small" type="text" icon={<FileProtectOutlined />}
+                                style={{ color: '#722ed1' }}
+                                loading={templateReportLoading === area.id}
+                                onClick={async () => {
+                                  setTemplateReportLoading(area.id)
+                                  try {
+                                    const r = await api.post(`/projects/survey-areas/${area.id}/template-report/`)
+                                    qc.invalidateQueries({ queryKey: ['documents', pid] })
+                                    openDocumentInNewTab(r.data.doc_id)
+                                    message.success('DGDE survey report created from template — OnlyOffice opening…')
+                                  } catch (e: any) {
+                                    message.error(e?.response?.data?.detail || 'Failed to create template report')
+                                  } finally {
+                                    setTemplateReportLoading(null)
                                   }
                                 }}
                               />
@@ -1194,6 +1345,7 @@ export default function ProjectDetailPage() {
                         form.append('file', file as Blob)
                         form.append('project', String(pid))
                         form.append('name', (file as File).name.replace(/\.[^.]+$/, ''))
+                        if (isCantonmentUploader) form.append('deo_visible', String(deoVisible))
                         api.post('/projects/geotiffs/', form, {
                           headers: { 'Content-Type': 'multipart/form-data' },
                         }).then((r) => {
@@ -1209,6 +1361,7 @@ export default function ProjectDetailPage() {
                       <Button icon={<UploadOutlined />} size="small">Upload GeoTiff (.tif)</Button>
                     </Upload>
                   )}
+                  {canEdit && deoVisibleToggle}
                   <Table<GeoTiffLayer>
                     dataSource={geotiffs}
                     rowKey="id"
@@ -1289,6 +1442,7 @@ export default function ProjectDetailPage() {
                         form.append('file', file as Blob)
                         form.append('project', String(pid))
                         form.append('layer_name', (file as File).name.replace(/\.[^.]+$/, ''))
+                        if (isCantonmentUploader) form.append('deo_visible', String(deoVisible))
                         api.post('/projects/shapefile-imports/', form, {
                           headers: { 'Content-Type': 'multipart/form-data' },
                         }).then((r) => {
@@ -1304,6 +1458,7 @@ export default function ProjectDetailPage() {
                       <Button icon={<UploadOutlined />} size="small">Import GIS File (.zip / .geojson / .kml / .gpkg)</Button>
                     </Upload>
                   )}
+                  {canEdit && deoVisibleToggle}
                   <Table<ShapefileImport>
                     dataSource={shapefileImports}
                     rowKey="id"
@@ -1873,6 +2028,7 @@ export default function ProjectDetailPage() {
               fd.append('file', file as Blob)
               if (shpLayerName) fd.append('layer_name', shpLayerName)
               if (shpNameField) fd.append('name_field', shpNameField)
+              if (isCantonmentUploader) fd.append('deo_visible', String(deoVisible))
               setShpUploading(true)
               api.post(`/projects/folders/${shpModal.folderId}/import-gis-file/`, fd, {
                 headers: { 'Content-Type': 'multipart/form-data' },
@@ -1901,6 +2057,7 @@ export default function ProjectDetailPage() {
               {shpUploading ? 'Importing…' : 'Choose GIS File & Import'}
             </Button>
           </Upload>
+          {deoVisibleToggle}
         </Space>
       </Modal>
 

@@ -28,6 +28,11 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
     retry: false,
   })
 
+  // Reflect the configured application title in the browser tab.
+  React.useEffect(() => {
+    if (data?.app_title) document.title = data.app_title
+  }, [data?.app_title])
+
   return (
     <BrandingContext.Provider value={data ?? DEFAULTS}>
       {children}

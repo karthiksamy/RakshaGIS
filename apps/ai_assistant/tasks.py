@@ -2,6 +2,8 @@ import json
 import os
 import tempfile
 import zipfile
+import subprocess
+import numpy as np
 
 from celery import shared_task
 from django.utils import timezone
@@ -478,21 +480,28 @@ def embed_document(self, task_id: int):
 @shared_task(bind=True, max_retries=0, name='ai_assistant.extract_map_boundaries')
 def extract_map_boundaries(self, job_id: int):
     """
-    Send a scanned map image to a vision LLM (LLaVA / Ollama) and parse
-    the response into parcel metadata + draft GeoJSON features.
+    Send a map image to a vision LLM and parse the response into draft GeoJSON features.
+
+    Two modes:
+    • Scanned map  → geometry=null, needs manual georeferencing
+    • GeoTiff      → real WGS-84 polygon coordinates derived from the image extent
     """
     import base64
+    import subprocess
     from datetime import timezone as dt_tz
     from datetime import datetime
 
     from apps.ai_assistant.models import BoundaryExtractionJob
     from apps.ai_assistant.services import LLMService
 
-    job = BoundaryExtractionJob.objects.select_related('source_document', 'project').get(id=job_id)
+    job = BoundaryExtractionJob.objects.select_related(
+        'source_document', 'project', 'source_geotiff'
+    ).get(id=job_id)
     job.status = BoundaryExtractionJob.RUNNING
     job.save(update_fields=['status'])
 
-    EXTRACTION_PROMPT = """You are analysing a scanned paper land survey / cadastral map from India
+    # ── Scanned map prompt ────────────────────────────────────────────────────
+    SCAN_PROMPT = """You are analysing a scanned paper land survey / cadastral map from India
 (DGDE Defence Estates). Extract all visible parcel and boundary information.
 
 Return a JSON object with this exact structure:
@@ -525,56 +534,222 @@ Return a JSON object with this exact structure:
 
 Return ONLY valid JSON. No explanation text before or after the JSON."""
 
+    tmp_png = None
     try:
-        # Get image bytes
-        image_bytes = None
-        if job.source_document and job.source_document.file:
-            with open(job.source_document.file.path, 'rb') as f:
-                image_bytes = f.read()
-        elif job.source_image:
-            with open(job.source_image.path, 'rb') as f:
-                image_bytes = f.read()
-
-        if not image_bytes:
-            raise ValueError('No image file found for this extraction job.')
-
-        image_b64 = base64.b64encode(image_bytes).decode()
-
         svc = LLMService()
-        raw = svc.vision_analyze(image_b64, EXTRACTION_PROMPT, model=job.vision_model)
-        job.raw_response = raw
 
-        # Parse JSON from the response
-        parsed = _parse_json_from_text(raw)
-        job.parsed_result = parsed
+        # ── Mode A: GeoTiff source ────────────────────────────────────────────
+        if job.source_geotiff:
+            from django.conf import settings as dj_settings
 
-        # Build draft GeoJSON features from parcel descriptions
-        # Since we have no coordinate data from scanned maps, we create point features
-        # at the project's centroid area — user must georeference manually
-        draft = []
-        if parsed and 'parcels' in parsed:
-            for i, parcel in enumerate(parsed['parcels']):
+            geotiff = job.source_geotiff
+            # Prefer the raw upload file for rendering — COG tiles may fail
+            # with plain gdal_translate; the raw GeoTiff is always safe.
+            # Fall back to COG only when the raw file is missing.
+            raw_field = geotiff.file
+            cog_field = geotiff.cog_file
+            raw_path  = os.path.join(dj_settings.MEDIA_ROOT, raw_field.name) if raw_field else None
+            cog_path  = os.path.join(dj_settings.MEDIA_ROOT, cog_field.name) if cog_field else None
+
+            # Pick best source: prefer raw file (exists + non-empty), else COG
+            if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+                src_path = raw_path
+            elif cog_path and os.path.exists(cog_path):
+                src_path = cog_path
+            else:
+                raise FileNotFoundError(f'No accessible GeoTiff file for layer {geotiff.id}')
+
+            # ── Get geographic extent via gdalinfo ────────────────────────────
+            info_out = subprocess.run(
+                ['gdalinfo', '-json', src_path],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            info = json.loads(info_out)
+
+            corners = info.get('cornerCoordinates', {})
+            ul = corners.get('upperLeft',  [0, 90])
+            lr = corners.get('lowerRight', [1, 0])
+            west, north = float(ul[0]), float(ul[1])
+            east, south = float(lr[0]), float(lr[1])
+
+            # ── Render to PNG for vision model (max 1024 px wide) ─────────────
+            # Use gdalwarp (handles COG, tiled, compressed formats better than
+            # gdal_translate -scale alone). Output to a temp file.
+            import tempfile as _tempfile
+            tmp_png_fd, tmp_png = _tempfile.mkstemp(suffix='_vis.png')
+            os.close(tmp_png_fd)
+
+            try:
+                subprocess.run(
+                    [
+                        'gdalwarp',
+                        '-of', 'PNG',
+                        '-ts', '1024', '0',      # target size: 1024 px wide, proportional height
+                        '-r', 'bilinear',
+                        '-co', 'WORLDFILE=NO',
+                        src_path, tmp_png,
+                    ],
+                    check=True, capture_output=True,
+                )
+            except subprocess.CalledProcessError:
+                # gdalwarp fallback: use gdal_translate with explicit scale
+                subprocess.run(
+                    [
+                        'gdal_translate', src_path, tmp_png,
+                        '-of', 'PNG',
+                        '-outsize', '1024', '0',
+                        '-scale',
+                        '-ot', 'Byte',
+                    ],
+                    check=True, capture_output=True,
+                )
+            with open(tmp_png, 'rb') as fh:
+                image_b64 = base64.b64encode(fh.read()).decode()
+
+            geotiff_prompt = f"""You are analysing a georeferenced satellite/drone image for DGDE Defence Estates land survey.
+
+Geographic bounds of this image (WGS84 decimal degrees):
+  Top-left corner:     {north:.6f}°N, {west:.6f}°E
+  Bottom-right corner: {south:.6f}°N, {east:.6f}°E
+
+Detect and trace ALL of the following feature types:
+1. OUTER BOUNDARY — the outermost perimeter of the entire surveyed area.
+2. INNER PARCELS — each individual sub-parcel, plot, or land division visible inside the boundary (trace each one separately).
+3. STRUCTURES — buildings, sheds, tanks, any man-made structures.
+4. ROADS & PATHS — roads, tracks, pathways.
+5. WATER BODIES — rivers, canals, ponds, drainage.
+6. VEGETATION — forest patches, agricultural fields, scrubland.
+
+For EACH feature trace its boundary polygon using NORMALISED image coordinates:
+  x: 0.0 = left edge → 1.0 = right edge
+  y: 0.0 = top edge  → 1.0 = bottom edge
+  Minimum 4 vertices. Close each polygon by repeating the first vertex last.
+
+Return ONLY valid JSON (no text before or after the JSON block):
+{{
+  "features": [
+    {{
+      "type": "outer_boundary|inner_parcel|building|road|water|vegetation|structure|fence|other",
+      "label": "descriptive name (e.g. 'Survey Area Boundary', 'Parcel A-1', 'Khasra 123', 'Main Road')",
+      "polygon": [[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x1,y1]],
+      "is_outer": false,
+      "confidence": "high|medium|low",
+      "notes": "any observations about this feature"
+    }}
+  ],
+  "image_quality": "clear|partially_obscured|cloudy|unclear",
+  "overall_description": "brief scene description"
+}}\n\nIMPORTANT: include both the outer boundary AND every inner parcel as separate feature entries."""
+
+            raw = svc.vision_analyze(image_b64, geotiff_prompt, model=job.vision_model)
+            job.raw_response = raw
+
+            parsed = _parse_json_from_text(raw)
+            raw_features = parsed.get('features', [])
+            job.parsed_result = {
+                'source': 'geotiff',
+                'bounds': {'west': west, 'south': south, 'east': east, 'north': north},
+                'image_quality': parsed.get('image_quality', ''),
+                'overall_description': parsed.get('overall_description', ''),
+                'model_feature_count': len(raw_features),
+            }
+
+            # Convert normalised pixel coords → WGS-84 lon/lat
+            def _norm_to_lonlat(x_norm: float, y_norm: float):
+                # Clamp to [0,1] — model may return slightly out-of-range values
+                x_norm = max(0.0, min(1.0, float(x_norm)))
+                y_norm = max(0.0, min(1.0, float(y_norm)))
+                return [
+                    round(west  + x_norm * (east  - west),  8),
+                    round(north - y_norm * (north - south),  8),  # y=0 → north
+                ]
+
+            draft = []
+            skipped_reasons = []
+            for i, feat in enumerate(raw_features):
+                poly_norm = feat.get('polygon', [])
+                if not poly_norm:
+                    skipped_reasons.append(f'feature {i}: no polygon key')
+                    continue
+                # Accept both [[x,y],...] and [[x,y,z],...] point formats
+                try:
+                    pts = [[float(p[0]), float(p[1])] for p in poly_norm]
+                except (TypeError, IndexError, ValueError) as e:
+                    skipped_reasons.append(f'feature {i}: bad coords ({e})')
+                    continue
+                if len(pts) < 3:
+                    skipped_reasons.append(f'feature {i}: only {len(pts)} vertices')
+                    continue
+                ring = [_norm_to_lonlat(pt[0], pt[1]) for pt in pts]
+                # Ensure the ring is closed
+                if ring[0] != ring[-1]:
+                    ring.append(ring[0])
                 draft.append({
                     'type': 'Feature',
-                    'geometry': None,  # No coordinates — requires manual georeferencing
+                    'geometry': {'type': 'Polygon', 'coordinates': [ring]},
                     'properties': {
-                        'survey_number': parcel.get('survey_number', f'parcel_{i+1}'),
-                        'area_text': parcel.get('area_text', ''),
-                        'shape': parcel.get('shape', ''),
-                        'owner_text': parcel.get('owner_text', ''),
-                        'adjacent_surveys': parcel.get('adjacent_surveys', []),
-                        'notes': parcel.get('notes', ''),
-                        'source': 'vision_extraction',
-                        'needs_georeferencing': True,
+                        'feature_type': feat.get('type', 'unknown'),
+                        'label':        feat.get('label', f'Feature {i+1}'),
+                        'is_outer':     bool(feat.get('is_outer', False) or feat.get('type') == 'outer_boundary'),
+                        'confidence':   feat.get('confidence', 'medium'),
+                        'notes':        feat.get('notes', ''),
+                        'source':       'geotiff_vision',
+                        'has_coordinates': True,
                     },
                 })
-        job.draft_features = draft
 
+            job.parsed_result['polygon_count'] = len(draft)
+            if skipped_reasons:
+                job.parsed_result['skipped_features'] = skipped_reasons
+
+        # ── Mode B: Scanned map ───────────────────────────────────────────────
+        else:
+            image_bytes = None
+            if job.source_document and job.source_document.file:
+                with open(job.source_document.file.path, 'rb') as f:
+                    image_bytes = f.read()
+            elif job.source_image:
+                with open(job.source_image.path, 'rb') as f:
+                    image_bytes = f.read()
+            if not image_bytes:
+                raise ValueError('No image file found for this extraction job.')
+
+            image_b64 = base64.b64encode(image_bytes).decode()
+            raw    = svc.vision_analyze(image_b64, SCAN_PROMPT, model=job.vision_model)
+            job.raw_response = raw
+            parsed = _parse_json_from_text(raw)
+            job.parsed_result = parsed
+
+            draft = []
+            if parsed and 'parcels' in parsed:
+                for i, parcel in enumerate(parsed['parcels']):
+                    draft.append({
+                        'type': 'Feature',
+                        'geometry': None,
+                        'properties': {
+                            'survey_number':   parcel.get('survey_number', f'parcel_{i+1}'),
+                            'area_text':       parcel.get('area_text', ''),
+                            'shape':           parcel.get('shape', ''),
+                            'owner_text':      parcel.get('owner_text', ''),
+                            'adjacent_surveys':parcel.get('adjacent_surveys', []),
+                            'notes':           parcel.get('notes', ''),
+                            'source':          'vision_extraction',
+                            'has_coordinates': False,
+                        },
+                    })
+
+        job.draft_features = draft
         job.status = BoundaryExtractionJob.DONE
+
     except Exception as exc:
-        job.status = BoundaryExtractionJob.FAILED
+        job.status    = BoundaryExtractionJob.FAILED
         job.error_log = str(exc)
     finally:
+        if tmp_png and os.path.exists(tmp_png):
+            try:
+                os.unlink(tmp_png)
+            except Exception:
+                pass
         job.completed_at = datetime.now(tz=dt_tz.utc)
         job.save(update_fields=['status', 'raw_response', 'parsed_result',
                                 'draft_features', 'error_log', 'completed_at'])
@@ -661,3 +836,514 @@ def export_training_dataset(self, task_id: int):
     finally:
         task.completed_at = timezone.now()
         task.save(update_fields=['status', 'result', 'error_message', 'completed_at'])
+
+
+# ── Classical GIS Polygon Extraction ─────────────────────────────────────────
+
+# Lazily-instantiated PaddleOCR singleton (heavy to construct; reused across
+# polygons). `False` means OCR is unavailable in this environment.
+_PADDLE_OCR = None
+
+
+def _get_paddle_ocr():
+    global _PADDLE_OCR
+    if _PADDLE_OCR is not None:
+        return _PADDLE_OCR
+    try:
+        from paddleocr import PaddleOCR
+        _PADDLE_OCR = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+    except Exception:
+        _PADDLE_OCR = False
+    return _PADDLE_OCR
+
+
+def _poly_lonlat_bounds(geojson_geom):
+    """Return (min_lon, min_lat, max_lon, max_lat) for a GeoJSON polygon geometry."""
+    pts = []
+
+    def _walk(c):
+        if isinstance(c, (list, tuple)) and c and isinstance(c[0], (int, float)):
+            pts.append(c)
+        elif isinstance(c, (list, tuple)):
+            for x in c:
+                _walk(x)
+
+    _walk((geojson_geom or {}).get('coordinates'))
+    if not pts:
+        return None
+    lons = [p[0] for p in pts]
+    lats = [p[1] for p in pts]
+    return min(lons), min(lats), max(lons), max(lats)
+
+
+def _ocr_survey_number(gray_small, geojson_geom, west, north, pix_w_s, pix_h_s):
+    """
+    Best-effort survey-number OCR for a single polygon. Crops the polygon's
+    bounding box from the (downsampled) grayscale raster and reads the most
+    confident number-like token. Returns (text, confidence); ('', 0.0) on any
+    failure or when OCR is unavailable — the caller leaves the attribute blank.
+    """
+    import re
+    import numpy as np
+    try:
+        ocr = _get_paddle_ocr()
+        if not ocr:
+            return '', 0.0
+        b = _poly_lonlat_bounds(geojson_geom)
+        if not b:
+            return '', 0.0
+        min_lon, min_lat, max_lon, max_lat = b
+        h, w = gray_small.shape[:2]
+        # pix_h_s is negative (north→south), so max_lat maps to the smaller y.
+        x0 = int((min_lon - west) / pix_w_s)
+        x1 = int((max_lon - west) / pix_w_s)
+        y0 = int((max_lat - north) / pix_h_s)
+        y1 = int((min_lat - north) / pix_h_s)
+        x0, x1 = sorted((max(0, min(x0, w - 1)), max(0, min(x1, w - 1))))
+        y0, y1 = sorted((max(0, min(y0, h - 1)), max(0, min(y1, h - 1))))
+        if (x1 - x0) < 6 or (y1 - y0) < 6:
+            return '', 0.0
+        crop = gray_small[y0:y1, x0:x1]
+        crop_rgb = np.stack([crop] * 3, axis=-1) if crop.ndim == 2 else crop
+        result = ocr.ocr(crop_rgb, cls=True)
+        if not result or not result[0]:
+            return '', 0.0
+        best_text, best_conf = '', 0.0
+        for line in result[0]:
+            try:
+                txt, conf = line[1][0], float(line[1][1])
+            except Exception:
+                continue
+            if conf > best_conf:
+                best_text, best_conf = txt, conf
+        # Prefer a survey-number-like token (digits with optional /-letter parts).
+        m = re.search(r'[0-9]+(?:[/\-][0-9A-Za-z]+)*', best_text or '')
+        token = m.group(0) if m else (best_text or '').strip()
+        return token, round(best_conf, 3)
+    except Exception:
+        return '', 0.0
+
+
+@shared_task(bind=True, max_retries=0, name='ai_assistant.extract_polygons_classical')
+def extract_polygons_classical(self, job_id: int):
+    """
+    Industry-standard classical GIS pipeline for automated polygon extraction.
+
+    GeoTIFF → grayscale → Gaussian smooth → edge detection (Sobel)
+           → Otsu threshold → morphological gap closing (dilation)
+           → connected component labeling → area filtering
+           → GDAL Polygonize → WGS-84 GeoJSON draft features
+
+    No vision LLM required. Uses the same spatial primitives as QGIS,
+    ArcGIS Pro and Orfeo Toolbox.
+
+    Parameters stored in BoundaryExtractionJob.raw_response (JSON string):
+      edge_sensitivity   : float 0–1, higher = more edges detected (default 0.3)
+      min_area_m2        : float, minimum polygon area in m² (default 500)
+      dilation_px        : int, morphological dilation radius in pixels (default 3)
+      simplify_tolerance : float, Douglas-Peucker tolerance in degrees (default 0.00005)
+    """
+    import json as _json
+    import subprocess
+    import tempfile
+    import numpy as np
+    from datetime import datetime, timezone as dt_tz
+    from PIL import Image, ImageFilter
+    from apps.ai_assistant.models import BoundaryExtractionJob
+
+    job = BoundaryExtractionJob.objects.select_related(
+        'project', 'source_geotiff'
+    ).get(id=job_id)
+    job.status = BoundaryExtractionJob.RUNNING
+    job.save(update_fields=['status'])
+
+    # Read params stored by the view as JSON in raw_response
+    try:
+        params = _json.loads(job.raw_response or '{}')
+    except Exception:
+        params = {}
+
+    edge_sensitivity   = float(params.get('edge_sensitivity',   0.3))
+    min_area_m2        = float(params.get('min_area_m2',        500.0))
+    dilation_px        = int(params.get('dilation_px',          3))
+    simplify_tol       = float(params.get('simplify_tolerance', 0.00005))
+    # Best-effort survey-number OCR (default on). Bounded to keep the task fast;
+    # polygons beyond the cap (or where nothing is read) get a blank survey_number.
+    ocr_enabled        = str(params.get('ocr_survey_numbers', True)).lower() not in ('false', '0', 'none')
+    OCR_MAX_POLYGONS   = 500
+
+    tmp_files = []
+
+    try:
+        from osgeo import gdal, ogr, osr
+
+        # ── Locate source file ────────────────────────────────────────────────
+        from django.conf import settings as _s
+        geotiff = job.source_geotiff
+        raw_path = os.path.join(_s.MEDIA_ROOT, geotiff.file.name) if geotiff.file else None
+        cog_path = os.path.join(_s.MEDIA_ROOT, geotiff.cog_file.name) if geotiff.cog_file else None
+
+        if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+            src_path = raw_path
+        elif cog_path and os.path.exists(cog_path):
+            src_path = cog_path
+        else:
+            raise FileNotFoundError('No accessible GeoTiff file for this layer.')
+
+        # ── Reproject to WGS-84 ────────────────────────────────────────────────
+        wgs84_fd, wgs84_path = tempfile.mkstemp(suffix='_wgs84.tif')
+        os.close(wgs84_fd)
+        tmp_files.append(wgs84_path)
+
+        ret = subprocess.run(
+            ['gdalwarp', '-t_srs', 'EPSG:4326', '-of', 'GTiff',
+             '-r', 'bilinear', '-overwrite', src_path, wgs84_path],
+            capture_output=True,
+        )
+        if ret.returncode != 0:
+            # Already WGS-84 or gdalwarp failed — use original
+            wgs84_path = src_path
+            tmp_files.pop()
+
+        # ── Open with GDAL + read spatial metadata ─────────────────────────────
+        ds = gdal.Open(wgs84_path)
+        if ds is None:
+            raise RuntimeError(f'GDAL cannot open {wgs84_path}')
+
+        gt     = ds.GetGeoTransform()   # (west, pix_w, 0, north, 0, pix_h)
+        proj   = ds.GetProjection()
+        orig_w = ds.RasterXSize
+        orig_h = ds.RasterYSize
+        west   = gt[0]
+        north  = gt[3]
+        pix_w  = gt[1]   # degrees per pixel, positive
+        pix_h  = gt[5]   # degrees per pixel, negative
+        east   = west  + orig_w * pix_w
+        south  = north + orig_h * pix_h   # north + neg * height
+
+        # ── Read bands → grayscale ─────────────────────────────────────────────
+        nb = ds.RasterCount
+        if nb >= 3:
+            r = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+            g = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
+            b = ds.GetRasterBand(3).ReadAsArray().astype(np.float32)
+            gray_arr = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.uint8)
+        else:
+            data = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+            lo, hi = data.min(), data.max()
+            if hi > lo:
+                gray_arr = ((data - lo) / (hi - lo) * 255).astype(np.uint8)
+            else:
+                gray_arr = np.zeros_like(data, dtype=np.uint8)
+        ds = None  # close
+
+        # ── Downsample large images (keep ≤ 4096 px on longest side) ──────────
+        MAX_PX = 4096
+        scale  = min(MAX_PX / orig_w, MAX_PX / orig_h, 1.0)
+        proc_w = max(1, int(orig_w * scale))
+        proc_h = max(1, int(orig_h * scale))
+
+        img_pil = Image.fromarray(gray_arr).resize((proc_w, proc_h), Image.LANCZOS)
+        gray_small = np.array(img_pil)
+
+        # Adjusted pixel sizes for the downsampled image
+        pix_w_s = (east - west)  / proc_w
+        pix_h_s = (south - north) / proc_h   # negative
+
+        # ── Step 2: Gaussian smooth → reduce noise ─────────────────────────────
+        img_smooth = img_pil.filter(ImageFilter.GaussianBlur(radius=2))
+
+        # ── Step 3: Sobel edge detection via PIL ───────────────────────────────
+        img_edges = img_smooth.filter(ImageFilter.FIND_EDGES)
+        edge_arr  = np.array(img_edges, dtype=np.float32)
+
+        # ── Step 4: Otsu threshold → binary edge mask ──────────────────────────
+        # Compute Otsu automatically, then scale by sensitivity
+        hist = np.bincount(edge_arr.astype(np.uint8).flatten(), minlength=256).astype(np.float64)
+        total = edge_arr.size
+        sum_total = np.dot(np.arange(256), hist)
+        sum_bg = w_bg = 0.0
+        best_var = -1.0
+        otsu_t = 128
+        for i in range(256):
+            w_bg += hist[i]
+            if w_bg == 0 or w_bg == total:
+                continue
+            w_fg = total - w_bg
+            sum_bg += i * hist[i]
+            mu_bg = sum_bg / w_bg
+            mu_fg = (sum_total - sum_bg) / w_fg
+            var = w_bg * w_fg * (mu_bg - mu_fg) ** 2
+            if var > best_var:
+                best_var = var
+                otsu_t = i
+
+        # Sensitivity: lower value = detect more (fainter) edges
+        threshold = max(1, int(otsu_t * (1.0 - edge_sensitivity)))
+        binary_edges = (edge_arr > threshold).astype(np.uint8)
+
+        # ── Step 5: Morphological dilation → close gaps in boundary lines ──────
+        # Dilation radius in pixels; repeat filter for larger radii
+        dil_img = Image.fromarray(binary_edges * 255)
+        kernel  = max(3, dilation_px * 2 + 1)
+        repeats = max(1, dilation_px // 2 + 1)
+        for _ in range(repeats):
+            dil_img = dil_img.filter(ImageFilter.MaxFilter(kernel))
+        dilated = np.array(dil_img) > 128
+
+        # ── Step 6: Invert → enclosed regions are filled pixels ────────────────
+        regions = (~dilated).astype(np.uint8)
+
+        # ── Step 7: Connected component labeling ──────────────────────────────
+        try:
+            from scipy.ndimage import label as scipy_label
+            labeled, n_comp = scipy_label(regions)
+        except ImportError:
+            labeled, n_comp = _bfs_label(regions)
+
+        # ── Step 8: Area filter in pixel space → m² conversion ─────────────────
+        # 1 degree ≈ 111 320 m at equator; use pix_w_s (lon) for coarse filter
+        deg_per_pix = abs(pix_w_s)
+        m_per_pix   = deg_per_pix * 111_320
+        m2_per_pixel = m_per_pix ** 2
+        min_px  = max(4, int(min_area_m2 / m2_per_pixel))
+
+        # Zero out labels that are too small (they'll become nodata)
+        counts = np.bincount(labeled.flatten())   # index = label id, value = pixel count
+        for lid in range(1, n_comp + 1):
+            if lid < len(counts) and counts[lid] < min_px:
+                labeled[labeled == lid] = 0
+
+        # ── Step 9: Write labeled raster as GeoTiff with spatial reference ──────
+        lbl_fd, lbl_path = tempfile.mkstemp(suffix='_labeled.tif')
+        os.close(lbl_fd)
+        tmp_files.append(lbl_path)
+
+        drv    = gdal.GetDriverByName('GTiff')
+        out_ds = drv.Create(lbl_path, proc_w, proc_h, 1, gdal.GDT_Int32)
+        out_ds.SetGeoTransform((west, pix_w_s, 0, north, 0, pix_h_s))
+        out_ds.SetProjection(proj)
+        band = out_ds.GetRasterBand(1)
+        band.WriteArray(labeled.astype(np.int32))
+        band.SetNoDataValue(0)
+        out_ds.FlushCache()
+        out_ds = None
+
+        # ── Step 10: GDAL Polygonize ───────────────────────────────────────────
+        gjson_fd, gjson_path = tempfile.mkstemp(suffix='_polygons.geojson')
+        os.close(gjson_fd)
+        tmp_files.append(gjson_path)
+
+        src_ds  = gdal.Open(lbl_path)
+        src_bnd = src_ds.GetRasterBand(1)
+
+        mem_drv = ogr.GetDriverByName('Memory')
+        mem_ds  = mem_drv.CreateDataSource('mem')
+        srs_wgs = osr.SpatialReference()
+        srs_wgs.ImportFromEPSG(4326)
+        srs_wgs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        mem_lyr = mem_ds.CreateLayer('poly', srs_wgs, ogr.wkbPolygon)
+        fld_def = ogr.FieldDefn('label_id', ogr.OFTInteger)
+        mem_lyr.CreateField(fld_def)
+
+        gdal.Polygonize(src_bnd, None, mem_lyr, 0, [], callback=None)
+        src_ds = None
+
+        # ── Step 11: Optional geometry simplification + build draft features ────
+        draft = []
+        mem_lyr.ResetReading()
+        feat_ogr = mem_lyr.GetNextFeature()
+        feat_idx = 0
+        while feat_ogr:
+            label_id = feat_ogr.GetField('label_id')
+            if label_id == 0:
+                feat_ogr = mem_lyr.GetNextFeature()
+                continue
+
+            geom = feat_ogr.GetGeometryRef()
+            if geom is None:
+                feat_ogr = mem_lyr.GetNextFeature()
+                continue
+
+            # Simplify (Douglas-Peucker)
+            if simplify_tol > 0:
+                geom = geom.Simplify(simplify_tol)
+
+            if geom is None or geom.IsEmpty():
+                feat_ogr = mem_lyr.GetNextFeature()
+                continue
+
+            geojson_geom = _json.loads(geom.ExportToJson())
+            area_deg2 = geom.GetArea()
+            area_m2 = area_deg2 * (111_320 ** 2)
+
+            # Best-effort survey number from OCR (blank when not readable).
+            survey_number, ocr_conf = '', 0.0
+            if ocr_enabled and feat_idx < OCR_MAX_POLYGONS:
+                survey_number, ocr_conf = _ocr_survey_number(
+                    gray_small, geojson_geom, west, north, pix_w_s, pix_h_s,
+                )
+
+            draft.append({
+                'type': 'Feature',
+                'geometry': geojson_geom,
+                'properties': {
+                    'feature_type': 'parcel',
+                    'label':        f'Region {label_id}',
+                    'label_id':     label_id,
+                    'area_m2':      round(area_m2, 1),
+                    'confidence':   'high',
+                    'survey_number':  survey_number,
+                    'ocr_confidence': ocr_conf,
+                    'source':       'classical_gis',
+                    'has_coordinates': True,
+                },
+            })
+            feat_idx += 1
+            feat_ogr = mem_lyr.GetNextFeature()
+
+        mem_ds = None
+
+        job.draft_features = draft
+        job.parsed_result  = {
+            'source':           'classical_gis',
+            'pipeline':         'sobel→otsu→dilate→label→polygonize',
+            'params':           params,
+            'bounds':           {'west': west, 'south': south, 'east': east, 'north': north},
+            'image_size':       [orig_w, orig_h],
+            'processed_size':   [proc_w, proc_h],
+            'otsu_threshold':   otsu_t,
+            'applied_threshold': threshold,
+            'n_components':     int(n_comp),
+            'polygon_count':    len(draft),
+            'min_area_m2':      min_area_m2,
+        }
+        job.raw_response = ''   # clear params – stored in parsed_result now
+        job.status = BoundaryExtractionJob.DONE
+
+    except Exception as exc:
+        import traceback
+        job.status    = BoundaryExtractionJob.FAILED
+        job.error_log = f'{exc}\n{traceback.format_exc()[-1500:]}'
+
+    finally:
+        for f in tmp_files:
+            try:
+                if f and os.path.exists(f):
+                    os.unlink(f)
+            except Exception:
+                pass
+        from datetime import datetime, timezone as dt_tz
+        job.completed_at = datetime.now(tz=dt_tz.utc)
+        job.save(update_fields=[
+            'status', 'draft_features', 'parsed_result',
+            'raw_response', 'error_log', 'completed_at',
+        ])
+
+
+def _bfs_label(binary: np.ndarray):
+    """
+    Pure-Python BFS connected component labeling (fallback when scipy is absent).
+    Returns (labeled_array, n_labels).
+    """
+    import numpy as np
+    from collections import deque
+
+    h, w = binary.shape
+    labeled = np.zeros((h, w), dtype=np.int32)
+    label_id = 0
+
+    for row in range(h):
+        for col in range(w):
+            if binary[row, col] == 0 or labeled[row, col] != 0:
+                continue
+            label_id += 1
+            q = deque()
+            q.append((row, col))
+            labeled[row, col] = label_id
+            while q:
+                r, c = q.popleft()
+                for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < h and 0 <= nc < w and binary[nr, nc] and labeled[nr, nc] == 0:
+                        labeled[nr, nc] = label_id
+                        q.append((nr, nc))
+
+    return labeled, label_id
+
+
+@shared_task(bind=True, max_retries=0, name='ai_assistant.extract_polygons_ai_pipeline')
+def extract_polygons_ai_pipeline(self, job_id: int):
+    """
+    Advanced 10-stage AI Vision pipeline task for georeferenced GeoTIFFs.
+    """
+    import os
+    from datetime import datetime, timezone as dt_tz
+    from apps.ai_assistant.models import BoundaryExtractionJob
+    from apps.ai_assistant.pipeline import AIVisionPipeline
+    
+    job = BoundaryExtractionJob.objects.select_related(
+        'project', 'source_geotiff'
+    ).get(id=job_id)
+    job.status = BoundaryExtractionJob.RUNNING
+    job.save(update_fields=['status'])
+    
+    try:
+        import json as _json
+        try:
+            params = _json.loads(job.raw_response or '{}')
+        except Exception:
+            params = {}
+            
+        tile_size = int(params.get('tile_size', 1024))
+        min_area_m2 = float(params.get('min_area_m2', 500.0))
+        simplify_tolerance = float(params.get('simplify_tolerance', 0.00005))
+        edge_sensitivity = float(params.get('edge_sensitivity', 0.3))
+        dilation_px = int(params.get('dilation_px', 3))
+        
+        from django.conf import settings as _s
+        geotiff = job.source_geotiff
+        if not geotiff:
+            raise ValueError("No GeoTIFF layer associated with this pipeline job.")
+            
+        raw_path = os.path.join(_s.MEDIA_ROOT, geotiff.file.name) if geotiff.file else None
+        cog_path = os.path.join(_s.MEDIA_ROOT, geotiff.cog_file.name) if geotiff.cog_file else None
+        
+        if raw_path and os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+            src_path = raw_path
+        elif cog_path and os.path.exists(cog_path):
+            src_path = cog_path
+        else:
+            raise FileNotFoundError('No accessible GeoTiff file for this layer.')
+            
+        # Instantiate and run pipeline
+        pipeline = AIVisionPipeline(
+            geotiff_path=src_path,
+            project=job.project,
+            vision_model=job.vision_model,
+            tile_size=tile_size,
+            min_area_m2=min_area_m2,
+            simplify_tolerance=simplify_tolerance,
+            edge_sensitivity=edge_sensitivity,
+            dilation_px=dilation_px
+        )
+        
+        draft, parsed_meta = pipeline.run()
+        
+        job.draft_features = draft
+        job.parsed_result = parsed_meta
+        job.raw_response = parsed_meta.get('qa_review', '')
+        job.status = BoundaryExtractionJob.DONE
+        
+    except Exception as exc:
+        import traceback
+        job.status = BoundaryExtractionJob.FAILED
+        job.error_log = f'{exc}\n{traceback.format_exc()[-1500:]}'
+        
+    finally:
+        job.completed_at = datetime.now(tz=dt_tz.utc)
+        job.save(update_fields=[
+            'status', 'draft_features', 'parsed_result',
+            'raw_response', 'error_log', 'completed_at',
+        ])
+

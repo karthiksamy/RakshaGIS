@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 # GeoDjango + Mapnik + document conversion dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
         binutils \
         libproj-dev \
         gdal-bin \
@@ -12,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         mapnik-utils \
         python3-mapnik \
         libmapnik-dev \
+    && pip install --no-cache-dir "GDAL==$(gdal-config --version)" \
+    && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — UID 1000 matches the typical host developer account so the

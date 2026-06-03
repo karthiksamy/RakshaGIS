@@ -45,6 +45,22 @@ export default function BasemapsPage() {
       message.error(e.response?.data?.detail || 'Cannot delete system basemap'),
   })
 
+  const patchMutation = useMutation({
+    mutationFn: ({ id, data }: { id: number; data: Partial<BasemapConfig> }) =>
+      api.patch(`/gis/basemaps/${id}/`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.basemaps() }),
+    onError: () => message.error('Failed to update basemap'),
+  })
+
+  const setDefaultMutation = useMutation({
+    mutationFn: (id: number) => api.post(`/gis/basemaps/${id}/set_default/`),
+    onSuccess: () => {
+      message.success('Default basemap updated')
+      qc.invalidateQueries({ queryKey: qk.basemaps() })
+    },
+    onError: () => message.error('Failed to set default basemap'),
+  })
+
   const isSuperAdmin = user?.role === 'SUPERADMIN'
 
   const columns: ColumnsType<BasemapConfig> = [
@@ -64,7 +80,28 @@ export default function BasemapsPage() {
     {
       title: 'Active',
       dataIndex: 'is_active',
-      render: (v) => <Tag color={v ? 'green' : 'default'}>{v ? 'Active' : 'Off'}</Tag>,
+      render: (v, record) => isSuperAdmin ? (
+        <Switch
+          size="small"
+          checked={v}
+          // The default basemap must stay active — block disabling it directly.
+          disabled={record.is_default || patchMutation.isPending}
+          onChange={(checked) => patchMutation.mutate({ id: record.id, data: { is_active: checked } })}
+        />
+      ) : (
+        <Tag color={v ? 'green' : 'default'}>{v ? 'Active' : 'Off'}</Tag>
+      ),
+    },
+    {
+      title: 'Default',
+      dataIndex: 'is_default',
+      render: (v, record) => v ? (
+        <Tag color="gold">★ Default</Tag>
+      ) : isSuperAdmin ? (
+        <Button size="small" onClick={() => setDefaultMutation.mutate(record.id)}>
+          Set default
+        </Button>
+      ) : null,
     },
     ...(isSuperAdmin
       ? [{
@@ -123,6 +160,15 @@ export default function BasemapsPage() {
             <Input />
           </Form.Item>
           <Form.Item name="is_active" label="Active" valuePropName="checked" initialValue={true}>
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            name="is_default"
+            label="Set as default basemap"
+            valuePropName="checked"
+            initialValue={false}
+            tooltip="The default loads automatically when the map opens. Only one basemap can be default."
+          >
             <Switch />
           </Form.Item>
         </Form>

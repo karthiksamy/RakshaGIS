@@ -82,6 +82,10 @@ class SurveyProject(models.Model):
     extent = gis_models.PolygonField(srid=4326, null=True, blank=True)
     total_area_hectares = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
 
+    # When False, this project's published data is hidden from higher levels (PDDE/DGDE).
+    # The owning office still sees it. Toggled by DEO/ADEO/CEO admins.
+    map_enabled = models.BooleanField(default=True)
+
     start_date = models.DateField(null=True, blank=True)
     target_date = models.DateField(null=True, blank=True)
 
@@ -183,6 +187,9 @@ class SurveyArea(models.Model):
         related_name='assigned_survey_areas',
     )
     status      = models.CharField(max_length=20, choices=STATUS_CHOICES, default=DRAFT)
+    # When False, this area's published data is hidden from higher levels (PDDE/DGDE).
+    # The owning office still sees it. Toggled by DEO/ADEO/CEO admins.
+    map_enabled = models.BooleanField(default=True)
     created_by  = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
         related_name='created_survey_areas',
@@ -241,6 +248,12 @@ class GISFeature(models.Model):
     geometry = gis_models.GeometryField(srid=4326)
     attributes = models.JSONField(default=dict)
     is_deleted = models.BooleanField(default=False)
+    # When True, this dataset is visible to the parent DEO office (and its subtree)
+    # even though it belongs to a subordinate CEO/ADEO org. Default True = opt-out model.
+    deo_visible = models.BooleanField(
+        default=True,
+        help_text='Allow the parent DEO office to view this feature in the Map Viewer.'
+    )
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='created_features'
@@ -254,6 +267,7 @@ class GISFeature(models.Model):
             models.Index(fields=['project', 'layer_name']),
             models.Index(fields=['project', 'is_deleted']),
             models.Index(fields=['folder', 'is_deleted']),
+            models.Index(fields=['project', 'deo_visible', 'is_deleted']),
         ]
 
     def __str__(self):
@@ -413,6 +427,11 @@ class ShapefileImport(models.Model):
         help_text='Optional: validate imported attributes against this template'
     )
     status             = models.CharField(max_length=10, choices=STATUS_CHOICES, default=PENDING)
+    # Propagated onto every GISFeature created by this import (see import_shapefile task).
+    deo_visible        = models.BooleanField(
+        default=True,
+        help_text='Allow the parent DEO office to view the features imported from this file.'
+    )
     feature_count      = models.PositiveIntegerField(null=True, blank=True)
     columns            = models.JSONField(default=list, blank=True,
                              help_text='Attribute column names detected in the source file')
@@ -462,6 +481,10 @@ class GeoTiffLayer(models.Model):
     status      = models.CharField(max_length=15, choices=STATUS_CHOICES, default=PENDING)
     error       = models.TextField(blank=True)
     is_visible  = models.BooleanField(default=True)
+    deo_visible = models.BooleanField(
+        default=True,
+        help_text='Allow the parent DEO office to view this raster in the Map Viewer.'
+    )
     opacity     = models.FloatField(default=0.8)
     created_by  = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='geotiff_layers')
     created_at  = models.DateTimeField(auto_now_add=True)
@@ -681,6 +704,12 @@ class TemporaryLayer(models.Model):
     geojson          = models.JSONField(null=True, blank=True)
     feature_count    = models.IntegerField(default=0)
     analysis_result  = models.JSONField(null=True, blank=True)
+    # Temp layers are uploader-scoped by default. When True, a CEO/ADEO uploader's
+    # temp layer is also visible to the parent DEO office (and its subtree).
+    deo_visible      = models.BooleanField(
+        default=True,
+        help_text='Allow the parent DEO office to view this temporary layer.'
+    )
     uploaded_by      = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
         related_name='temp_layers'

@@ -19,7 +19,7 @@ class BasemapConfigSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'provider', 'provider_display',
             'url_template', 'attribution',
-            'is_active', 'is_system',
+            'is_active', 'is_default', 'is_system',
             'created_by', 'created_by_name', 'created_at',
         ]
         read_only_fields = ['id', 'is_system', 'created_by', 'created_at']

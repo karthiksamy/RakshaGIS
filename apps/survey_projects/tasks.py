@@ -87,6 +87,7 @@ def import_shapefile(self, job_id: int):
                         attributes=attrs,
                         created_by=job.created_by,
                         folder=job.folder,
+                        deo_visible=job.deo_visible,
                     ))
 
         GISFeature.objects.bulk_create(features_to_create, batch_size=500)

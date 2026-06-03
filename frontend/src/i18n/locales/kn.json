@@ -1,63 +1,23 @@
 {
-  "nav": {
-    "dashboard": "ಡ್ಯಾಶ್‌ಬೋರ್ಡ್",
-    "map": "ನಕ್ಷೆ",
-    "terrain": "3D ಭೂಪ್ರದೇಶ",
-    "projects": "ಯೋಜನೆಗಳು",
-    "documents": "ದಾಖಲೆಗಳು",
-    "ai_assistant": "AI ಸಹಾಯಕ",
-    "users": "ಬಳಕೆದಾರರು",
-    "organisations": "ಸಂಸ್ಥೆಗಳು",
-    "reports": "ವರದಿಗಳು",
-    "backups": "ಬ್ಯಾಕಪ್",
-    "master_data": "ಮಾಸ್ಟರ್ ಡೇಟಾ",
-    "states": "ರಾಜ್ಯಗಳು",
-    "districts": "ಜಿಲ್ಲೆಗಳು",
-    "taluks": "ತಾಲ್ಲೂಕುಗಳು",
-    "villages": "ಗ್ರಾಮಗಳು"
-  },
-  "common": {
-    "save": "ಉಳಿಸಿ",
-    "cancel": "ರದ್ದು ಮಾಡಿ",
-    "delete": "ಅಳಿಸಿ",
-    "edit": "ತಿದ್ದಿ",
-    "add": "ಸೇರಿಸಿ",
-    "create": "ರಚಿಸಿ",
-    "close": "ಮುಚ್ಚಿ",
-    "search": "ಹುಡುಕಿ",
-    "submit": "ಸಲ್ಲಿಸಿ",
-    "yes": "ಹೌದು",
-    "no": "ಇಲ್ಲ",
-    "ok": "ಸರಿ",
-    "loading": "ಲೋಡ್ ಆಗುತ್ತಿದೆ...",
-    "error": "ದೋಷ",
-    "success": "ಯಶಸ್ಸು",
-    "logout": "ಲಾಗ್‌ಔಟ್",
-    "settings": "ಸೆಟ್ಟಿಂಗ್‌ಗಳು",
-    "status": "ಸ್ಥಿತಿ"
-  },
-  "status": {
-    "draft": "ಕರಡು",
-    "submitted": "ಸಲ್ಲಿಸಲಾಗಿದೆ",
-    "under_review": "ಪರಿಶೀಲನೆಯಲ್ಲಿ",
-    "approved": "ಅನುಮೋದಿಸಲಾಗಿದೆ",
-    "published": "ಪ್ರಕಟಿಸಲಾಗಿದೆ",
-    "returned": "ಪರಿಷ್ಕರಣೆಗೆ ಹಿಂದಿರುಗಿಸಲಾಗಿದೆ",
-    "pending": "ಬಾಕಿ"
-  },
-  "auth": {
-    "login": "ಲಾಗಿನ್",
-    "username": "ಬಳಕೆದಾರ ಹೆಸರು",
-    "password": "ಪಾಸ್‌ವರ್ಡ್",
-    "login_title": "RakshaGIS ಗೆ ಲಾಗಿನ್ ಆಗಿ",
-    "login_subtitle": "ರಕ್ಷಣಾ ಎಸ್ಟೇಟ್ GIS ವೇದಿಕೆ — ಭಾರತ ಸರ್ಕಾರ"
-  },
-  "workflow": {
-    "submit_to_checker": "ಪರಿಶೀಲಕರಿಗೆ ಸಲ್ಲಿಸಿ",
-    "approve": "ಅನುಮೋದಿಸಿ",
-    "publish": "ಪ್ರಕಟಿಸಿ"
-  },
-  "language": {
-    "select": "ಭಾಷೆ"
-  }
+  "nav": { "dashboard": "ಡ್ಯಾಶ್‌ಬೋರ್ಡ್", "map": "ನಕ್ಷೆ", "terrain": "3D ಭೂಪ್ರದೇಶ", "projects": "ಯೋಜನೆಗಳು", "documents": "ದಾಖಲೆಗಳು", "access_requests": "ಡೇಟಾ ಪ್ರವೇಶ", "ai_assistant": "AI ಸಹಾಯಕ", "ai_vision": "AI ದೃಷ್ಟಿ", "users": "ಬಳಕೆದಾರರು", "organisations": "ಸಂಸ್ಥೆಗಳು", "basemaps": "ಬೇಸ್‌ಮ್ಯಾಪ್‌ಗಳು", "reports": "ವರದಿಗಳು", "audit": "ಆಡಿಟ್ ಲಾಗ್‌ಗಳು", "qgis_sync": "QGIS ಸಿಂಕ್", "backups": "ಬ್ಯಾಕಪ್‌ಗಳು", "master_data": "ಮಾಸ್ಟರ್ ಡೇಟಾ", "states": "ರಾಜ್ಯಗಳು", "districts": "ಜಿಲ್ಲೆಗಳು", "taluks": "ತಾಲ್ಲೂಕುಗಳು", "villages": "ಹಳ್ಳಿಗಳು", "boundary_import": "ಗಡಿ ಆಮದು", "branding": "ಬ್ರಾಂಡಿಂಗ್", "ai_config": "AI ಸಂರಚನೆ", "external_data": "ಬಾಹ್ಯ ಡೇಟಾ" },
+  "common": { "save": "ಉಳಿಸಿ", "cancel": "ರದ್ದು", "delete": "ಅಳಿಸಿ", "edit": "ಸಂಪಾದಿಸಿ", "add": "ಸೇರಿಸಿ", "create": "ರಚಿಸಿ", "update": "ನವೀಕರಿಸಿ", "close": "ಮುಚ್ಚಿ", "download": "ಡೌನ್‌ಲೋಡ್", "upload": "ಅಪ್‌ಲೋಡ್", "search": "ಹುಡುಕಿ", "filter": "ಶೋಧಿಸಿ", "reset": "ಮರುಹೊಂದಿಸಿ", "confirm": "ಖಚಿತಪಡಿಸಿ", "submit": "ಸಲ್ಲಿಸಿ", "back": "ಹಿಂದೆ", "next": "ಮುಂದೆ", "yes": "ಹೌದು", "no": "ಇಲ್ಲ", "ok": "ಸರಿ", "loading": "ಲೋಡ್ ಆಗುತ್ತಿದೆ...", "error": "ದೋಷ", "success": "ಯಶಸ್ಸು", "warning": "ಎಚ್ಚರಿಕೆ", "actions": "ಕ್ರಿಯೆಗಳು", "name": "ಹೆಸರು", "code": "ಕೋಡ್", "date": "ದಿನಾಂಕ", "status": "ಸ್ಥಿತಿ", "type": "ಪ್ರಕಾರ", "description": "ವಿವರಣೆ", "notes": "ಟಿಪ್ಪಣಿಗಳು", "remarks": "ಅಭಿಪ್ರಾಯಗಳು", "view": "ವೀಕ್ಷಿಸಿ", "refresh": "ರಿಫ್ರೆಶ್", "export": "ರಫ್ತು", "print": "ಮುದ್ರಿಸಿ", "logout": "ಲಾಗ್‌ಔಟ್", "profile": "ಪ್ರೊಫೈಲ್", "settings": "ಸೆಟ್ಟಿಂಗ್‌ಗಳು", "retry": "ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ", "open": "ತೆರೆಯಿರಿ", "run": "ಚಲಾಯಿಸಿ", "generate": "ರಚಿಸಿ", "processing": "ಪ್ರಕ್ರಿಯೆಗೊಳಿಸಲಾಗುತ್ತಿದೆ...", "no_data": "ಡೇಟಾ ಇಲ್ಲ", "clear": "ತೆರವು", "active": "ಸಕ್ರಿಯ", "inactive": "ನಿಷ್ಕ್ರಿಯ", "apply": "ಅನ್ವಯಿಸಿ", "optional": "ಐಚ್ಛಿಕ", "required": "ಅಗತ್ಯ", "organisation": "ಸಂಸ್ಥೆ", "created": "ರಚಿಸಲಾಗಿದೆ", "updated": "ನವೀಕರಿಸಲಾಗಿದೆ", "deleted": "ಅಳಿಸಲಾಗಿದೆ", "all": "ಎಲ್ಲಾ", "none": "ಯಾವುದೂ ಇಲ್ಲ", "select": "ಆಯ್ಕೆ", "features": "ವೈಶಿಷ್ಟ್ಯಗಳು", "source": "ಮೂಲ", "total": "ಒಟ್ಟು", "by": "ಮೂಲಕ" },
+  "status": { "draft": "ಕರಡು", "submitted": "ತಪಾಸಣೆಗೆ ಸಲ್ಲಿಸಲಾಗಿದೆ", "under_review": "ಪರಿಶೀಲನೆಯಲ್ಲಿ", "approved": "ಅನುಮೋದಿಸಲಾಗಿದೆ", "published": "ಪ್ರಕಟಿಸಲಾಗಿದೆ", "returned": "ಪರಿಷ್ಕರಣೆಗೆ ಹಿಂತಿರುಗಿಸಲಾಗಿದೆ", "pending": "ಬಾಕಿ", "running": "ಚಾಲನೆಯಲ್ಲಿದೆ", "done": "ಮುಗಿದಿದೆ", "failed": "ವಿಫಲವಾಗಿದೆ", "clean": "ಶುದ್ಧ", "has_disputes": "ವಿವಾದಗಳಿವೆ" },
+  "auth": { "login": "ಲಾಗಿನ್", "logout": "ಲಾಗ್‌ಔಟ್", "username": "ಬಳಕೆದಾರ ಹೆಸರು", "password": "ಗುಪ್ತಪದ", "login_title": "RakshaGIS ಗೆ ಲಾಗಿನ್ ಮಾಡಿ", "login_subtitle": "ರಕ್ಷಣಾ ಭೂ GIS ವೇದಿಕೆ — ಭಾರತ ಸರ್ಕಾರ", "change_password": "ಗುಪ್ತಪದ ಬದಲಿಸಿ", "current_password": "ಪ್ರಸ್ತುತ ಗುಪ್ತಪದ", "new_password": "ಹೊಸ ಗುಪ್ತಪದ", "confirm_password": "ಗುಪ್ತಪದ ಖಚಿತಪಡಿಸಿ", "login_failed": "ತಪ್ಪಾದ ಬಳಕೆದಾರ ಹೆಸರು ಅಥವಾ ಗುಪ್ತಪದ", "session_expired": "ನಿಮ್ಮ ಅಧಿವೇಶನ ಮುಗಿದಿದೆ. ದಯಮಾಡಿ ಮತ್ತೆ ಲಾಗಿನ್ ಮಾಡಿ." },
+  "workflow": { "submit_to_checker": "ಪರಿಶೀಲಕರಿಗೆ ಸಲ್ಲಿಸಿ", "resubmit_to_checker": "ಮತ್ತೆ ಸಲ್ಲಿಸಿ", "send_to_approver": "ಅನುಮೋದಕರಿಗೆ ಕಳಿಸಿ", "approve": "ಅನುಮೋದಿಸಿ", "return_to_sdo": "SDO ಗೆ ಹಿಂತಿರುಗಿಸಿ", "return_from_review": "ಪರಿಷ್ಕರಣೆಗೆ ಹಿಂತಿರುಗಿಸಿ", "publish": "ಪ್ರಕಟಿಸಿ", "remarks_required": "ಹಿಂತಿರುಗಿಸುವಾಗ ಅಭಿಪ್ರಾಯ ಅಗತ್ಯ", "optional_remarks": "ಐಚ್ಛಿಕ ಅಭಿಪ್ರಾಯಗಳು...", "confirm_action": "ಕ್ರಿಯೆ ಖಚಿತಪಡಿಸಿ", "workflow_updated": "ಕಾರ್ಯಪ್ರವಾಹ ನವೀಕರಿಸಲಾಗಿದೆ", "survey_area": "ಸಮೀಕ್ಷಾ ಪ್ರದೇಶ", "select_folder": "ಫೋಲ್ಡರ್‌ಗೆ ಲಿಂಕ್ ಮಾಡಿ (ಐಚ್ಛಿಕ)" },
+  "map": { "pan": "ಪ್ಯಾನ್", "zoom_in": "ಜೂಮ್ ಇನ್", "zoom_out": "ಜೂಮ್ ಔಟ್", "draw_point": "ಬಿಂದು ಎಳೆಯಿರಿ", "draw_line": "ರೇಖೆ ಎಳೆಯಿರಿ", "draw_polygon": "ಬಹುಭುಜ ಎಳೆಯಿರಿ", "edit_feature": "ವೈಶಿಷ್ಟ್ಯ ಸಂಪಾದಿಸಿ", "delete_feature": "ವೈಶಿಷ್ಟ್ಯ ಅಳಿಸಿ", "measure": "ಅಳತೆ", "buffer": "ಬಫರ್ ವಿಶ್ಲೇಷಣೆ", "print_map": "ನಕ್ಷೆ ಮುದ್ರಿಸಿ", "select_features": "ಬಾಕ್ಸ್ ಆಯ್ಕೆ", "identify": "ಗುರುತಿಸಿ", "base_map": "ಬೇಸ್ ಮ್ಯಾಪ್", "layers": "ಪದರಗಳು", "features": "ವೈಶಿಷ್ಟ್ಯಗಳು", "add_layer": "ಪದರ ಸೇರಿಸಿ", "layer_name": "ಪದರ ಹೆಸರು", "attributes": "ಗುಣಲಕ್ಷಣಗಳು", "save_feature": "ವೈಶಿಷ್ಟ್ಯ ಉಳಿಸಿ", "feature_saved": "ವೈಶಿಷ್ಟ್ಯ ಉಳಿಸಲಾಗಿದೆ", "feature_deleted": "ವೈಶಿಷ್ಟ್ಯ ಅಳಿಸಲಾಗಿದೆ", "no_project": "ಯೋಜನೆ ಆಯ್ಕೆಯಾಗಿಲ್ಲ", "select_project": "ಸಂಪಾದನೆ ಪ್ರಾರಂಭಿಸಲು ಯೋಜನೆ ಆಯ್ಕೆ ಮಾಡಿ", "locked_area": "ಈ ಪ್ರದೇಶ ಸಲ್ಲಿಸಲಾಗಿದೆ — ಸಂಪಾದನೆ ಲಾಕ್", "topology_check": "ಟೋಪಾಲಜಿ ಪರಿಶೀಲನೆ", "zoom_to": "ವೈಶಿಷ್ಟ್ಯಗಳಿಗೆ ಜೂಮ್", "coordinates": "ನಿರ್ದೇಶಾಂಕಗಳು", "area": "ಪ್ರದೇಶ", "length": "ಉದ್ದ", "go_to": "ನಿರ್ದೇಶಾಂಕಕ್ಕೆ ಹೋಗಿ" },
+  "project": { "survey_project": "ಸಮೀಕ್ಷಾ ಯೋಜನೆ", "survey_projects": "ಸಮೀಕ್ಷಾ ಯೋಜನೆಗಳು", "project_number": "ಯೋಜನೆ ಸಂಖ್ಯೆ", "project_name": "ಯೋಜನೆ ಹೆಸರು", "create_project": "ಯೋಜನೆ ರಚಿಸಿ", "new_project": "ಹೊಸ ಯೋಜನೆ", "add_survey_area": "ಸಮೀಕ್ಷಾ ಪ್ರದೇಶ ಸೇರಿಸಿ", "area_name": "ಪ್ರದೇಶ / ಪಾಕೆಟ್ ಹೆಸರು", "area_code": "ಪ್ರದೇಶ ಕೋಡ್", "generate_report": "AI ಸಮೀಕ್ಷಾ ವರದಿ ರಚಿಸಿ", "create_online_report": "ಆನ್‌ಲೈನ್ ವರದಿ ರಚಿಸಿ", "check_disputes": "ವಿವಾದಗಳನ್ನು ಪರಿಶೀಲಿಸಿ", "dispute_detected": "ಗಡಿ ವಿವಾದ ಪತ್ತೆಯಾಗಿದೆ", "disputes_found_one": "{{count}} ಅತಿಕ್ರಮಣ ಪತ್ತೆಯಾಗಿದೆ", "disputes_found_other": "{{count}} ಅತಿಕ್ರಮಣಗಳು ಪತ್ತೆಯಾಗಿವೆ", "acknowledge_submit": "ಒಪ್ಪಿ ಸಲ್ಲಿಸಿ", "cancel_submission": "ಸಲ್ಲಿಕೆ ರದ್ದು", "assigned_to": "ನಿಯೋಜಿಸಲಾಗಿದೆ", "history": "ಇತಿಹಾಸ", "details": "ವಿವರಗಳು", "version_compare": "ಆವೃತ್ತಿ ಹೋಲಿಕೆ", "bulk_transition": "ಸಾಮೂಹಿಕ ಸ್ಥಿತಿ ಬದಲಾವಣೆ", "transition": "ಬದಲಾವಣೆ", "comment_optional": "ಟಿಪ್ಪಣಿ (ಐಚ್ಛಿಕ)", "review_comment": "ಪರಿಶೀಲನಾ ಟಿಪ್ಪಣಿ…", "select_transition": "ಬದಲಾವಣೆ ಆಯ್ಕೆ", "project_created": "ಯೋಜನೆ ರಚಿಸಲಾಗಿದೆ", "project_failed": "ಯೋಜನೆ ರಚಿಸಲು ವಿಫಲ", "select_org": "ಸಂಸ್ಥೆ ಆಯ್ಕೆ" },
+  "org": { "organisation": "ಸಂಸ್ಥೆ", "organisations": "ಸಂಸ್ಥೆಗಳು", "add_org": "ಸಂಸ್ಥೆ ಸೇರಿಸಿ", "edit_org": "ಸಂಸ್ಥೆ ಸಂಪಾದಿಸಿ", "delete_org": "ಈ ಸಂಸ್ಥೆ ಅಳಿಸುವುದೇ?", "level": "ಮಟ್ಟ", "dgde": "DGDE (ರಾಷ್ಟ್ರೀಯ)", "pdde": "PDDE (ಕಮಾಂಡ್)", "deo": "DEO (ಜಿಲ್ಲೆ/ಪ್ರದೇಶ)", "ceo": "CEO (ಕ್ಯಾಂಟೋನ್ಮೆಂಟ್)", "adeo": "ADEO (ಉಪ-ಪ್ರದೇಶ)", "parent": "ಮೂಲ ಸಂಸ್ಥೆ", "office_id": "ಕಚೇರಿ ID", "office_id_5": "ಕಚೇರಿ ID (5 ಅಕ್ಷರ)", "office_name": "ಕಚೇರಿ ಹೆಸರು", "officer_name": "ಅಧಿಕಾರಿ ಹೆಸರು", "address": "ವಿಳಾಸ", "state": "ರಾಜ್ಯ", "district": "ಜಿಲ್ಲೆ", "pincode": "ಪಿನ್‌ಕೋಡ್", "mobile": "ಮೊಬೈಲ್", "landline": "ಲ್ಯಾಂಡ್‌ಲೈನ್", "select_parent": "ಮೂಲ ಆಯ್ಕೆ (ಇದ್ದರೆ)", "select_state": "ರಾಜ್ಯ ಆಯ್ಕೆ", "select_state_first": "ಮೊದಲು ರಾಜ್ಯ ಆಯ್ಕೆ", "select_district": "ಜಿಲ್ಲೆ ಆಯ್ಕೆ", "org_created": "ಸಂಸ್ಥೆ ರಚಿಸಲಾಗಿದೆ", "org_updated": "ಸಂಸ್ಥೆ ನವೀಕರಿಸಲಾಗಿದೆ" },
+  "user": { "users": "ಬಳಕೆದಾರರು", "full_name": "ಪೂರ್ಣ ಹೆಸರು", "first_name": "ಮೊದಲ ಹೆಸರು", "last_name": "ಕೊನೆಯ ಹೆಸರು", "email": "ಇಮೇಲ್", "username": "ಬಳಕೆದಾರ ಹೆಸರು", "employee_id": "ಉದ್ಯೋಗಿ ID", "designation": "ಹುದ್ದೆ", "phone": "ಫೋನ್", "role": "ಪಾತ್ರ", "add_user": "ಬಳಕೆದಾರ ಸೇರಿಸಿ", "create_user": "ಬಳಕೆದಾರ ರಚಿಸಿ", "edit_user": "ಬಳಕೆದಾರ ಸಂಪಾದಿಸಿ", "delete_user": "ಈ ಬಳಕೆದಾರ ಅಳಿಸುವುದೇ?", "deactivate_user": "ನಿಷ್ಕ್ರಿಯಗೊಳಿಸಿ", "activate_user": "ಸಕ್ರಿಯಗೊಳಿಸಿ", "reset_password": "ಗುಪ್ತಪದ ಮರುಹೊಂದಿಸಿ", "change_password": "ಗುಪ್ತಪದ ಬದಲಿಸಿ", "change_pwd_for": "ಗುಪ್ತಪದ ಬದಲಿಸಿ — {{name}}", "force_logout": "ಬಲವಂತ ಲಾಗ್‌ಔಟ್", "user_created": "ಬಳಕೆದಾರ ರಚಿಸಲಾಗಿದೆ", "user_updated": "ಬಳಕೆದಾರ ನವೀಕರಿಸಲಾಗಿದೆ", "min_8_chars": "ಕನಿಷ್ಠ 8 ಅಕ್ಷರಗಳು", "superadmin": "ಸೂಪರ್ ಅಡ್ಮಿನ್", "sdo": "SDO", "surveyor": "ಸರ್ವೇಯರ್", "checker": "ಪರಿಶೀಲಕ", "approver": "ಅನುಮೋದಕ", "viewer": "ವೀಕ್ಷಕ", "pdde_viewer": "PDDE ವೀಕ್ಷಕ", "activate": "ಸಕ್ರಿಯಗೊಳಿಸಿ", "deactivate": "ನಿಷ್ಕ್ರಿಯಗೊಳಿಸಿ" },
+  "document": { "documents": "ದಾಖಲೆಗಳು", "upload_document": "ದಾಖಲೆ ಅಪ್‌ಲೋಡ್", "open_in_editor": "OnlyOffice ನಲ್ಲಿ ತೆರೆಯಿರಿ", "ai_process": "AI ವಿಶ್ಲೇಷಣೆ ಚಲಾಯಿಸಿ", "ai_processed": "AI ಪ್ರಕ್ರಿಯೆ ಮಾಡಲಾಗಿದೆ", "generate_report": "ವರದಿ ರಚಿಸಿ", "category": "ವರ್ಗ", "size": "ಗಾತ್ರ", "uploaded_by": "ಅಪ್‌ಲೋಡ್ ಮಾಡಿದವರು", "uploaded_at": "ಅಪ್‌ಲೋಡ್ ಸಮಯ" },
+  "ai": { "ai_assistant": "AI ಸಹಾಯಕ", "chat": "ಚಾಟ್", "new_chat": "ಹೊಸ ಚಾಟ್", "ask_placeholder": "GIS ಡೇಟಾ, ಸಮೀಕ್ಷಾ ಯೋಜನೆಗಳು ಅಥವಾ ರಕ್ಷಣಾ ಭೂಮಿ ಬಗ್ಗೆ ಕೇಳಿ…", "rag_context": "RAG ಸಂದರ್ಭ", "no_project_rag": "ಯೋಜನೆ ಇಲ್ಲ (ಸಾಮಾನ್ಯ ಚಾಟ್)", "sources_used": "{{count}} ಮೂಲಗಳು ಬಳಸಲಾಗಿದೆ", "vision_extraction": "ನಕ್ಷೆ ಗಡಿ ಹೊರತೆಗೆಯುವಿಕೆ", "extract_boundaries": "ಗಡಿಗಳನ್ನು ಹೊರತೆಗೆಯಿರಿ", "embed_docs": "RAG ಗಾಗಿ ದಾಖಲೆಗಳನ್ನು ಎಂಬೆಡ್ ಮಾಡಿ", "export_training": "ತರಬೇತಿ ಡೇಟಾ ರಫ್ತು" },
+  "backup": { "title": "ಬ್ಯಾಕಪ್ ಮತ್ತು ಚೇತರಿಕೆ", "manual_backup": "ಹಸ್ತಚಾಲಿತ ಬ್ಯಾಕಪ್", "schedules": "ವೇಳಾಪಟ್ಟಿಗಳು", "history": "ಇತಿಹಾಸ", "full_db": "ಸಂಪೂರ್ಣ ಡೇಟಾಬೇಸ್", "start_backup": "ಬ್ಯಾಕಪ್ ಪ್ರಾರಂಭಿಸಿ", "download": "ಡೌನ್‌ಲೋಡ್", "backup_queued": "ಬ್ಯಾಕಪ್ ಸರದಿಯಲ್ಲಿದೆ", "encrypted": "ಎನ್‌ಕ್ರಿಪ್ಟ್ ಮಾಡಲಾಗಿದೆ", "not_encrypted": "ಎನ್‌ಕ್ರಿಪ್ಟ್ ಮಾಡಿಲ್ಲ", "run_now": "ಈಗಲೇ ಚಲಾಯಿಸಿ", "daily": "ದಿನನಿತ್ಯ", "weekly": "ವಾರಾಂತ್ಯ", "monthly": "ಮಾಸಿಕ", "schedule_name": "ವೇಳಾಪಟ್ಟಿ ಹೆಸರು" },
+  "terrain": { "title": "3D ಭೂಪ್ರದೇಶ ವೀಕ್ಷಕ", "load_features": "ವೈಶಿಷ್ಟ್ಯಗಳನ್ನು ಲೋಡ್ ಮಾಡಿ", "elevation_query": "ಎತ್ತರ", "elevation_profile": "ಪ್ರೊಫೈಲ್", "slope_analysis": "ಇಳಿಜಾರು", "fly_to_india": "ಭಾರತಕ್ಕೆ ಹೋಗಿ", "select_project": "ಯೋಜನೆ ಆಯ್ಕೆ", "terrain_source": "ಭೂಪ್ರದೇಶ", "clear": "ತೆರವು", "min_slope": "ಕನಿಷ್ಠ ಇಳಿಜಾರು", "avg_slope": "ಸರಾಸರಿ ಇಳಿಜಾರು", "max_slope": "ಗರಿಷ್ಠ ಇಳಿಜಾರು" },
+  "dashboard": { "title": "ಡ್ಯಾಶ್‌ಬೋರ್ಡ್", "total_projects": "ಒಟ್ಟು ಯೋಜನೆಗಳು", "total_features": "ಒಟ್ಟು ವೈಶಿಷ್ಟ್ಯಗಳು", "active_users": "ಸಕ್ರಿಯ ಬಳಕೆದಾರರು", "organisations": "ಸಂಸ್ಥೆಗಳು", "status_breakdown": "ಯೋಜನೆ ಸ್ಥಿತಿ ವಿಶ್ಲೇಷಣೆ", "monthly_trend": "ಮಾಸಿಕ ಯೋಜನೆ ರಚನೆ", "recent_projects": "ಇತ್ತೀಚಿನ ಯೋಜನೆಗಳು (7 ದಿನ)", "recent_activity": "ಇತ್ತೀಚಿನ ಚಟುವಟಿಕೆ", "no_recent_projects": "ಇತ್ತೀಚಿನ ಯೋಜನೆಗಳಿಲ್ಲ", "no_recent_activity": "ಇತ್ತೀಚಿನ ಚಟುವಟಿಕೆ ಇಲ್ಲ", "published_pct": "{{pct}}% ಪ್ರಕಟಿಸಲಾಗಿದೆ", "no_data": "ಇನ್ನೂ ಡೇಟಾ ಇಲ್ಲ" },
+  "reports": { "title": "ವರದಿಗಳು", "add_schedule": "ವೇಳಾಪಟ್ಟಿ ಸೇರಿಸಿ", "edit_schedule": "ವೇಳಾಪಟ್ಟಿ ಸಂಪಾದಿಸಿ", "schedule_name": "ವೇಳಾಪಟ್ಟಿ ಹೆಸರು", "report_type": "ವರದಿ ಪ್ರಕಾರ", "frequency": "ಆವೃತ್ತಿ", "recipients": "ಸ್ವೀಕರಿಸುವವರು (ಅಲ್ಪವಿರಾಮ ಅಲಗ ಇಮೇಲ್)", "delete_schedule": "ಈ ವೇಳಾಪಟ್ಟಿ ಅಳಿಸುವುದೇ?", "send_now": "ಈಗಲೇ ಕಳಿಸಿ", "schedule_updated": "ವೇಳಾಪಟ್ಟಿ ನವೀಕರಿಸಲಾಗಿದೆ", "schedule_created": "ವೇಳಾಪಟ್ಟಿ ರಚಿಸಲಾಗಿದೆ", "last_sent": "ಕೊನೆಯಲ್ಲಿ ಕಳಿಸಲಾಗಿದೆ", "next_run": "ಮುಂದಿನ ಚಾಲನೆ", "org": "ಸಂಸ್ಥೆ" },
+  "audit": { "title": "ಆಡಿಟ್ ಲಾಗ್‌ಗಳು", "login_logs": "ಲಾಗಿನ್ ಲಾಗ್‌ಗಳು", "export_logs": "ರಫ್ತು ಲಾಗ್‌ಗಳು", "sessions": "ಅಧಿವೇಶನಗಳು", "all_results": "ಎಲ್ಲಾ ಫಲಿತಾಂಶಗಳು", "success": "ಯಶಸ್ಸು", "failed": "ವಿಫಲ", "ip_address": "IP ವಿಳಾಸ", "username": "ಬಳಕೆದಾರ ಹೆಸರು", "timestamp": "ಸಮಯ ಮುದ್ರೆ", "reason": "ಕಾರಣ" },
+  "qgis": { "title": "QGIS ಸಿಂಕ್", "all_projects": "ಎಲ್ಲಾ ಯೋಜನೆಗಳು", "all_statuses": "ಎಲ್ಲಾ ಸ್ಥಿತಿಗಳು", "no_uploads": "ಇನ್ನೂ QGIS ಅಪ್‌ಲೋಡ್‌ಗಳಿಲ್ಲ", "request_retry": "ಮರು ಪ್ರಯತ್ನ ಕೋರಿಕೆ", "retry_confirm": "ಮರು ಪ್ರಯತ್ನ ಕೋರಬೇಕೇ?", "search_placeholder": "ಫೈಲ್ ಹೆಸರು / ಮಾಡ್ಯೂಲ್ ಹುಡುಕಿ…", "retry_sent": "ಮರು ಪ್ರಯತ್ನ ಕೋರಲಾಗಿದೆ." },
+  "branding": { "title": "ಬ್ರಾಂಡಿಂಗ್ ಸೆಟ್ಟಿಂಗ್‌ಗಳು", "app_title": "ಅಪ್ಲಿಕೇಶನ್ ಶೀರ್ಷಿಕೆ", "org_subtitle": "ಉಪ ಶೀರ್ಷಿಕೆ / ಸಂಸ್ಥೆ ಹೆಸರು", "tagline": "ಲಾಗಿನ್ ಪುಟ ಟ್ಯಾಗ್‌ಲೈನ್", "logo_url": "ಲೋಗೋ URL", "accent_color": "ಆಕ್ಸೆಂಟ್ ಬಣ್ಣ", "updated": "ಬ್ರಾಂಡಿಂಗ್ ನವೀಕರಿಸಲಾಗಿದೆ", "save": "ಬ್ರಾಂಡಿಂಗ್ ಉಳಿಸಿ", "access_denied": "ಪ್ರವೇಶ ನಿರಾಕರಿಸಲಾಗಿದೆ — ಸೂಪರ್ ಅಡ್ಮಿನ್ ಮಾತ್ರ" },
+  "external": { "title": "ಬಾಹ್ಯ ಡೇಟಾ ಮೂಲಗಳು", "add_database": "ಡೇಟಾಬೇಸ್ ಸೇರಿಸಿ", "test": "ಪರೀಕ್ಷಿಸಿ", "sync_orgs": "ಸಂಸ್ಥೆಗಳನ್ನು ಸಿಂಕ್ ಮಾಡಿ", "level_filters": "ಮಟ್ಟ ಶೋಧಕಗಳು", "all_rows": "ಎಲ್ಲಾ ಬಳಕೆದಾರರು ಎಲ್ಲಾ ಸಾಲುಗಳನ್ನು ನೋಡುತ್ತಾರೆ", "filter_title": "ಮಟ್ಟ-ವಾರು ಕಚೇರಿ ಶೋಧಕ ಸಂರಚನೆ", "no_filter_row": "ಶೋಧಕ ಇಲ್ಲ — ಎಲ್ಲಾ ಸಾಲುಗಳನ್ನು ನೋಡುತ್ತಾರೆ", "save_filters": "ಶೋಧಕಗಳನ್ನು ಉಳಿಸಿ", "add_to_map": "ನಕ್ಷೆಗೆ ಸೇರಿಸಿ", "read_only_info": "ಓದಲು ಮಾತ್ರ ಪದರಗಳು.", "layer_empty": "\"{{name}}\" ಲೋಡ್ ಆಗಿದೆ ಆದರೆ 0 ವೈಶಿಷ್ಟ್ಯಗಳು." },
+  "master": { "states": "ರಾಜ್ಯಗಳು", "districts": "ಜಿಲ್ಲೆಗಳು", "taluks": "ತಾಲ್ಲೂಕುಗಳು", "villages": "ಹಳ್ಳಿಗಳು", "boundary_import": "ಗಡಿ ಆಮದು", "import_running": "ಆಮದು ಹಿನ್ನೆಲೆಯಲ್ಲಿ ನಡೆಯುತ್ತಿದೆ…", "no_jobs": "ಇನ್ನೂ ಆಮದು ಕೆಲಸಗಳಿಲ್ಲ" },
+  "language": { "select": "ಭಾಷೆ", "en": "English", "hi": "हिन्दी (Hindi)", "ta": "தமிழ் (Tamil)", "te": "తెలుగు (Telugu)", "bn": "বাংলা (Bengali)", "kn": "ಕನ್ನಡ (Kannada)", "mr": "मराठी (Marathi)" }
 }

@@ -11,6 +11,13 @@
   <!-- NOTE: Update database credentials below with your actual values -->
   <!-- Get credentials from .env: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME -->
 
+  <!-- BASEMAP: server-side Mapnik renders ONLY the PostGIS vector layers below, over the
+       flat background-color set on <Map> above. It does NOT draw an OSM/satellite basemap
+       (that is a client-side OpenLayers layer and never reaches Mapnik). To bake a raster
+       basemap into the export, add a <Layer> with a gdal/raster <Datasource> pointing at a
+       local GeoTIFF or VRT BEFORE the vector layers. Otherwise use the "WYSIWYG Capture"
+       export, which composites the live basemap on the client. -->
+
   <!-- Layer: State Boundaries -->
   <Layer name="state_boundaries" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
     <StyleName>state_style</StyleName>
@@ -22,11 +29,12 @@
       <Parameter name="user">raksha</Parameter>
       <Parameter name="password">raksha_dev_pass</Parameter>
       <Parameter name="table">
-        (SELECT id, name, geometry FROM gis_layers_boundary
-         WHERE boundary_type = 'STATE' AND geometry IS NOT NULL
+        (SELECT id, name, geometry FROM gis_layers_state
+         WHERE geometry IS NOT NULL
          ORDER BY id) AS state_boundaries
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>
   </Layer>
@@ -42,18 +50,25 @@
       <Parameter name="user">raksha</Parameter>
       <Parameter name="password">raksha_dev_pass</Parameter>
       <Parameter name="table">
-        (SELECT id, name, geometry FROM gis_layers_boundary
-         WHERE boundary_type = 'DISTRICT' AND geometry IS NOT NULL
+        (SELECT id, name, geometry FROM gis_layers_district
+         WHERE geometry IS NOT NULL
          ORDER BY id) AS district_boundaries
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>
   </Layer>
 
-  <!-- Layer: Survey Areas -->
-  <Layer name="survey_areas" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
-    <StyleName>survey_style</StyleName>
+  <!-- NOTE: the former "survey_areas" layer was removed. SurveyArea has no geometry
+       column, so its referenced table (survey_projects_surveyarea_geometry) does not
+       exist — Mapnik either errored or rendered nothing for it. Survey-area geometry is
+       captured per feature in survey_projects_gisfeature (see the GIS Features layers
+       below) and as defence parcels (next layer). -->
+
+  <!-- Layer: Defence Parcels -->
+  <Layer name="defence_parcels" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
+    <StyleName>defence_style</StyleName>
     <Datasource>
       <Parameter name="type">postgis</Parameter>
       <Parameter name="dbname">rakshagis</Parameter>
@@ -62,11 +77,70 @@
       <Parameter name="user">raksha</Parameter>
       <Parameter name="password">raksha_dev_pass</Parameter>
       <Parameter name="table">
-        (SELECT id, name, status, geometry FROM survey_projects_surveyarea
-         WHERE geometry IS NOT NULL
-         ORDER BY id) AS survey_areas
+        (SELECT id, name, geometry FROM survey_projects_defenceparcel) AS defence_parcels
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="extent">-180,-90,180,90</Parameter>
+      <Parameter name="use_spatial_index">true</Parameter>
+    </Datasource>
+  </Layer>
+
+  <!-- Layer: GIS Features (Polygons) -->
+  <Layer name="gis_polygons" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
+    <StyleName>gis_polygon_style</StyleName>
+    <Datasource>
+      <Parameter name="type">postgis</Parameter>
+      <Parameter name="dbname">rakshagis</Parameter>
+      <Parameter name="host">host.docker.internal</Parameter>
+      <Parameter name="port">5432</Parameter>
+      <Parameter name="user">raksha</Parameter>
+      <Parameter name="password">raksha_dev_pass</Parameter>
+      <Parameter name="table">
+        (SELECT id, layer_name, geometry FROM survey_projects_gisfeature
+         WHERE geometry_type = 'POLYGON' AND is_deleted = false) AS gis_polygons
+      </Parameter>
+      <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="extent">-180,-90,180,90</Parameter>
+      <Parameter name="use_spatial_index">true</Parameter>
+    </Datasource>
+  </Layer>
+
+  <!-- Layer: GIS Features (Lines) -->
+  <Layer name="gis_lines" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
+    <StyleName>gis_line_style</StyleName>
+    <Datasource>
+      <Parameter name="type">postgis</Parameter>
+      <Parameter name="dbname">rakshagis</Parameter>
+      <Parameter name="host">host.docker.internal</Parameter>
+      <Parameter name="port">5432</Parameter>
+      <Parameter name="user">raksha</Parameter>
+      <Parameter name="password">raksha_dev_pass</Parameter>
+      <Parameter name="table">
+        (SELECT id, layer_name, geometry FROM survey_projects_gisfeature
+         WHERE geometry_type = 'LINE' AND is_deleted = false) AS gis_lines
+      </Parameter>
+      <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="extent">-180,-90,180,90</Parameter>
+      <Parameter name="use_spatial_index">true</Parameter>
+    </Datasource>
+  </Layer>
+
+  <!-- Layer: GIS Features (Points) -->
+  <Layer name="gis_points" srs="+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs">
+    <StyleName>gis_point_style</StyleName>
+    <Datasource>
+      <Parameter name="type">postgis</Parameter>
+      <Parameter name="dbname">rakshagis</Parameter>
+      <Parameter name="host">host.docker.internal</Parameter>
+      <Parameter name="port">5432</Parameter>
+      <Parameter name="user">raksha</Parameter>
+      <Parameter name="password">raksha_dev_pass</Parameter>
+      <Parameter name="table">
+        (SELECT id, layer_name, geometry FROM survey_projects_gisfeature
+         WHERE geometry_type = 'POINT' AND is_deleted = false) AS gis_points
+      </Parameter>
+      <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>
   </Layer>
@@ -74,22 +148,39 @@
   <!-- Styles -->
   <Style name="state_style">
     <Rule>
-      <MaxScaleDenominator>250000</MaxScaleDenominator>
       <LineSymbolizer stroke="#333333" stroke-width="2" stroke-opacity="0.9"/>
     </Rule>
   </Style>
 
   <Style name="district_style">
     <Rule>
-      <MaxScaleDenominator>100000</MaxScaleDenominator>
       <LineSymbolizer stroke="#666666" stroke-width="1.5" stroke-opacity="0.7"/>
     </Rule>
   </Style>
 
-  <Style name="survey_style">
+  <Style name="defence_style">
     <Rule>
-      <PolygonSymbolizer fill="#4ecdc4" fill-opacity="0.25"/>
-      <LineSymbolizer stroke="#4ecdc4" stroke-width="1.5" stroke-opacity="0.8"/>
+      <PolygonSymbolizer fill="#ff9800" fill-opacity="0.25"/>
+      <LineSymbolizer stroke="#e65100" stroke-width="2" stroke-opacity="0.9"/>
+    </Rule>
+  </Style>
+
+  <Style name="gis_polygon_style">
+    <Rule>
+      <PolygonSymbolizer fill="#4caf50" fill-opacity="0.2"/>
+      <LineSymbolizer stroke="#1b5e20" stroke-width="1.5" stroke-opacity="0.8"/>
+    </Rule>
+  </Style>
+
+  <Style name="gis_line_style">
+    <Rule>
+      <LineSymbolizer stroke="#2196f3" stroke-width="2" stroke-opacity="0.8"/>
+    </Rule>
+  </Style>
+
+  <Style name="gis_point_style">
+    <Rule>
+      <MarkersSymbolizer fill="#e91e63" stroke="#ffffff" stroke-width="1.5" width="8" height="8" placement="point" marker-type="ellipse"/>
     </Rule>
   </Style>
 

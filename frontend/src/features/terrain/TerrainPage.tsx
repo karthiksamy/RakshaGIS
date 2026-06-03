@@ -26,11 +26,99 @@ interface SlopeStats { min: number; max: number; avg: number; gridSize: number }
 interface ClickedElev { lat: number; lon: number; elev: number }
 
 // Color features by layer_name (consistent hash-based color)
-function layerColor(name: string): Cesium.Color {
+function layerColor(name?: string | null): Cesium.Color {
+  const s = name || 'layer'
   let h = 0
-  for (let i = 0; i < name.length; i++) h = name.charCodeAt(i) + ((h << 5) - h)
+  for (let i = 0; i < s.length; i++) h = s.charCodeAt(i) + ((h << 5) - h)
   const hue = Math.abs(h % 360) / 360
   return Cesium.Color.fromHsl(hue, 0.7, 0.55, 0.6)
+}
+
+// Build a Cesium imagery provider from a configured BasemapConfig (or a sensible
+// public-OSM fallback). Handles {a-c}-style subdomain templates → Cesium {s}.
+function makeCesiumImagery(basemap?: any): Cesium.ImageryProvider {
+  let url = (basemap?.url_template || '').trim()
+  let subdomains: string[] | undefined
+  const m = url.match(/\{([a-z])-([a-z])\}/i)
+  if (m) {
+    subdomains = []
+    for (let c = m[1].charCodeAt(0); c <= m[2].charCodeAt(0); c++) {
+      subdomains.push(String.fromCharCode(c))
+    }
+    url = url.replace(m[0], '{s}')
+  } else if (url.includes('{s}')) {
+    subdomains = ['a', 'b', 'c']
+  }
+  // OSM provider or no template → public OSM tiles (works without the local tile server).
+  if (!url || basemap?.provider === 'OSM') {
+    url = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+    subdomains = undefined
+  }
+  return new Cesium.UrlTemplateImageryProvider({
+    url,
+    subdomains,
+    tilingScheme: new Cesium.WebMercatorTilingScheme(),
+    maximumLevel: 19,
+    credit: new Cesium.Credit(basemap?.attribution || 'OpenStreetMap contributors'),
+  })
+}
+
+// Add a single GeoJSON geometry to a Cesium datasource as draped/extruded entities.
+// Handles polygon holes and multi-geometries (used by both project & external layers).
+function addGeomEntity(
+  ds: Cesium.CustomDataSource,
+  geom: any,
+  name: string,
+  color: Cesium.Color,
+  extrudedHeight: number,
+) {
+  if (!geom) return
+  // GISFeatureSerializer (DRF-GIS GeometryField) can hand back the geometry as a
+  // JSON string rather than a nested object — parse it so .type/.coordinates work.
+  if (typeof geom === 'string') {
+    try { geom = JSON.parse(geom) } catch { return }
+  }
+  if (!geom || !geom.type) return
+  if (geom.type === 'Polygon' || geom.type === 'MultiPolygon') {
+    const polys = geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates
+    polys.forEach((poly: number[][][]) => {
+      if (!poly || !poly.length) return
+      const hierarchy = new Cesium.PolygonHierarchy(
+        Cesium.Cartesian3.fromDegreesArray(poly[0].flat()),
+        poly.slice(1).map((hole) =>
+          new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArray(hole.flat()))),
+      )
+      // IMPORTANT: a ground-clamped polygon (heightReference CLAMP_TO_GROUND) cannot
+      // also be extruded — that combination throws in Cesium's render loop and blanks
+      // the globe. So: drape on terrain when not extruding, else extrude as a volume.
+      const polygon: any = extrudedHeight > 0
+        ? { hierarchy, material: color, outline: true,
+            outlineColor: Cesium.Color.WHITE.withAlpha(0.4),
+            height: 0, extrudedHeight }
+        : { hierarchy, material: color, outline: false,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND }
+      ds.entities.add({ name, polygon })
+    })
+  } else if (geom.type === 'LineString' || geom.type === 'MultiLineString') {
+    const coords = geom.type === 'LineString' ? [geom.coordinates] : geom.coordinates
+    coords.forEach((line: number[][]) => {
+      ds.entities.add({
+        name,
+        polyline: {
+          positions: Cesium.Cartesian3.fromDegreesArray(line.flat()),
+          width: 2, material: color, clampToGround: true,
+        },
+      })
+    })
+  } else if (geom.type === 'Point' || geom.type === 'MultiPoint') {
+    const pts = geom.type === 'Point' ? [geom.coordinates] : geom.coordinates
+    pts.forEach((p: number[]) => {
+      ds.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(p[0], p[1]),
+        point: { pixelSize: 8, color, heightReference: Cesium.HeightReference.CLAMP_TO_GROUND },
+      })
+    })
+  }
 }
 
 function haversineM(lat1: number, lon1: number, lat2: number, lon2: number) {
@@ -53,6 +141,10 @@ export default function TerrainPage() {
   const [ready, setReady] = useState(false)
   const [activeTool, setActiveTool] = useState<Tool>('none')
   const [selectedProject, setSelectedProject] = useState<number | null>(null)
+  const [selectedArea, setSelectedArea] = useState<number | null>(null)
+  const [selectedExtLayer, setSelectedExtLayer] = useState<number | null>(null)
+  const [extFilterValue, setExtFilterValue] = useState<string | null>(null)
+  const [extLoading, setExtLoading] = useState(false)
   const [featuresLoaded, setFeaturesLoaded] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
   const [cesiumError, setCesiumError] = useState<string | null>(null)
@@ -64,8 +156,9 @@ export default function TerrainPage() {
   const [profileBuilding, setProfileBuilding] = useState(false)
   const [slopeBuilding, setSlopeBuilding] = useState(false)
 
-  // Extrusion height slider (for features)
-  const [extrusionH, setExtrusionH] = useState(10)
+  // Feature extrusion height (0 = drape flat on the terrain; >0 = raise as a volume).
+  // Default 0 so parcels render as proper shapes clamped to the ground.
+  const [extrusionH, setExtrusionH] = useState(0)
 
   const { data: terrainCfg } = useQuery<any>({
     queryKey: ['terrain-config'],
@@ -76,6 +169,56 @@ export default function TerrainPage() {
     queryKey: ['projects-list'],
     queryFn: () => api.get('/projects/?page_size=100').then(r => r.data.results ?? r.data),
   })
+
+  // Active external DB layers (GLR plans etc.) available to drape on the terrain.
+  const { data: extLayers = [] } = useQuery<any[]>({
+    queryKey: ['ext-layers-active'],
+    queryFn: () => api.get('/external/layers/').then(r => r.data.results ?? r.data),
+  })
+
+  // Configured basemaps — used as the globe imagery (consistent with the 2D map).
+  const { data: basemaps = [] } = useQuery<any[]>({
+    queryKey: ['basemaps'],
+    queryFn: () => api.get('/gis/basemaps/').then(r => r.data.results ?? r.data),
+  })
+  const [selectedBasemap, setSelectedBasemap] = useState<number | null>(null)
+
+  // Survey areas (named, e.g. "AFS Sulur") for the selected project.
+  const { data: surveyAreas = [] } = useQuery<any[]>({
+    queryKey: ['survey-areas-3d', selectedProject],
+    queryFn: () => api.get(`/projects/survey-areas/?project=${selectedProject}`)
+      .then(r => r.data.results ?? r.data),
+    enabled: !!selectedProject,
+  })
+
+  // The column an external layer is filtered by (configured by the super admin):
+  // office-name field → classification field → label column → first analysis column.
+  // office_filter_field is the dedicated office-name column (same field the 2D
+  // ExternalLayersPanel uses); it must take priority so the office dropdown appears.
+  const extLayer = extLayers.find((l: any) => l.id === selectedExtLayer)
+  const extFilterField: string =
+    (extLayer?.office_filter_field || extLayer?.classification_field || extLayer?.label_column ||
+     (extLayer?.analysis_columns || [])[0] || '').trim()
+
+  // Distinct values of that column, for the value-filter dropdown.
+  const { data: extFilterValues = [] } = useQuery<string[]>({
+    queryKey: ['ext-distinct', selectedExtLayer, extFilterField],
+    queryFn: () => api.get(`/external/layers/${selectedExtLayer}/distinct-values/`, {
+      params: { field: extFilterField, limit: 500 },
+    }).then(r => r.data?.values ?? []),
+    enabled: !!selectedExtLayer && !!extFilterField,
+  })
+
+  // Default to the super-admin-configured default basemap (else first active).
+  useEffect(() => {
+    if (basemaps.length && selectedBasemap == null) {
+      const pick =
+        basemaps.find((b: any) => b.is_default && b.is_active) ??
+        basemaps.find((b: any) => b.is_active) ??
+        basemaps[0]
+      if (pick) setSelectedBasemap(pick.id)
+    }
+  }, [basemaps])
 
   // Init Cesium viewer
   useEffect(() => {
@@ -114,19 +257,10 @@ export default function TerrainPage() {
         creditContainer: document.createElement('div'),
       })
 
-      // Add imagery (post-construction — imageryProvider was removed from constructor in Cesium 1.101)
+      // Initial imagery (post-construction — imageryProvider was removed from the
+      // constructor in Cesium 1.101). A later effect swaps in the chosen basemap.
       viewer.imageryLayers.removeAll()
-      viewer.imageryLayers.addImageryProvider(
-        new Cesium.UrlTemplateImageryProvider({
-          url: '/osm-tiles/{z}/{x}/{y}.png',
-          tilingScheme: new Cesium.WebMercatorTilingScheme(),
-          maximumLevel: 18,
-          credit: new Cesium.Credit('OpenStreetMap contributors'),
-        })
-      )
-
-      // Remove default imagery (loaded by imageryProvider constructor above)
-      // Do NOT do anything — UrlTemplateImageryProvider is passed directly
+      viewer.imageryLayers.addImageryProvider(makeCesiumImagery())
 
       viewer.scene.globe.depthTestAgainstTerrain = true
       viewer.scene.globe.enableLighting = false
@@ -164,6 +298,15 @@ export default function TerrainPage() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terrainCfg?.terrain_source])
+
+  // Swap the globe imagery whenever the chosen basemap changes.
+  useEffect(() => {
+    const viewer = viewerRef.current
+    if (!viewer || !ready) return
+    const bm = basemaps.find((b: any) => b.id === selectedBasemap)
+    viewer.imageryLayers.removeAll()
+    viewer.imageryLayers.addImageryProvider(makeCesiumImagery(bm))
+  }, [ready, selectedBasemap, basemaps])
 
   // Install click handler based on active tool
   useEffect(() => {
@@ -256,7 +399,7 @@ export default function TerrainPage() {
     }
   }, [activeTool, ready])
 
-  const loadProjectFeatures = useCallback(async (projectId: number) => {
+  const loadProjectFeatures = useCallback(async (projectId: number, areaId?: number | null) => {
     const viewer = viewerRef.current
     if (!viewer) return
     // Remove previous feature datasources
@@ -264,71 +407,71 @@ export default function TerrainPage() {
     toRemove.forEach((ds: any) => viewer.dataSources.remove(ds))
 
     try {
-      const res = await api.get(`/projects/features/?project=${projectId}&page_size=2000`)
-      const features = res.data.results ?? res.data
-      if (!features.length) { message.info('No features found for this project'); return }
+      // A specific survey area (e.g. "AFS Sulur") loads only that area's features;
+      // otherwise the whole project loads.
+      const res = areaId
+        ? await api.get(`/projects/survey-areas/${areaId}/features/?limit=20000`)
+        : await api.get(`/projects/features/?project=${projectId}&page_size=2000`)
+      const raw = areaId ? (res.data?.features ?? []) : (res.data.results ?? res.data)
+      // Normalise to { geometry, layer_name } regardless of endpoint shape.
+      const features = areaId
+        ? raw.map((f: any) => ({ geometry: f.geometry, layer_name: f.properties?.layer_name }))
+        : raw
+      if (!features.length) { message.info('No features found'); return }
 
       const ds = new Cesium.CustomDataSource('project-features')
-      await viewer.dataSources.add(ds)
-
+      let drawn = 0
       features.forEach((f: any) => {
-        const color = layerColor(f.layer_name)
-        const geom = f.geometry
-        if (!geom) return
-
-        if (geom.type === 'Polygon' || geom.type === 'MultiPolygon') {
-          const rings = geom.type === 'Polygon' ? [geom.coordinates[0]] : geom.coordinates.map((c: any) => c[0])
-          rings.forEach((ring: number[][]) => {
-            const hierarchy = new Cesium.PolygonHierarchy(
-              Cesium.Cartesian3.fromDegreesArray(ring.flat())
-            )
-            ds.entities.add({
-              name: f.layer_name,
-              polygon: {
-                hierarchy,
-                material: color,
-                outline: true,
-                outlineColor: Cesium.Color.WHITE.withAlpha(0.4),
-                height: 0,
-                extrudedHeight: extrusionH,
-                heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-              },
-            })
-          })
-        } else if (geom.type === 'LineString' || geom.type === 'MultiLineString') {
-          const coords = geom.type === 'LineString' ? [geom.coordinates] : geom.coordinates
-          coords.forEach((line: number[][]) => {
-            ds.entities.add({
-              polyline: {
-                positions: Cesium.Cartesian3.fromDegreesArray(line.flat()),
-                width: 2,
-                material: color,
-                clampToGround: true,
-              },
-            })
-          })
-        } else if (geom.type === 'Point') {
-          ds.entities.add({
-            position: Cesium.Cartesian3.fromDegrees(geom.coordinates[0], geom.coordinates[1]),
-            point: { pixelSize: 8, color, heightReference: Cesium.HeightReference.CLAMP_TO_GROUND },
-            label: {
-              text: f.layer_name,
-              font: '11px sans-serif',
-              fillColor: Cesium.Color.WHITE,
-              outlineColor: Cesium.Color.BLACK,
-              outlineWidth: 2,
-              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-              pixelOffset: new Cesium.Cartesian2(0, -14),
-            },
-          })
-        }
+        try {
+          addGeomEntity(ds, f.geometry, f.layer_name, layerColor(f.layer_name), extrusionH)
+          drawn++
+        } catch { /* skip a malformed feature without losing the rest */ }
       })
-
-      viewer.zoomTo(ds)
+      await viewer.dataSources.add(ds)
+      viewer.flyTo(ds, { duration: 1.5 }).catch(() => {})
       setFeaturesLoaded(true)
-      message.success(`Loaded ${features.length} features`)
+      message.success(`Loaded ${drawn} of ${features.length} features`)
     } catch {
-      message.error('Failed to load project features')
+      message.error('Failed to load features')
+    }
+  }, [extrusionH])
+
+  // Drape an external DB layer (e.g. GLR plan) over the terrain.
+  const loadExternalLayer = useCallback(async (
+    extId: number, name: string, filterField?: string, filterValue?: string | null,
+  ) => {
+    const viewer = viewerRef.current
+    if (!viewer) return
+    const dsName = `ext-${extId}`
+    // Replace any prior instance of this layer
+    viewer.dataSources.getByName(dsName).forEach((ds: any) => viewer.dataSources.remove(ds))
+
+    setExtLoading(true)
+    try {
+      // Geometry is returned in WGS84 by the backend; cap to keep the viewer responsive.
+      // Optionally filter by the super-admin-configured column value.
+      const params: Record<string, unknown> = { limit: 20000 }
+      if (filterField && filterValue) {
+        params.filter_field = filterField
+        params.filter_value = filterValue
+      }
+      const res = await api.get(`/external/layers/${extId}/geojson/`, { params })
+      const features = res.data?.features ?? []
+      if (!features.length) { message.info(`No matching features in "${name}"`); return }
+
+      const ds = new Cesium.CustomDataSource(dsName)
+      const color = layerColor(name)
+      features.forEach((f: any) => {
+        try { addGeomEntity(ds, f.geometry, name, color, extrusionH) } catch { /* skip */ }
+      })
+      await viewer.dataSources.add(ds)
+      viewer.flyTo(ds, { duration: 1.5 }).catch(() => {})
+      setFeaturesLoaded(true)
+      message.success(`Loaded "${name}" — ${features.length} feature(s)`)
+    } catch {
+      message.error(`Failed to load "${name}"`)
+    } finally {
+      setExtLoading(false)
     }
   }, [extrusionH])
 
@@ -338,6 +481,11 @@ export default function TerrainPage() {
     viewer.entities.removeAll()
     const toRemove = viewer.dataSources.getByName('project-features')
     toRemove.forEach((ds: any) => viewer.dataSources.remove(ds))
+    // Remove any draped external layers (named 'ext-<id>')
+    for (let i = viewer.dataSources.length - 1; i >= 0; i--) {
+      const ds = viewer.dataSources.get(i)
+      if (ds?.name?.startsWith('ext-')) viewer.dataSources.remove(ds)
+    }
     setFeaturesLoaded(false)
     setClickedElev(null)
     setProfileData([])
@@ -383,21 +531,90 @@ export default function TerrainPage() {
 
         <Select
           placeholder="Select project"
-          style={{ width: 200 }}
+          style={{ width: 180 }}
           size="small"
+          showSearch
+          optionFilterProp="label"
           options={projects.map((p: any) => ({ value: p.id, label: p.project_number || p.name }))}
           value={selectedProject}
-          onChange={setSelectedProject}
+          onChange={(v) => { setSelectedProject(v); setSelectedArea(null) }}
         />
+        <Tooltip title="Optional: load only one survey area (e.g. AFS Sulur)">
+          <Select
+            placeholder="Survey area (all)"
+            style={{ width: 170 }}
+            size="small"
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            disabled={!selectedProject}
+            options={surveyAreas.map((a: any) => ({ value: a.id, label: a.name }))}
+            value={selectedArea}
+            onChange={(v) => setSelectedArea(v ?? null)}
+          />
+        </Tooltip>
         <Button
           size="small" type="primary"
           disabled={!selectedProject || !ready}
-          onClick={() => selectedProject && loadProjectFeatures(selectedProject)}
+          onClick={() => selectedProject && loadProjectFeatures(selectedProject, selectedArea)}
         >
-          Load Features
+          {selectedArea ? 'Load Area' : 'Load Features'}
         </Button>
 
         <Divider type="vertical" style={{ borderColor: '#2a2a3e', height: 20 }} />
+
+        <Select
+          placeholder="External layer"
+          style={{ width: 170 }}
+          size="small"
+          allowClear
+          showSearch
+          optionFilterProp="label"
+          options={extLayers.map((l: any) => ({ value: l.id, label: l.display_name }))}
+          value={selectedExtLayer}
+          onChange={(v) => { setSelectedExtLayer(v ?? null); setExtFilterValue(null) }}
+        />
+        {extFilterField && (
+          <Tooltip title={`Filter by ${extFilterField} (configured by admin)`}>
+            <Select
+              placeholder={extFilterField}
+              style={{ width: 160 }}
+              size="small"
+              allowClear
+              showSearch
+              optionFilterProp="label"
+              options={extFilterValues.map((v: string) => ({ value: v, label: v }))}
+              value={extFilterValue}
+              onChange={(v) => setExtFilterValue(v ?? null)}
+            />
+          </Tooltip>
+        )}
+        <Button
+          size="small"
+          loading={extLoading}
+          disabled={!selectedExtLayer || !ready}
+          onClick={() => {
+            const l = extLayers.find((x: any) => x.id === selectedExtLayer)
+            if (l) loadExternalLayer(l.id, l.display_name, extFilterField, extFilterValue)
+          }}
+        >
+          Load Layer
+        </Button>
+
+        <Divider type="vertical" style={{ borderColor: '#2a2a3e', height: 20 }} />
+
+        <Tooltip title="Globe basemap imagery">
+          <Select
+            placeholder="Basemap"
+            style={{ width: 150 }}
+            size="small"
+            options={basemaps
+              .filter((b: any) => b.is_active)
+              .map((b: any) => ({ value: b.id, label: b.is_default ? `${b.name} ★` : b.name }))}
+            value={selectedBasemap}
+            onChange={setSelectedBasemap}
+          />
+        </Tooltip>
 
         <Tooltip title="Fly to India">
           <Button size="small" icon={<GlobalOutlined />} onClick={flyToIndia} disabled={!ready} />

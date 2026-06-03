@@ -32,6 +32,7 @@ shapely==2.0.6
 
 # ── AI / document processing ────────────────────────────────────────
 pdfplumber==0.11.4
+pymupdf==1.27.2.3
 
 # ── Monitoring ──────────────────────────────────────────────────────
 django-prometheus==2.3.1
@@ -49,3 +50,6 @@ django-celery-beat==2.6.0
 
 # ── Backup encryption ────────────────────────────────────────────────────────
 cryptography==43.0.3
+
+# ── C2PA content provenance (signed manifests for PNG/JPEG/TIFF/WebP) ─────────
+c2pa-python==0.32.11

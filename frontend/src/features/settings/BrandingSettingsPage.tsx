@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { Card, Form, Input, Button, Space, Typography, message, ColorPicker, Divider, Alert } from 'antd'
 import { SaveOutlined, EyeOutlined, GlobalOutlined } from '@ant-design/icons'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 import { useAppStore } from '@/app/store'
 import type { BrandingConfig } from '@/context/BrandingContext'
@@ -11,10 +12,11 @@ const { Title, Text } = Typography
 export default function BrandingSettingsPage() {
   const user = useAppStore((s) => s.user)
   const qc = useQueryClient()
+  const { t } = useTranslation()
   const [form] = Form.useForm()
 
   if (user?.role !== 'SUPERADMIN') {
-    return <Alert type="error" message="Access denied — Superadmin only" style={{ margin: 24 }} />
+    return <Alert type="error" message={t("branding.access_denied")} style={{ margin: 24 }} />
   }
 
   const { data, isLoading } = useQuery<BrandingConfig>({
@@ -29,10 +31,10 @@ export default function BrandingSettingsPage() {
   const mutation = useMutation({
     mutationFn: (values: Partial<BrandingConfig>) => api.patch('/core/branding/', values).then((r) => r.data),
     onSuccess: (updated) => {
-      message.success('Branding updated — reload to see changes')
+      message.success(t('branding.updated'))
       qc.setQueryData(['branding'], updated)
     },
-    onError: () => message.error('Failed to save branding'),
+    onError: () => message.error(t('common.error')),
   })
 
   function handleColorChange(_: any, hex: string) {
@@ -41,7 +43,7 @@ export default function BrandingSettingsPage() {
 
   return (
     <div style={{ padding: 24, maxWidth: 640 }}>
-      <Title level={4} style={{ marginBottom: 4 }}>Branding Settings</Title>
+      <Title level={4} style={{ marginBottom: 4 }}>{t("branding.title")}</Title>
       <Text type="secondary" style={{ fontSize: 13 }}>
         Customise the application title, subtitle, colour scheme and login page messaging.
       </Text>
@@ -52,7 +54,7 @@ export default function BrandingSettingsPage() {
 
           <Form.Item
             name="app_title"
-            label="Application Title"
+            label={t("branding.app_title")}
             rules={[{ required: true, max: 100 }]}
           >
             <Input prefix={<GlobalOutlined />} placeholder="RakshaGIS" />
@@ -60,7 +62,7 @@ export default function BrandingSettingsPage() {
 
           <Form.Item
             name="app_subtitle"
-            label="Subtitle / Organisation Name"
+            label={t("branding.org_subtitle")}
             rules={[{ max: 200 }]}
           >
             <Input placeholder="DGDE — Defence Estates GIS Platform" />
@@ -68,7 +70,7 @@ export default function BrandingSettingsPage() {
 
           <Form.Item
             name="logo_url"
-            label="Logo URL"
+            label={t("branding.logo_url")}
             tooltip="Enter a URL to your logo image. Leave blank to use the default icon."
             rules={[{ type: 'url', message: 'Enter a valid URL' }]}
           >
@@ -80,7 +82,7 @@ export default function BrandingSettingsPage() {
 
           <Form.Item
             name="login_tagline"
-            label="Login Page Tagline"
+            label={t("branding.tagline")}
             rules={[{ max: 300 }]}
           >
             <Input.TextArea

@@ -395,7 +395,12 @@ export default function AppLayout() {
           />
         </Sider>
 
-        <Content style={{ overflow: 'hidden', position: 'relative' }}>
+        <Content style={{
+          height: 'calc(100vh - 48px)',
+          overflowY: 'auto',
+          overflowX: 'hidden',
+          position: 'relative',
+        }}>
           <Outlet />
         </Content>
       </Layout>

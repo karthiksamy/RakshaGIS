@@ -8,6 +8,7 @@ import {
   PlusOutlined, EditOutlined, DeleteOutlined, SendOutlined, PlayCircleOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 import { useAppStore } from '@/app/store'
 
@@ -35,6 +36,7 @@ export default function ReportsPage() {
   const user = useAppStore(s => s.user)
   const [modalOpen, setModalOpen] = useState(false)
   const [editItem, setEditItem] = useState<ReportSchedule | null>(null)
+  const { t } = useTranslation()
   const [form] = Form.useForm()
 
   const { data, isLoading } = useQuery<{ results: ReportSchedule[] }>({
@@ -54,7 +56,7 @@ export default function ReportsPage() {
         : api.post('/reports/schedules/', values),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['report-schedules'] })
-      message.success(editItem ? 'Schedule updated' : 'Schedule created')
+      message.success(editItem ? t('reports.schedule_updated') : t('reports.schedule_created'))
       setModalOpen(false)
       form.resetFields()
       setEditItem(null)
@@ -122,10 +124,10 @@ export default function ReportsPage() {
           { title: 'Name', dataIndex: 'name', render: v => <Text style={{ color: '#e0e0e0' }}>{v}</Text> },
           { title: 'Type', dataIndex: 'report_type_display', width: 160, render: v => <Text style={{ color: '#aaa' }}>{v}</Text> },
           {
-            title: 'Frequency', dataIndex: 'frequency', width: 90,
+            title: t('reports.frequency'), dataIndex: 'frequency', width: 90,
             render: (v, r) => <Tag color={FREQ_COLOR[v] || 'default'}>{r.frequency_display}</Tag>,
           },
-          { title: 'Organisation', dataIndex: 'organisation_name', width: 180, render: v => <Text style={{ color: '#888' }}>{v}</Text> },
+          { title: t('reports.org'), dataIndex: 'organisation_name', width: 180, render: v => <Text style={{ color: '#888' }}>{v}</Text> },
           { title: 'Recipients', dataIndex: 'recipients', ellipsis: true, render: v => <Text style={{ color: '#666', fontSize: 11 }}>{v}</Text> },
           {
             title: 'Active', dataIndex: 'is_active', width: 70,
@@ -143,7 +145,7 @@ export default function ReportsPage() {
                 <Tooltip title="Send Now">
                   <Button size="small" icon={<SendOutlined />} onClick={() => sendNowMutation.mutate(r.id)} />
                 </Tooltip>
-                <Popconfirm title="Delete this schedule?" onConfirm={() => deleteMutation.mutate(r.id)}>
+                <Popconfirm title={t("reports.delete_schedule")} onConfirm={() => deleteMutation.mutate(r.id)}>
                   <Button size="small" danger icon={<DeleteOutlined />} />
                 </Popconfirm>
               </Space>
@@ -160,12 +162,12 @@ export default function ReportsPage() {
         confirmLoading={saveMutation.isPending}
       >
         <Form form={form} layout="vertical" onFinish={vals => saveMutation.mutate(vals)} style={{ marginTop: 12 }}>
-          <Form.Item name="name" label="Schedule Name" rules={[{ required: true }]}>
+          <Form.Item name="name" label={t("reports.schedule_name")} rules={[{ required: true }]}>
             <Input />
           </Form.Item>
           <Row gutter={12}>
             <Col span={12}>
-              <Form.Item name="report_type" label="Report Type" rules={[{ required: true }]}>
+              <Form.Item name="report_type" label={t("reports.report_type")} rules={[{ required: true }]}>
                 <Select options={[
                   { value: 'STATUS_SUMMARY', label: 'Project Status Summary' },
                   { value: 'FEATURE_EXPORT', label: 'Feature Data Export' },
@@ -174,7 +176,7 @@ export default function ReportsPage() {
               </Form.Item>
             </Col>
             <Col span={12}>
-              <Form.Item name="frequency" label="Frequency" rules={[{ required: true }]}>
+              <Form.Item name="frequency" label={t("reports.frequency")} rules={[{ required: true }]}>
                 <Select options={[
                   { value: 'DAILY', label: 'Daily' },
                   { value: 'WEEKLY', label: 'Weekly' },
@@ -183,7 +185,7 @@ export default function ReportsPage() {
               </Form.Item>
             </Col>
           </Row>
-          <Form.Item name="organisation" label="Organisation" rules={[{ required: true }]}>
+          <Form.Item name="organisation" label={t("reports.org")} rules={[{ required: true }]}>
             <Select
               showSearch
               filterOption={(input, opt) => (opt?.label as string || '').toLowerCase().includes(input.toLowerCase())}
@@ -192,7 +194,7 @@ export default function ReportsPage() {
           </Form.Item>
           <Form.Item
             name="recipients"
-            label="Recipients (comma-separated emails)"
+            label={t("reports.recipients")}
             rules={[{ required: true }]}
           >
             <Input.TextArea rows={2} placeholder="user1@example.com, user2@example.com" />

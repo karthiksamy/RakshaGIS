@@ -348,7 +348,7 @@ export default function LoginPage() {
 
         <div style={{ marginTop: 32, paddingTop: 16, borderTop: '1px solid #0f1c2e', textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <Typography.Text style={{ color: '#24374a', fontSize: 11 }}>
-            RakshaGIS v2.0 — {t('auth.login_subtitle', 'Ministry of Defence, India')}
+            {branding.app_title} v2.0 — {t('auth.login_subtitle', 'Ministry of Defence, India')}
           </Typography.Text>
           <LanguageSwitcher />
         </div>

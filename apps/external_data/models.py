@@ -106,18 +106,74 @@ class ExternalLayer(models.Model):
     # Optional attribute columns to include (empty = all)
     include_columns = models.JSONField(default=list, blank=True,
                           help_text='List of column names to include; empty = all non-geometry')
+    # Columns to surface in temp-layer proximity analysis result tables.
+    # Empty = first 5 available columns.
+    analysis_columns = models.JSONField(default=list, blank=True,
+                          help_text='Columns to show in Intersecting/Nearby analysis tables; empty = first 5')
 
     # ── Office-based row-level filtering ──────────────────────────────────
+    # Whether this layer holds data INSIDE a cantonment (rows keyed by the
+    # cantonment/CEO office code) or OUTSIDE (general office hierarchy).
+    #   OUTSIDE → filter by the user's office + parent-subtree descendants.
+    #   INSIDE  → filter by cantonment (officelevelid='CB') office codes resolved
+    #             per level: PDDE via controllingoffice, DEO via parentofficeid,
+    #             CEO via own office code. DGDE always sees all.
+    SCOPE_OUTSIDE = 'OUTSIDE'
+    SCOPE_INSIDE  = 'INSIDE'
+    SCOPE_CHOICES = [
+        (SCOPE_OUTSIDE, 'Outside Cantonment (office hierarchy)'),
+        (SCOPE_INSIDE,  'Inside Cantonment (CB office codes)'),
+    ]
+    cantonment_scope = models.CharField(max_length=10, choices=SCOPE_CHOICES,
+                              default=SCOPE_OUTSIDE,
+                              help_text='How office filtering resolves the allowed rows.')
+
     # Column in the external table that holds the office code (e.g. 'officeid').
     # When set, non-DGDE users only see rows whose value is within their office
     # subtree.  DGDE-level users and super admins always see every row.
     office_filter_field = models.CharField(max_length=63, blank=True,
-                              help_text='Column holding the office code used to '
-                                        'filter rows per logged-in office. Empty = no filter.')
+                              help_text='Fallback column for filtering (used when no '
+                                        'per-level override is set). Empty = no filter.')
+
+    # Per-level column overrides: which column to match against the user's office code
+    # for each org level.  DGDE is always unrestricted (no entry needed).
+    # e.g. {"PDDE": "pdde_code", "DEO": "officeid", "CEO": "officeid", "ADEO": "officeid"}
+    level_filter_fields = models.JSONField(default=dict, blank=True,
+                              help_text='Per-level column map: '
+                                        '{"PDDE":"col","DEO":"col","CEO":"col","ADEO":"col"}. '
+                                        'Overrides office_filter_field for the matched level.')
 
     # Display configuration
     style           = models.JSONField(default=dict, blank=True,
                           help_text='OpenLayers-compatible style: {color, fillColor, weight, opacity}')
+
+    # ── Rendering type for INSIDE-cantonment layers ───────────────────────
+    # GLR_PLAN → classification-based (thematic) colouring by classification_field.
+    # OTHERS   → flat single colour from `style` (color + opacity).
+    # Ignored for OUTSIDE-cantonment layers, which are always flat.
+    INSIDE_GLR    = 'GLR_PLAN'
+    INSIDE_OTHERS = 'OTHERS'
+    INSIDE_RENDER_CHOICES = [
+        (INSIDE_GLR,    'GLR Plan (classification colours)'),
+        (INSIDE_OTHERS, 'Others (single colour)'),
+    ]
+    inside_render_type = models.CharField(max_length=10, choices=INSIDE_RENDER_CHOICES,
+                              default=INSIDE_OTHERS,
+                              help_text='Inside-cantonment layers: GLR Plan → classification '
+                                        'colouring; Others → flat colour.')
+
+    # ── Classification-based (thematic) rendering ─────────────────────────
+    # Used only when cantonment_scope=INSIDE and inside_render_type=GLR_PLAN.
+    # Polygons/features are coloured by the unique values of this attribute column.
+    classification_field  = models.CharField(max_length=63, blank=True,
+                                help_text='Attribute column whose unique values drive thematic colours. '
+                                          'Empty = flat single-colour style.')
+    # Map of {value: {"color": "#RRGGBB", "opacity": 0.0-1.0}}. The key '__null__'
+    # (or empty string) styles features whose classification value is NULL/blank.
+    classification_colors = models.JSONField(default=dict, blank=True,
+                                help_text='{"A1": {"color": "#1b5e20", "opacity": 0.6}, ...}. '
+                                          'Use "__null__" for NULL/empty values.')
+
     min_zoom        = models.IntegerField(default=5)
     is_active       = models.BooleanField(default=True,
                           help_text='Shown in map viewer when True')

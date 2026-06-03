@@ -203,6 +203,21 @@ ONLYOFFICE_JWT_SECRET = env('ONLYOFFICE_JWT_SECRET', default='')
 # Leave empty to fall back to request.build_absolute_uri (good for local dev).
 ONLYOFFICE_INTERNAL_BASE_URL = env('ONLYOFFICE_INTERNAL_BASE_URL', default='')
 
+# ── C2PA content provenance signing ──────────────────────────────────────────
+# Real, signed C2PA manifests are embedded into supported raster exports
+# (PNG/JPEG/TIFF/WebP). Other formats fall back to the legacy provenance token.
+C2PA_ENABLED = env.bool('C2PA_ENABLED', default=True)
+C2PA_DIR = env('C2PA_DIR', default=str(BASE_DIR / 'data' / 'c2pa'))
+# Provide a CA-issued ES256 signer for production; if blank a self-signed dev
+# signer is generated once under C2PA_DIR.
+C2PA_SIGN_CERT_PATH = env('C2PA_SIGN_CERT_PATH', default='')
+C2PA_SIGN_KEY_PATH = env('C2PA_SIGN_KEY_PATH', default='')
+# RFC-3161 timestamp authority URL; leave blank for air-gapped (no timestamp).
+C2PA_TSA_URL = env('C2PA_TSA_URL', default='')
+C2PA_CERT_ORG = env('C2PA_CERT_ORG', default='DGDE RakshaGIS')
+C2PA_CERT_CN = env('C2PA_CERT_CN', default='RakshaGIS Provenance Signer')
+C2PA_CERT_COUNTRY = env('C2PA_CERT_COUNTRY', default='IN')
+
 OLLAMA_LOCAL_URL = env('OLLAMA_LOCAL_URL', default='http://localhost:11434')
 # host.docker.internal resolves to the Docker Desktop host on Windows/Mac/WSL2
 OLLAMA_HOST_URL  = env('OLLAMA_HOST_URL',  default='http://host.docker.internal:11434')
@@ -210,6 +225,14 @@ OLLAMA_DOCKER_URL = env('OLLAMA_DOCKER_URL', default='http://ollama:11434')
 # Kept for backwards-compat; services.py auto-detects which URL to use at runtime.
 OLLAMA_BASE_URL = env('OLLAMA_BASE_URL', default='http://ollama:11434')
 OLLAMA_MODEL = env('OLLAMA_MODEL', default='llama3.2')
+
+# AI compute mode — whether the AI backend is running on an NVIDIA GPU.
+# AI_BACKEND_GPU accepts: true/false, gpu/cpu, 1/0, yes/no (set by docker-compose
+# profile and .env). Vision pipelines (single-shot LLaVA + the Advanced AI Vision
+# Pipeline) require GPU and are blocked in CPU mode. The classical CV pipeline
+# runs on either CPU or GPU.
+_ai_backend_gpu = str(env('AI_BACKEND_GPU', default='false')).strip().lower()
+AI_GPU_ENABLED = _ai_backend_gpu in ('true', '1', 'yes', 'on', 'gpu', 'cuda', 'nvidia')
 
 # Backup & Recovery
 # BACKUP_ENCRYPTION_KEY: Fernet key (URL-safe base64, 32 bytes).

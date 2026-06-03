@@ -12,6 +12,7 @@ build/
 .gitignore/
 .gitignore
 .build-hash
+.frontend-hash
 
 #Data
 data/

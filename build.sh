@@ -1189,67 +1189,21 @@ else
   echo "      Then: docker compose run --rm web python manage.py collectstatic --no-input"
 fi
 
-# ── Step 10: Start all services ───────────────────────────────────────────────
+# ── Build complete ────────────────────────────────────────────────────────────
+# build.sh only sets up the environment — it does NOT start containers.
+# Use RakshaGIS.sh to start, stop, restart, or check service status.
 echo ""
-echo -e "${BOLD}>>> Starting all services...${RESET}"
-echo "  Compute mode : ${GPU_MODE^^}"
-[[ -n "$AI_BACKENDS_DOCKER" ]] \
-  && echo "  AI (Docker)  : $AI_BACKENDS_DOCKER" \
-  || echo "  AI (Docker)  : none (all using local installs)"
-[[ "$OPT_OSM" == true ]]        && echo "  OSM tiles    : enabled"
-[[ "$OPT_TERRAIN" == true ]]    && echo "  Terrain      : enabled"
-[[ "$OPT_MONITORING" == true ]] && echo "  Monitoring   : enabled"
-[[ "$OPT_ONLYOFFICE" == true ]] && echo "  OnlyOffice   : enabled"
-[[ "$OPT_HTTPS" == true ]]      && echo "  HTTPS        : enabled (${OPT_HTTPS_DOMAIN})"
-
-# Core application services (always started)
-echo ""
-echo "  ▶ Starting core services (db · redis · web · celery · nginx · pg_tileserv)..."
-docker compose up -d
-echo -e "  ${GREEN}✓ Core services running${RESET}"
-
-# Start optional services selected during setup
-if [[ -n "$OPTIONAL_PROFILES" ]]; then
-  echo "  ▶ Starting optional services..."
-  # shellcheck disable=SC2086
-  docker compose $OPTIONAL_PROFILES up -d
-  echo -e "  ${GREEN}✓ Optional services started${RESET}"
-fi
-
-# Start OnlyOffice (no separate profile — part of core compose, but only if selected)
-if [[ "$OPT_ONLYOFFICE" == true ]]; then
-  echo "  ▶ Starting OnlyOffice document server..."
-  docker compose up -d onlyoffice
-  echo -e "  ${GREEN}✓ OnlyOffice started${RESET}"
-fi
-
-# Start only AI backends that are NOT already running (START_PROFILES built by detection)
-if [[ -n "$START_PROFILES" ]]; then
-  echo "  ▶ Starting Docker AI backends..."
-  # shellcheck disable=SC2086
-  docker compose $START_PROFILES up -d
-  echo -e "  ${GREEN}✓ Docker AI backends started${RESET}"
-else
-  echo "  ✓ AI backends: all already running or using local installations"
-fi
-
-# ── Done ──────────────────────────────────────────────────────────────────────
-echo ""
-ACCESS_URL="http://localhost"
-[[ "${HOST_PORT}" != "80" ]] && ACCESS_URL="http://localhost:${HOST_PORT}"
 
 _yn() { [[ "$1" == "true" ]] && echo "enabled" || echo "disabled"; }
 
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║                RakshaGIS Setup Complete                 ║"
+echo "║              RakshaGIS Build Complete                   ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 printf "║  Project name    : %-35s║\n" "rakshagis  (COMPOSE_PROJECT_NAME)"
 printf "║  Data directory  : %-35s║\n" "${DATA_DIR}"
 printf "║  HTTP port       : %-35s║\n" "${HOST_PORT}"
 printf "║  Compute mode    : %-35s║\n" "${GPU_MODE^^}"
 printf "║  AI backends     : %-35s║\n" "${AI_BACKENDS_DOCKER:-local only}"
-echo "║  Default login   : admin / admin123                     ║"
-printf "║  Access URL      : %-35s║\n" "${ACCESS_URL}"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Optional components                                    ║"
 printf "║    OSM offline tiles    : %-29s║\n" "$(_yn "$OPT_OSM")"
@@ -1258,9 +1212,14 @@ printf "║    Monitoring           : %-29s║\n" "$(_yn "$OPT_MONITORING")"
 printf "║    OnlyOffice           : %-29s║\n" "$(_yn "$OPT_ONLYOFFICE")"
 printf "║    HTTPS / SSL          : %-29s║\n" "$(_yn "$OPT_HTTPS")"
 echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  Use './RakshaGIS.sh start|stop|restart|status'         ║"
-echo "║  Go to Settings → AI Config to activate a backend       ║"
-echo "║  Re-run build.sh at any time to enable more components  ║"
+echo "║  Next step — start the application:                     ║"
+echo "║    ./RakshaGIS.sh start                                 ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+echo "║  Other commands:                                        ║"
+echo "║    ./RakshaGIS.sh stop                                  ║"
+echo "║    ./RakshaGIS.sh restart                               ║"
+echo "║    ./RakshaGIS.sh status                                ║"
+echo "║    ./RakshaGIS.sh logs [service]                        ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Multi-project isolation: all resources are prefixed    ║"
 echo "║  'rakshagis_' — other projects on this host are safe.   ║"

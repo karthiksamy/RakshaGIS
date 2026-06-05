@@ -31,12 +31,18 @@ cd "$SCRIPT_DIR"
 BOLD='\033[1m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; RESET='\033[0m'
 
 # ── Load settings from .env ───────────────────────────────────────────────────
+_re() { grep "^$1=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r'; }
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
-  DATA_DIR=$(grep         "^DATA_DIR="              "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
-  AI_BACKEND_GPU=$(grep   "^AI_BACKEND_GPU="        "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
-  AI_BACKENDS=$(grep      "^AI_BACKENDS="           "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
-  HOST_PORT=$(grep        "^RAKSHAGIS_HTTP_PORT="   "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
-  COMPOSE_PROJECT_NAME=$(grep "^COMPOSE_PROJECT_NAME=" "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
+  DATA_DIR=$(_re DATA_DIR)
+  AI_BACKEND_GPU=$(_re AI_BACKEND_GPU)
+  AI_BACKENDS=$(_re AI_BACKENDS)
+  HOST_PORT=$(_re RAKSHAGIS_HTTP_PORT)
+  COMPOSE_PROJECT_NAME=$(_re COMPOSE_PROJECT_NAME)
+  OPT_OSM=$(_re RAKSHA_OPT_OSM)
+  OPT_TERRAIN=$(_re RAKSHA_OPT_TERRAIN)
+  OPT_MONITORING=$(_re RAKSHA_OPT_MONITORING)
+  OPT_ONLYOFFICE=$(_re RAKSHA_OPT_ONLYOFFICE)
+  OPT_HTTPS=$(_re RAKSHA_OPT_HTTPS)
 fi
 DATA_DIR="${DATA_DIR:-/RakshaGIS}"
 AI_BACKEND_GPU="${AI_BACKEND_GPU:-cpu}"
@@ -149,8 +155,15 @@ else
   ANYTHINGLLM_STATUS="not installed"
 fi
 
-# Combined: all Docker profiles needed for stop/restart/status
-ALL_PROFILE_FLAGS="$DOCKER_PROFILES"
+# Optional component profiles (from .env selections made during build.sh setup)
+OPTIONAL_PROFILES=""
+[[ "$OPT_OSM" == "true" ]]        && OPTIONAL_PROFILES="$OPTIONAL_PROFILES --profile osm"
+[[ "$OPT_TERRAIN" == "true" ]]    && OPTIONAL_PROFILES="$OPTIONAL_PROFILES --profile terrain"
+[[ "$OPT_MONITORING" == "true" ]] && OPTIONAL_PROFILES="$OPTIONAL_PROFILES --profile monitoring"
+[[ "$OPT_HTTPS" == "true" ]]      && OPTIONAL_PROFILES="$OPTIONAL_PROFILES --profile https"
+
+# Combined: AI backend profiles + optional component profiles (used by stop/restart/status)
+ALL_PROFILE_FLAGS="$DOCKER_PROFILES $OPTIONAL_PROFILES"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 print_banner() {
@@ -164,11 +177,19 @@ print_banner() {
 print_info() {
   echo "  Storage location : $DATA_DIR"
   echo "  Compose file     : $SCRIPT_DIR/docker-compose.yml"
+  echo "  HTTP port        : $HOST_PORT"
   echo "  AI compute mode  : ${AI_BACKEND_GPU^^}"
   echo "  Ollama           : $OLLAMA_STATUS"
   echo "  LocalAI          : $LOCALAI_STATUS"
   echo "  LlamaCpp         : $LLAMACPP_STATUS"
   echo "  AnythingLLM      : $ANYTHINGLLM_STATUS"
+  echo ""
+  echo "  ── Optional components ──"
+  [[ "$OPT_OSM" == "true" ]]        && echo "  OSM tiles        : enabled" || echo "  OSM tiles        : disabled"
+  [[ "$OPT_TERRAIN" == "true" ]]    && echo "  Terrain          : enabled" || echo "  Terrain          : disabled"
+  [[ "$OPT_MONITORING" == "true" ]] && echo "  Monitoring       : enabled" || echo "  Monitoring       : disabled"
+  [[ "$OPT_ONLYOFFICE" == "true" ]] && echo "  OnlyOffice       : enabled" || echo "  OnlyOffice       : disabled"
+  [[ "$OPT_HTTPS" == "true" ]]      && echo "  HTTPS            : enabled" || echo "  HTTPS            : disabled"
   echo ""
 
   if [[ -d "$DATA_DIR" ]]; then
@@ -240,9 +261,46 @@ do_start() {
   echo -e "  ${GREEN}✓ Port ${HOST_PORT} is available.${RESET}"
   echo ""
 
+  # ── Optional-service port checks ────────────────────────────────────────────
+  # Check ports for each enabled optional service before Docker tries to bind.
+  _opt_port_check() {
+    local svc="$1" port="$2"
+    if _port_in_use "$port" && [[ "$(_port_owner "$port")" != "rakshagis" ]]; then
+      echo -e "  ${RED}✗ Cannot start ${svc} — port ${port} is already allocated${RESET}"
+      echo "    Occupied by: $(_port_owner "$port" || echo 'another process')"
+      echo "    Fix: stop the conflicting process or disable ${svc} in .env"
+      echo "         (set RAKSHA_OPT_$(echo "$svc" | tr '[:lower:]' '[:upper:]')=false)"
+      return 1
+    fi
+    return 0
+  }
+  _START_BLOCKED=false
+  [[ "$OPT_MONITORING" == "true" ]] && ! _opt_port_check "Grafana"    3000 && _START_BLOCKED=true
+  [[ "$OPT_MONITORING" == "true" ]] && ! _opt_port_check "Prometheus" 9090 && _START_BLOCKED=true
+  if [[ "$_START_BLOCKED" == true ]]; then
+    echo ""
+    echo -e "  ${RED}Startup aborted — resolve the port conflicts above and re-run.${RESET}"
+    return 1
+  fi
+
   echo ">>> Starting core services (db · redis · web · celery · nginx · pg_tileserv)…"
   $COMPOSE up -d $CORE_SERVICES
   echo -e "  ${GREEN}✓ Core services started${RESET}"
+
+  # Start optional services (OSM, Terrain, Monitoring, HTTPS)
+  if [[ -n "$OPTIONAL_PROFILES" ]]; then
+    echo ">>> Starting optional services…"
+    # shellcheck disable=SC2086
+    $COMPOSE $OPTIONAL_PROFILES up -d
+    echo -e "  ${GREEN}✓ Optional services started${RESET}"
+  fi
+
+  # Start OnlyOffice (no Docker Compose profile — explicit service name)
+  if [[ "$OPT_ONLYOFFICE" == "true" ]]; then
+    echo ">>> Starting OnlyOffice document server…"
+    $COMPOSE up -d onlyoffice
+    echo -e "  ${GREEN}✓ OnlyOffice started${RESET}"
+  fi
 
   # Start Docker-managed AI backends that are not already running
   if [[ -n "$START_PROFILES" ]]; then
@@ -252,15 +310,6 @@ do_start() {
     echo -e "  ${GREEN}✓ Docker AI backends started${RESET}"
   else
     echo "  (All AI backends already running or using local installations)"
-  fi
-
-  # Monitoring (optional)
-  echo ""
-  read -r -p "  Start monitoring services (Prometheus / Grafana)? [y/N]: " MON
-  if [[ "${MON,,}" == "y" ]]; then
-    echo ">>> Starting monitoring…"
-    $COMPOSE up -d $MONITOR_SERVICES
-    echo -e "  ${GREEN}✓ Monitoring started${RESET}"
   fi
 
   # ── Wait for the web service to actually serve HTTP ──────────────────────
@@ -318,6 +367,14 @@ do_stop() {
 do_restart() {
   echo ">>> Restarting core services…"
   $COMPOSE restart $CORE_SERVICES
+  if [[ "$OPT_ONLYOFFICE" == "true" ]]; then
+    $COMPOSE restart onlyoffice
+  fi
+  if [[ -n "$OPTIONAL_PROFILES" ]]; then
+    echo ">>> Restarting optional services…"
+    # shellcheck disable=SC2086
+    $COMPOSE $OPTIONAL_PROFILES restart
+  fi
   if [[ -n "$DOCKER_PROFILES" ]]; then
     echo ">>> Restarting Docker AI backends…"
     # shellcheck disable=SC2086

@@ -11,6 +11,7 @@ import {
   BellOutlined, DashboardOutlined, BarChartOutlined, AuditOutlined,
   CheckCircleOutlined, SearchOutlined, BgColorsOutlined, EyeOutlined, EnvironmentOutlined,
   ShareAltOutlined, ImportOutlined, CompassOutlined, SafetyOutlined, CloudServerOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
@@ -18,6 +19,7 @@ import { useAppStore } from '@/app/store'
 import api from '@/services/api'
 import { useTheme, THEMES, type ThemeKey } from '@/context/ThemeContext'
 import { useBranding } from '@/context/BrandingContext'
+import { sha512hex } from '@/utils/crypto'
 import LanguageSwitcher from './LanguageSwitcher'
 
 const { Text } = Typography
@@ -27,8 +29,10 @@ const NAV_ITEMS = [
   { key: '/dashboard', icon: <DashboardOutlined />, label: 'Dashboard' },
   { key: '/map', icon: <GlobalOutlined />, label: 'Map' },
   { key: '/terrain', icon: <CompassOutlined />, label: '3D Terrain' },
+  { key: '/drone', icon: <CloudServerOutlined />, label: 'Drone Survey' },
   { key: '/projects', icon: <FolderOutlined />, label: 'Projects' },
   { key: '/documents', icon: <FileOutlined />, label: 'Documents' },
+  { key: '/basemaps', icon: <AppstoreOutlined />, label: 'Basemaps' },
   { key: '/access-requests', icon: <ShareAltOutlined />, label: 'Data Access' },
   { key: '/ai-chat', icon: <RobotOutlined />, label: 'AI Assistant' },
   { key: '/ai-vision', icon: <EyeOutlined />, label: 'AI Vision' },
@@ -37,11 +41,11 @@ const NAV_ITEMS = [
 const ADMIN_NAV_ITEMS = [
   { key: '/users', icon: <TeamOutlined />, label: 'Users' },
   { key: '/organisations', icon: <BankOutlined />, label: 'Organisations' },
-  { key: '/basemaps', icon: <AppstoreOutlined />, label: 'Basemaps' },
   { key: '/reports', icon: <BarChartOutlined />, label: 'Reports' },
   { key: '/audit', icon: <AuditOutlined />, label: 'Audit Logs' },
   { key: '/backups', icon: <SafetyOutlined />, label: 'Backups' },
   { key: '/qgis-sync', icon: <CheckCircleOutlined />, label: 'QGIS Sync' },
+  { key: '/verify', icon: <SafetyCertificateOutlined />, label: 'Verify Provenance' },
 ]
 
 const MASTER_NAV_ITEMS = [
@@ -176,7 +180,9 @@ export default function AppLayout() {
 
   async function handleChangePassword(values: { old_password: string; new_password: string }) {
     try {
-      await api.post('/accounts/users/change-my-password/', values)
+      const old_password_sha512 = await sha512hex(values.old_password)
+      const new_password_sha512 = await sha512hex(values.new_password)
+      await api.post('/accounts/users/change-my-password/', { old_password_sha512, new_password_sha512 })
       message.success('Password changed successfully')
       setPwdModalOpen(false)
       pwdForm.resetFields()

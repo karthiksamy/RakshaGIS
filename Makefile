@@ -6,6 +6,7 @@ DC_DEV  = docker compose -f docker-compose.yml -f docker-compose.dev.yml
 
 .PHONY: help \
         run migrate migrations shell superuser worker collectstatic install check \
+        dev dev-stop \
         dc-up dc-dev dc-down dc-build dc-logs dc-shell dc-migrate dc-superuser dc-restart
 
 ## ── Local dev without Docker ────────────────────────────────────────
@@ -60,6 +61,13 @@ dc-superuser:  ## Create superuser inside running web container
 
 dc-shell:      ## Django shell inside running web container
 	$(DC) exec web python manage.py shell
+
+## ── Hot-reload development (recommended) ────────────────────────────
+dev:           ## Start hot-reload dev (backend Docker + Vite HMR at :5173)
+	@bash dev.sh
+
+dev-stop:      ## Stop the Docker dev backend
+	@bash dev.sh stop
 
 ## ── Docker — development ────────────────────────────────────────────
 dc-dev:        ## Start dev stack (live reload, no Nginx)

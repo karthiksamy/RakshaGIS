@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 
 from django.contrib.auth.models import AbstractUser
@@ -143,12 +144,21 @@ class User(AbstractUser):
     employee_id = models.CharField(max_length=20, unique=True, null=True, blank=True)
     phone = models.CharField(max_length=15, blank=True)
     designation = models.CharField(max_length=100, blank=True)
+    sha512_password = models.CharField(max_length=128, blank=True, default='',
+        help_text='SHA-512 hex digest of the raw password; used for challenge-response login')
 
     class Meta:
         db_table = 'accounts_user'
         indexes = [
             models.Index(fields=['organisation', 'role']),
         ]
+
+    def set_password(self, raw_password):
+        if raw_password is not None:
+            self.sha512_password = hashlib.sha512(raw_password.encode('utf-8')).hexdigest()
+        else:
+            self.sha512_password = ''
+        super().set_password(raw_password)
 
     def __str__(self):
         return f"{self.get_full_name() or self.username} ({self.get_role_display()})"

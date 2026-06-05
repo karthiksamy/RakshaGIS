@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -396,6 +396,113 @@ export default function ProjectDetailPage() {
   const [areaRemarks, setAreaRemarks] = useState('')
   const [disputeModal, setDisputeModal] = useState<{ area: SurveyArea; action: string; disputes: DisputeRow[] } | null>(null)
   const [expandedAreaId, setExpandedAreaId] = useState<number | null>(null)
+
+  // ── Async export state ────────────────────────────────────────────────────
+  type ExportJob = {
+    task_uuid: string
+    label: string       // human-readable "Area name" or "Project number"
+    status: 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED'
+    progress_msg: string
+    file_size: number | null
+    error: string | null
+  }
+  const [exportJobs, setExportJobs] = useState<ExportJob[]>([])
+  const [exportModalOpen, setExportModalOpen] = useState(false)
+  const exportPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  function _stopPoll() {
+    if (exportPollRef.current) { clearInterval(exportPollRef.current); exportPollRef.current = null }
+  }
+
+  async function _pollJobs(jobs: ExportJob[]) {
+    const pending = jobs.filter(j => j.status === 'PENDING' || j.status === 'RUNNING')
+    if (pending.length === 0) { _stopPoll(); return }
+    const updated = await Promise.all(jobs.map(async (job) => {
+      if (job.status !== 'PENDING' && job.status !== 'RUNNING') return job
+      try {
+        const r = await api.get(`/core/export/status/${job.task_uuid}/`)
+        return { ...job, ...r.data } as ExportJob
+      } catch { return job }
+    }))
+    setExportJobs(updated)
+    if (updated.every(j => j.status === 'DONE' || j.status === 'FAILED')) _stopPoll()
+  }
+
+  function _startPolling(jobs: ExportJob[]) {
+    _stopPoll()
+    exportPollRef.current = setInterval(() => {
+      setExportJobs(cur => { _pollJobs(cur); return cur })
+    }, 2500)
+  }
+
+  async function startAreaExport(area: SurveyArea) {
+    try {
+      const r = await api.post(`/projects/survey-areas/${area.id}/export/`)
+      const job: ExportJob = {
+        task_uuid: r.data.task_uuid,
+        label: area.name,
+        status: 'PENDING',
+        progress_msg: 'Queued…',
+        file_size: null,
+        error: null,
+      }
+      setExportJobs(cur => {
+        const next = [job, ...cur]
+        _startPolling(next)
+        return next
+      })
+      setExportModalOpen(true)
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail || e?.response?.data?.error || 'Failed to start export'
+      message.error(detail)
+    }
+  }
+
+  async function startProjectExport() {
+    try {
+      const r = await api.post(`/projects/${pid}/export-full/`)
+      const job: ExportJob = {
+        task_uuid: r.data.task_uuid,
+        label: project?.project_number || `Project ${pid}`,
+        status: 'PENDING',
+        progress_msg: 'Queued…',
+        file_size: null,
+        error: null,
+      }
+      setExportJobs(cur => {
+        const next = [job, ...cur]
+        _startPolling(next)
+        return next
+      })
+      setExportModalOpen(true)
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail || e?.response?.data?.error || 'Failed to start export'
+      message.error(detail)
+    }
+  }
+
+  async function downloadExport(job: ExportJob) {
+    try {
+      const resp = await api.get(`/core/export/download/${job.task_uuid}/`, { responseType: 'blob' })
+      const safe = job.label.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60)
+      const url = URL.createObjectURL(new Blob([resp.data], { type: 'application/zip' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${safe}_export.zip`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch {
+      message.error('Download failed — the export file may have expired.')
+    }
+  }
+
+  function fmtFileSize(bytes: number | null) {
+    if (!bytes) return ''
+    if (bytes < 1024 * 1024) return ` (${(bytes / 1024).toFixed(0)} KB)`
+    return ` (${(bytes / 1024 / 1024).toFixed(1)} MB)`
+  }
 
   const pid = Number(id)
 
@@ -1044,24 +1151,40 @@ export default function ProjectDetailPage() {
               ),
               children: (
                 <Space direction="vertical" style={{ width: '100%' }}>
-                  {canForward && (
-                    <Space size={8} wrap>
-                      <Button
-                        type="primary" icon={<PlusOutlined />} size="small"
-                        onClick={() => { areaForm.resetFields(); setAreaModal('create') }}
-                      >
-                        Add Survey Area
+                  <Space size={8} wrap>
+                    {canForward && (
+                      <>
+                        <Button
+                          type="primary" icon={<PlusOutlined />} size="small"
+                          onClick={() => { areaForm.resetFields(); setAreaModal('create') }}
+                        >
+                          Add Survey Area
+                        </Button>
+                        <Button
+                          icon={<FileAddOutlined />} size="small"
+                          style={{ borderColor: '#4fc3f7', color: '#4fc3f7' }}
+                          onClick={() => setNewLayerModal(true)}
+                          title="Create a new shapefile layer and start drawing immediately"
+                        >
+                          New Shapefile Layer
+                        </Button>
+                      </>
+                    )}
+                    <Button
+                      icon={<DownloadOutlined />} size="small"
+                      style={{ borderColor: '#95de64', color: '#95de64' }}
+                      onClick={startProjectExport}
+                      title="Export all survey areas, GIS data, documents and rasters as a watermarked ZIP"
+                    >
+                      Export Full Project
+                    </Button>
+                    {exportJobs.length > 0 && (
+                      <Button size="small" type="text" onClick={() => setExportModalOpen(true)}
+                        style={{ color: '#faad14' }}>
+                        Exports ({exportJobs.filter(j => j.status === 'PENDING' || j.status === 'RUNNING').length} active)
                       </Button>
-                      <Button
-                        icon={<FileAddOutlined />} size="small"
-                        style={{ borderColor: '#4fc3f7', color: '#4fc3f7' }}
-                        onClick={() => setNewLayerModal(true)}
-                        title="Create a new shapefile layer and start drawing immediately"
-                      >
-                        New Shapefile Layer
-                      </Button>
-                    </Space>
-                  )}
+                    )}
+                  </Space>
                   {surveyAreas.length === 0 && (
                     <Alert
                       type="info"
@@ -1172,6 +1295,13 @@ export default function ProjectDetailPage() {
                                   setSelectedProjectId(pid)
                                   navigate(`/map?area=${area.id}`)
                                 }}
+                              />
+                            </Tooltip>
+                            <Tooltip title="Export all data for this area (shapefiles, documents, rasters) as a watermarked ZIP">
+                              <Button
+                                size="small" type="text" icon={<DownloadOutlined />}
+                                style={{ color: '#95de64' }}
+                                onClick={() => startAreaExport(area)}
                               />
                             </Tooltip>
                             <Button
@@ -2231,9 +2361,89 @@ export default function ProjectDetailPage() {
       </Modal>
 
       {/* ── OnlyOffice Viewer ──────────────────────────────────── */}
-      {(() => {
-        return null
-      })()}
+      {(() => { return null })()}
+
+      {/* ── Export Progress Modal ──────────────────────────────── */}
+      <Modal
+        open={exportModalOpen}
+        title={<Space><DownloadOutlined /><span>Data Export Jobs</span></Space>}
+        onCancel={() => setExportModalOpen(false)}
+        footer={[
+          <Button key="close" onClick={() => setExportModalOpen(false)}>Close</Button>,
+        ]}
+        width={560}
+      >
+        {exportJobs.length === 0 ? (
+          <Alert type="info" message="No active or completed exports." showIcon />
+        ) : (
+          <Space direction="vertical" style={{ width: '100%' }} size={12}>
+            {exportJobs.map((job) => (
+              <Card key={job.task_uuid} size="small"
+                style={{
+                  borderLeft: `3px solid ${
+                    job.status === 'DONE' ? '#52c41a'
+                    : job.status === 'FAILED' ? '#ff4d4f'
+                    : '#1890ff'
+                  }`
+                }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, fontSize: 13 }}>{job.label}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}>
+                      {job.status === 'DONE'
+                        ? `Ready${fmtFileSize(job.file_size)}`
+                        : job.status === 'FAILED'
+                        ? `Failed: ${job.error || 'Unknown error'}`
+                        : job.progress_msg || 'Working…'}
+                    </div>
+                  </div>
+                  <Tag color={
+                    job.status === 'DONE' ? 'success'
+                    : job.status === 'FAILED' ? 'error'
+                    : 'processing'
+                  }>
+                    {job.status}
+                  </Tag>
+                  {job.status === 'DONE' && (
+                    <Button
+                      size="small" type="primary" icon={<DownloadOutlined />}
+                      onClick={() => downloadExport(job)}
+                    >
+                      Download
+                    </Button>
+                  )}
+                </div>
+                {(job.status === 'PENDING' || job.status === 'RUNNING') && (
+                  <div style={{ marginTop: 8 }}>
+                    <div style={{
+                      height: 4, borderRadius: 2, background: 'var(--border-color)',
+                      overflow: 'hidden',
+                    }}>
+                      <div style={{
+                        height: '100%', background: '#1890ff', borderRadius: 2,
+                        width: '40%',
+                        animation: 'raksha-progress 1.5s ease-in-out infinite',
+                      }} />
+                    </div>
+                  </div>
+                )}
+              </Card>
+            ))}
+            <div style={{ fontSize: 11, color: '#888' }}>
+              Exports include all GIS features (shapefiles), documents, rasters, and
+              uploaded shapefile ZIPs — each file carries a C2PA or LP-DNA watermark.
+              Downloads expire 2 hours after completion.
+            </div>
+          </Space>
+        )}
+        <style>{`
+          @keyframes raksha-progress {
+            0%   { transform: translateX(-100%); }
+            50%  { transform: translateX(150%); }
+            100% { transform: translateX(400%); }
+          }
+        `}</style>
+      </Modal>
     </div>
   )
 }

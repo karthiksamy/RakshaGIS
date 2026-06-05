@@ -150,6 +150,132 @@ def detect_zip_watermark(file_bytes: bytes) -> str:
         pass
     return None
 
+# ── OOXML (DOCX/XLSX/PPTX) custom-properties provenance ──────────────────────
+# OnlyOffice strips unknown ZIP entries (like .raksha-wmark) when it re-exports a
+# document. Custom Properties (docProps/custom.xml) are part of the OOXML spec and
+# ARE preserved through OnlyOffice edit → save → download cycles.
+
+_PROPS_NS  = 'http://schemas.openxmlformats.org/officeDocument/2006/custom-properties'
+_VT_NS     = 'http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'
+_PROPS_CT  = 'application/vnd.openxmlformats-officedocument.custom-properties+xml'
+_PROPS_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties'
+_FMTID     = '{D5CDD505-2E9C-101B-9397-08002B2CF9AE}'
+_PROP_NAME = 'RakshaGIS_Provenance'
+
+
+def _make_custom_props_xml(token: str) -> bytes:
+    return (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Properties xmlns="{_PROPS_NS}" xmlns:vt="{_VT_NS}">'
+        f'<property fmtid="{_FMTID}" pid="2" name="{_PROP_NAME}">'
+        f'<vt:lpwstr>{token}</vt:lpwstr>'
+        f'</property></Properties>'
+    ).encode('utf-8')
+
+
+def embed_ooxml_provenance(file_bytes: bytes, token: str) -> bytes:
+    """
+    Embed provenance token in OOXML custom properties (docProps/custom.xml).
+
+    This survives OnlyOffice edit/save/download cycles because custom properties
+    are a recognised OOXML part that OnlyOffice reads and re-emits intact.
+    Also writes the legacy .raksha-wmark entry for backward compatibility.
+    """
+    buf = io.BytesIO(file_bytes)
+    new_buf = io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf, 'r') as r_zip:
+            names = set(r_zip.namelist())
+
+            # ── Build updated docProps/custom.xml ────────────────────────────
+            if 'docProps/custom.xml' in names:
+                try:
+                    tree = ET.fromstring(r_zip.read('docProps/custom.xml'))
+                    # Remove any existing RakshaGIS_Provenance property
+                    for prop in tree.findall(f'{{{_PROPS_NS}}}property'):
+                        if prop.get('name') == _PROP_NAME:
+                            tree.remove(prop)
+                    max_pid = max(
+                        (int(p.get('pid', 2)) for p in tree.findall(f'{{{_PROPS_NS}}}property')),
+                        default=1,
+                    )
+                    prop_el = ET.SubElement(tree, f'{{{_PROPS_NS}}}property')
+                    prop_el.set('fmtid', _FMTID)
+                    prop_el.set('pid', str(max_pid + 1))
+                    prop_el.set('name', _PROP_NAME)
+                    ET.SubElement(prop_el, f'{{{_VT_NS}}}lpwstr').text = token
+                    inner = ET.tostring(tree, encoding='unicode')
+                    custom_xml_bytes = (
+                        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                        + inner
+                    ).encode('utf-8')
+                except Exception:
+                    custom_xml_bytes = _make_custom_props_xml(token)
+            else:
+                custom_xml_bytes = _make_custom_props_xml(token)
+
+            # ── Ensure [Content_Types].xml references custom.xml ─────────────
+            ct_bytes = r_zip.read('[Content_Types].xml')
+            ct_str = ct_bytes.decode('utf-8')
+            if _PROPS_CT not in ct_str:
+                override = f'<Override PartName="/docProps/custom.xml" ContentType="{_PROPS_CT}"/>'
+                ct_str = ct_str.replace('</Types>', override + '</Types>')
+                ct_bytes = ct_str.encode('utf-8')
+
+            # ── Ensure _rels/.rels has the custom-properties relationship ─────
+            rels_bytes = r_zip.read('_rels/.rels')
+            rels_str = rels_bytes.decode('utf-8')
+            if _PROPS_REL not in rels_str:
+                existing_ids = re.findall(r'Id="(rId\d+)"', rels_str)
+                max_id = max((int(i[3:]) for i in existing_ids if i.startswith('rId')), default=0)
+                rel_tag = (
+                    f'<Relationship Id="rId{max_id + 1}" Type="{_PROPS_REL}"'
+                    f' Target="docProps/custom.xml"/>'
+                )
+                rels_str = rels_str.replace('</Relationships>', rel_tag + '</Relationships>')
+                rels_bytes = rels_str.encode('utf-8')
+
+            # ── Rebuild ZIP ───────────────────────────────────────────────────
+            skip = {'docProps/custom.xml', '[Content_Types].xml', '_rels/.rels', '.raksha-wmark'}
+            with zipfile.ZipFile(new_buf, 'w', zipfile.ZIP_DEFLATED) as w_zip:
+                for item in r_zip.infolist():
+                    if item.filename not in skip:
+                        w_zip.writestr(item, r_zip.read(item.filename))
+                w_zip.writestr('docProps/custom.xml', custom_xml_bytes)
+                w_zip.writestr('[Content_Types].xml', ct_bytes)
+                w_zip.writestr('_rels/.rels', rels_bytes)
+                w_zip.writestr('.raksha-wmark', token.encode('utf-8'))  # legacy fallback
+
+        return new_buf.getvalue()
+    except Exception:
+        raise  # let the caller's try/except handle the fallback to embed_zip_watermark
+
+
+def detect_ooxml_provenance(file_bytes: bytes) -> str | None:
+    """
+    Extract provenance token from OOXML custom properties.
+    Checks docProps/custom.xml first (survives OnlyOffice), then .raksha-wmark (legacy).
+    """
+    try:
+        buf = io.BytesIO(file_bytes)
+        with zipfile.ZipFile(buf, 'r') as zf:
+            names = zf.namelist()
+            if 'docProps/custom.xml' in names:
+                try:
+                    tree = ET.fromstring(zf.read('docProps/custom.xml'))
+                    for prop in tree.findall(f'{{{_PROPS_NS}}}property'):
+                        if prop.get('name') == _PROP_NAME:
+                            val = prop.find(f'{{{_VT_NS}}}lpwstr')
+                            if val is not None and val.text:
+                                return val.text.strip()
+                except Exception:
+                    pass
+            if '.raksha-wmark' in names:
+                return zf.read('.raksha-wmark').decode('utf-8').strip()
+    except Exception:
+        pass
+    return None
+
 def embed_tail_comment_watermark(file_bytes: bytes, token: str) -> bytes:
     """Embed watermark token as a safe comment appended to the end of a file (PDF, TIFF)."""
     # Ensure there's a trailing newline, then append comment
@@ -487,8 +613,20 @@ def embed_watermark(file_bytes: bytes, filename: str, mime_type: str = None, met
     except Exception:
         watermarked_bytes = None
 
-    # 1. ZIP-based (Office Docs, Shapefiles)
-    if name.endswith(('.docx', '.xlsx', '.pptx', '.zip')) or (mime_type and 'zip' in mime_type):
+    # 1. OOXML Office Docs — embed in docProps/custom.xml so OnlyOffice preserves it
+    if name.endswith(('.docx', '.xlsx', '.pptx')):
+        try:
+            watermarked_bytes = embed_ooxml_provenance(file_bytes, token)
+        except Exception:
+            pass
+        if watermarked_bytes is None:
+            try:
+                watermarked_bytes = embed_zip_watermark(file_bytes, token)
+            except Exception:
+                pass
+
+    # 1b. Other ZIP-based formats (plain .zip, Shapefiles)
+    if watermarked_bytes is None and (name.endswith('.zip') or (mime_type and 'zip' in mime_type)):
         try:
             watermarked_bytes = embed_zip_watermark(file_bytes, token)
         except Exception:
@@ -564,6 +702,7 @@ def detect_watermark(file_bytes: bytes, filename: str = None, mime_type: str = N
     cipher = get_fernet_cipher()
     name = (filename or "").lower()
     
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
     token = None
     clpw_info = None
 
@@ -597,6 +736,11 @@ def detect_watermark(file_bytes: bytes, filename: str = None, mime_type: str = N
                         }
             except Exception:
                 pass
+        
+        c2pa_registry_hash_matched = False
+        if c2pa_registry_record and c2pa_registry_record.get("file_hash") == file_hash:
+            c2pa_registry_hash_matched = True
+
         meta = dict(raksha)
         meta.setdefault("source", "RakshaGIS/DEMAP")
         return {
@@ -608,12 +752,26 @@ def detect_watermark(file_bytes: bytes, filename: str = None, mime_type: str = N
                      ("validation_state", "title", "claim_generator", "active_manifest")},
             "registry_verified": c2pa_registry_verified,
             "registry_record": c2pa_registry_record,
+            "registry_hash_matched": c2pa_registry_hash_matched,
         }
 
     # Try all structural detectors based on file name or magic matching
 
-    # 1. ZIP files
-    if name.endswith(('.docx', '.xlsx', '.pptx', '.zip')) or (mime_type and 'zip' in mime_type):
+    _ooxml_mimes = {
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    }
+    _is_ooxml = name.endswith(('.docx', '.xlsx', '.pptx')) or (
+        mime_type and mime_type.split(';')[0].strip().lower() in _ooxml_mimes
+    )
+
+    # 1. OOXML Office Docs — check custom.xml first (survives OnlyOffice), then .raksha-wmark
+    if _is_ooxml:
+        token = detect_ooxml_provenance(file_bytes)
+
+    # 1b. Other ZIP-based formats (plain .zip, Shapefiles)
+    if not token and (name.endswith('.zip') or (mime_type and 'zip' in mime_type and not _is_ooxml)):
         token = detect_zip_watermark(file_bytes)
         
     # 2. Images (PNG, JPEG)
@@ -667,6 +825,7 @@ def detect_watermark(file_bytes: bytes, filename: str = None, mime_type: str = N
     # Central Trust Registry Lookup
     registry_verified = False
     registry_record = None
+    registry_hash_matched = False
     
     dna_hash = decrypted_metadata.get("dna_hash")
     if dna_hash:
@@ -686,6 +845,8 @@ def detect_watermark(file_bytes: bytes, filename: str = None, mime_type: str = N
                         "generated_at": rec.generated_at.isoformat(),
                         "file_hash": rec.file_hash,
                     }
+                    if rec.file_hash and rec.file_hash == file_hash:
+                        registry_hash_matched = True
         except Exception:
             pass
             
@@ -698,12 +859,12 @@ def detect_watermark(file_bytes: bytes, filename: str = None, mime_type: str = N
             "verification_method": "structural_cryptographic_signature",
             "registry_verified": registry_verified,
             "registry_record": registry_record,
+            "registry_hash_matched": registry_hash_matched,
             "clpw": clpw_info
         }
         
     # Check if CLPW matched (even if metadata token was stripped/absent)
     if clpw_info and clpw_info.get("matched"):
-        file_hash = hashlib.sha256(file_bytes).hexdigest()
         try:
             from django.apps import apps
             if apps.ready:
@@ -743,6 +904,7 @@ def detect_watermark(file_bytes: bytes, filename: str = None, mime_type: str = N
             "verification_method": "coordinate_lsb_perturbation",
             "registry_verified": registry_verified,
             "registry_record": registry_record,
+            "registry_hash_matched": True if registry_record else False,
             "clpw": clpw_info
         }
         
@@ -752,7 +914,8 @@ def detect_watermark(file_bytes: bytes, filename: str = None, mime_type: str = N
         "metadata": {},
         "verification_method": "none",
         "registry_verified": False,
-        "registry_record": None
+        "registry_record": None,
+        "registry_hash_matched": False
     }
 
 # ── Standalone CLI Interface ─────────────────────────────────────────────────

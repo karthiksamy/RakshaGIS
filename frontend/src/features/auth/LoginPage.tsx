@@ -14,6 +14,7 @@ import api from '@/services/api'
 import { useBranding } from '@/context/BrandingContext'
 import { useTranslation } from 'react-i18next'
 import LanguageSwitcher from '@/components/LanguageSwitcher'
+import { sha512hex } from '@/utils/crypto'
 import type { User } from '@/types'
 
 interface LoginForm {
@@ -64,7 +65,31 @@ export default function LoginPage() {
 
   const mutation = useMutation({
     mutationFn: async (values: LoginForm) => {
-      const { data } = await axios.post('/api/accounts/auth/login/', values)
+      // Step 1: fetch one-time nonce
+      const { data: challenge } = await axios.get('/api/accounts/auth/challenge/')
+
+      // Step 2: hash — SHA-512(SHA-512(password) + nonce)
+      const passHash = await sha512hex(values.password)
+      const loginHash = await sha512hex(passHash + challenge.nonce)
+
+      // Step 3: try hashed login
+      let { data } = await axios.post('/api/accounts/auth/login/', {
+        username: values.username,
+        password_hash: loginHash,
+        nonce_id: challenge.nonce_id,
+      })
+
+      // Step 4: one-time transition for accounts not yet migrated
+      // Server did NOT consume the nonce, so we can reuse the same nonce_id
+      if (data.needs_migration) {
+        const resp = await axios.post('/api/accounts/auth/login/', {
+          username: values.username,
+          password_raw: values.password,
+          nonce_id: challenge.nonce_id,
+        })
+        data = resp.data
+      }
+
       if (data.requires_2fa) {
         setPreAuthKey(data.pre_auth_key)
         setStep('2fa')

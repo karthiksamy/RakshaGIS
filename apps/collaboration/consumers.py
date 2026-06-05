@@ -8,22 +8,25 @@ other's feature edits, deletions, and presence events in real time.
 Connection URL:  ws[s]://<host>/ws/project/<project_id>/?token=<jwt_access_token>
 
 Message types (client → server):
-  feature_created  — { type, feature: {id, geometry, layer_name, attributes, ...} }
-  feature_updated  — { type, feature_id, geometry, attributes }
-  feature_deleted  — { type, feature_id }
-  feature_lock     — { type, feature_id }    acquire edit lock
-  feature_unlock   — { type, feature_id }    release edit lock
-  cursor           — { type, lng, lat }       live cursor (optional)
+  feature_created   — { type, feature: {id, geometry, layer_name, attributes, ...} }
+  feature_updated   — { type, feature_id, geometry, attributes }
+  feature_deleted   — { type, feature_id }
+  feature_lock      — { type, feature_id }     acquire edit lock
+  feature_unlock    — { type, feature_id }     release edit lock
+  activity_update   — { type, activity, tool_key, project_id, survey_area_id, survey_area_name }
+  cursor            — { type, lng, lat }        live cursor (optional)
 
 Message types (server → client):
-  presence         — { type, event: joined|left, user: {id,name,color} }
-  feature_created  — { type, feature, sender_id }
-  feature_updated  — { type, feature_id, geometry, attributes, sender_id }
-  feature_deleted  — { type, feature_id, sender_id }
-  feature_locked   — { type, feature_id, user }
-  feature_unlocked — { type, feature_id, sender_id }
-  cursor           — { type, user_id, lng, lat }
-  error            — { type, detail }
+  presence          — { type, event: joined|left, user: {id,name,color,activity} }
+  presence_activity — { type, user_id, activity }   live status update
+  room_state        — { type, users, locked_features }
+  feature_created   — { type, feature, sender_id }
+  feature_updated   — { type, feature_id, geometry, attributes, sender_id }
+  feature_deleted   — { type, feature_id, sender_id }
+  feature_locked    — { type, feature_id, user }
+  feature_unlocked  — { type, feature_id, sender_id }
+  cursor            — { type, user_id, lng, lat }
+  error             — { type, detail }
 """
 
 import json
@@ -72,7 +75,8 @@ class ProjectRoomConsumer(AsyncWebsocketConsumer):
             await self.close(code=4003)
             return
 
-        # Register presence
+        # Register presence (activity starts as 'Viewing')
+        self.user_info['activity'] = 'Viewing'
         _PRESENCE.setdefault(self.room_group, {})[self.channel_name] = self.user_info
         _LOCKS.setdefault(self.room_group, {})
 
@@ -140,12 +144,22 @@ class ProjectRoomConsumer(AsyncWebsocketConsumer):
         msg_type = data.get('type', '')
 
         if msg_type == 'feature_created':
+            feature = data.get('feature', {})
             await self.channel_layer.group_send(self.room_group, {
                 'type': 'collab.feature_created',
-                'feature': data.get('feature', {}),
+                'feature': feature,
                 'sender_id': self.user.id,
                 'sender': self.channel_name,
             })
+            await self._log_activity(
+                action='CREATE_FEATURE',
+                activity_label='Created Feature',
+                project_id=self.project_id,
+                survey_area_id=data.get('survey_area_id'),
+                feature_id=feature.get('id'),
+                layer_name=feature.get('layer_name', ''),
+                detail={'geometry_type': feature.get('geometry_type', '')},
+            )
 
         elif msg_type == 'feature_updated':
             await self.channel_layer.group_send(self.room_group, {
@@ -156,6 +170,14 @@ class ProjectRoomConsumer(AsyncWebsocketConsumer):
                 'sender_id': self.user.id,
                 'sender': self.channel_name,
             })
+            await self._log_activity(
+                action='EDIT_FEATURE',
+                activity_label='Edited Feature',
+                project_id=self.project_id,
+                survey_area_id=data.get('survey_area_id'),
+                feature_id=data.get('feature_id'),
+                layer_name=data.get('layer_name', ''),
+            )
 
         elif msg_type == 'feature_deleted':
             await self.channel_layer.group_send(self.room_group, {
@@ -164,6 +186,13 @@ class ProjectRoomConsumer(AsyncWebsocketConsumer):
                 'sender_id': self.user.id,
                 'sender': self.channel_name,
             })
+            await self._log_activity(
+                action='DELETE_FEATURE',
+                activity_label='Deleted Feature',
+                project_id=self.project_id,
+                survey_area_id=data.get('survey_area_id'),
+                feature_id=data.get('feature_id'),
+            )
 
         elif msg_type == 'feature_lock':
             feature_id = str(data.get('feature_id', ''))
@@ -199,6 +228,29 @@ class ProjectRoomConsumer(AsyncWebsocketConsumer):
                     'sender': self.channel_name,
                 })
 
+        elif msg_type == 'activity_update':
+            activity = (data.get('activity') or 'Viewing')[:100]
+            # Update in-memory presence
+            room_presence = _PRESENCE.get(self.room_group, {})
+            if self.channel_name in room_presence:
+                room_presence[self.channel_name]['activity'] = activity
+            # Broadcast to everyone in the room (including sender — they need to see own updates)
+            await self.channel_layer.group_send(self.room_group, {
+                'type': 'collab.presence_activity',
+                'user_id': self.user.id,
+                'activity': activity,
+            })
+            # Log significant tool changes to the DB audit trail
+            tool_key = data.get('tool_key', '')
+            if tool_key and tool_key not in ('pan', 'identify', 'coord_picker'):
+                await self._log_activity(
+                    action='TOOL_CHANGE',
+                    activity_label=activity,
+                    project_id=data.get('project_id'),
+                    survey_area_id=data.get('survey_area_id'),
+                    detail={'tool_key': tool_key},
+                )
+
         elif msg_type == 'cursor':
             await self.channel_layer.group_send(self.room_group, {
                 'type': 'collab.cursor',
@@ -218,6 +270,14 @@ class ProjectRoomConsumer(AsyncWebsocketConsumer):
             'type': 'presence',
             'event': event['event'],
             'user': event['user'],
+        }))
+
+    async def collab_presence_activity(self, event):
+        """Broadcast a user's current activity label to every client in the room."""
+        await self.send(json.dumps({
+            'type': 'presence_activity',
+            'user_id': event['user_id'],
+            'activity': event['activity'],
         }))
 
     async def collab_feature_created(self, event):
@@ -278,6 +338,37 @@ class ProjectRoomConsumer(AsyncWebsocketConsumer):
 
     async def send_error(self, detail: str):
         await self.send(json.dumps({'type': 'error', 'detail': detail}))
+
+    @database_sync_to_async
+    def _log_activity(
+        self, *, action: str, activity_label: str = '',
+        project_id=None, survey_area_id=None,
+        feature_id=None, layer_name: str = '', detail: dict | None = None,
+    ):
+        from apps.workflow.models import MapActivityLog
+        from apps.survey_projects.models import SurveyProject, SurveyArea
+        project = None
+        survey_area = None
+        if project_id:
+            try:
+                project = SurveyProject.objects.get(id=project_id)
+            except SurveyProject.DoesNotExist:
+                pass
+        if survey_area_id:
+            try:
+                survey_area = SurveyArea.objects.get(id=survey_area_id)
+            except SurveyArea.DoesNotExist:
+                pass
+        MapActivityLog.objects.create(
+            user=self.user,
+            project=project,
+            survey_area=survey_area,
+            action=action,
+            activity_label=activity_label,
+            feature_id=feature_id,
+            layer_name=layer_name or '',
+            detail=detail or {},
+        )
 
     @database_sync_to_async
     def _check_project_access(self) -> bool:

@@ -27,6 +27,12 @@ interface ExternalLayer {
   description: string
   level_filter_fields: Record<string, string>
   office_filter_field: string
+  // Style / viewport fields — present in the API response; forwarded to MapPage's showExtLayer
+  classification_field?: string
+  classification_colors?: Record<string, { color: string; opacity?: number }>
+  style?: Record<string, unknown>
+  min_zoom?: number
+  bbox?: number[] | null
 }
 
 interface SurveyAreaOption {
@@ -50,11 +56,11 @@ interface Props {
   open: boolean
   onClose: () => void
   visibleIds: Set<number>
-  onToggleVisible: (id: number, geojson: Record<string, unknown>) => void
+  onToggleVisible: (id: number, geojson: Record<string, unknown>, name: string) => void
   onHide: (id: number) => void
   // External layer callbacks — IDs prefixed with 'ext:' to avoid collision
   extVisibleIds?: Set<string>
-  onToggleExtVisible?: (extId: string, geojson: Record<string, unknown>) => void
+  onToggleExtVisible?: (extId: string, layer: ExternalLayer) => void
   onHideExt?: (extId: string) => void
 }
 
@@ -193,30 +199,23 @@ export default function TempLayersPanel({
                       .then(r => r.data.results ?? r.data),
     enabled: open,
   })
-  const [loadingExtId, setLoadingExtId] = useState<number | null>(null)
 
-  async function toggleExtLayer(layer: ExternalLayer) {
+  function toggleExtLayer(layer: ExternalLayer) {
     const key = `ext:${layer.id}`
     if (extVisibleIds.has(key)) {
       onHideExt?.(key)
       return
     }
-    setLoadingExtId(layer.id)
-    try {
-      const r = await api.get(`/external/layers/${layer.id}/geojson/`, { params: { limit: 5000 } })
-      const fc = r.data
-      const count = fc?.features?.length ?? 0
-      if (count === 0) {
-        message.warning(t('external.layer_empty', { name: layer.display_name }))
-      } else {
-        message.success(t('external.layer_loaded', { name: layer.display_name, count }))
-      }
-      onToggleExtVisible?.(key, fc)
-    } catch (err: any) {
-      message.error(err?.response?.data?.detail || `Failed to load "${layer.display_name}"`)
-    } finally {
-      setLoadingExtId(null)
+    // Pass the layer config to MapPage's showExtLayer, which handles GeoJSON fetching
+    // and viewport management itself — identical to how ExternalLayersPanel works.
+    // feature_count comes from the already-loaded layer list (no extra API round-trip).
+    const count = layer.feature_count ?? 0
+    if (count === 0) {
+      message.warning(t('external.layer_empty', { name: layer.display_name }))
+    } else {
+      message.success(t('external.layer_loaded', { name: layer.display_name, count }))
     }
+    onToggleExtVisible?.(key, layer)
   }
 
   const deleteMut = useMutation({
@@ -259,7 +258,7 @@ export default function TempLayersPanel({
       fileRef.current = null
 
       if (layer.geojson) {
-        onToggleVisible(layer.id, layer.geojson as Record<string, unknown>)
+        onToggleVisible(layer.id, layer.geojson as Record<string, unknown>, layer.name)
       }
 
       // Open analysis modal with pre-filled targets — user selects ranges and clicks Run
@@ -435,10 +434,10 @@ export default function TempLayersPanel({
                 onClick={() => {
                   if (visible) { onHide(row.id) }
                   else if ((row as any).geojson) {
-                    onToggleVisible(row.id, (row as any).geojson)
+                    onToggleVisible(row.id, (row as any).geojson, row.name)
                   } else {
                     api.get(`/projects/temp-layers/${row.id}/`).then(r => {
-                      if (r.data.geojson) onToggleVisible(row.id, r.data.geojson)
+                      if (r.data.geojson) onToggleVisible(row.id, r.data.geojson, row.name)
                       else message.warning('No geometry data found')
                     })
                   }
@@ -553,7 +552,7 @@ export default function TempLayersPanel({
                               <Button
                                 size="small" type="text"
                                 icon={visible ? <EyeInvisibleOutlined /> : <EyeOutlined />}
-                                loading={loadingExtId === row.id}
+
                                 style={{ color: visible ? '#1890ff' : '#888' }}
                                 onClick={() => toggleExtLayer(row)}
                               />

@@ -34,6 +34,7 @@
          ORDER BY id) AS state_boundaries
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="srid">4326</Parameter>
       <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>
@@ -55,6 +56,7 @@
          ORDER BY id) AS district_boundaries
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="srid">4326</Parameter>
       <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>
@@ -80,6 +82,7 @@
         (SELECT id, name, geometry FROM survey_projects_defenceparcel) AS defence_parcels
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="srid">4326</Parameter>
       <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>
@@ -100,6 +103,7 @@
          WHERE geometry_type = 'POLYGON' AND is_deleted = false) AS gis_polygons
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="srid">4326</Parameter>
       <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>
@@ -120,6 +124,7 @@
          WHERE geometry_type = 'LINE' AND is_deleted = false) AS gis_lines
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="srid">4326</Parameter>
       <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>
@@ -140,6 +145,7 @@
          WHERE geometry_type = 'POINT' AND is_deleted = false) AS gis_points
       </Parameter>
       <Parameter name="geometry_field">geometry</Parameter>
+      <Parameter name="srid">4326</Parameter>
       <Parameter name="extent">-180,-90,180,90</Parameter>
       <Parameter name="use_spatial_index">true</Parameter>
     </Datasource>

@@ -24,8 +24,13 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
   const { data } = useQuery<BrandingConfig>({
     queryKey: ['branding'],
     queryFn: () => axios.get('/api/core/branding/').then((r) => r.data),
-    staleTime: 5 * 60 * 1000,
-    retry: false,
+    // No staleTime — always refetch in the background so the login page
+    // picks up branding changes without a full page reload.
+    staleTime: 0,
+    gcTime: 0,          // don't keep stale branding in the cache
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
+    retry: 1,
   })
 
   // Reflect the configured application title in the browser tab.

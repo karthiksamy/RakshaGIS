@@ -9,11 +9,15 @@ from django.utils import timezone
 
 from apps.accounts.models import User
 from apps.accounts.permissions import org_queryset_filter
+import csv
+import io
+
 from apps.survey_projects.models import SurveyProject, SurveyArea
-from .models import WorkflowStep, AuditLog, Notification, DisputeReport
+from .models import WorkflowStep, AuditLog, Notification, DisputeReport, MapActivityLog
 from .serializers import (
     WorkflowStepSerializer, WorkflowTransitionSerializer,
     AuditLogSerializer, NotificationSerializer, DisputeReportSerializer,
+    MapActivityLogSerializer,
 )
 
 # (required_from_status, new_status, role_property)
@@ -493,3 +497,80 @@ class BulkTransitionView(APIView):
             'success_ids': success_ids,
             'errors': failed,
         })
+
+
+class MapActivityLogViewSet(viewsets.ModelViewSet):
+    """
+    Map activity audit log — records every user action on the map viewer.
+    GET  /workflow/map-activity/           — list (filterable)
+    POST /workflow/map-activity/           — create a log entry (frontend)
+    GET  /workflow/map-activity/export/    — CSV export for audit
+    """
+    serializer_class = MapActivityLogSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['action', 'project', 'survey_area', 'user']
+
+    def get_permissions(self):
+        if self.action == 'create':
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated()]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = MapActivityLog.objects.select_related(
+            'user__organisation', 'project', 'survey_area',
+        )
+        # SUPERADMIN sees all; everyone else sees their own org's logs
+        if user.role != User.SUPERADMIN:
+            org = getattr(user, 'organisation', None)
+            if org:
+                qs = qs.filter(user__organisation=org)
+            else:
+                qs = qs.filter(user=user)
+
+        # Date range filter
+        date_from = self.request.query_params.get('date_from')
+        date_to   = self.request.query_params.get('date_to')
+        if date_from:
+            qs = qs.filter(timestamp__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(timestamp__date__lte=date_to)
+
+        return qs
+
+    def perform_create(self, serializer):
+        ip = (
+            self.request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip()
+            or self.request.META.get('REMOTE_ADDR')
+        )
+        serializer.save(user=self.request.user, ip_address=ip or None)
+
+    @action(detail=False, methods=['get'], url_path='export')
+    def export(self, request):
+        """Download all matching logs as CSV for audit submission."""
+        qs = self.filter_queryset(self.get_queryset())
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            'Timestamp', 'User', 'Organisation', 'Action', 'Activity',
+            'Project', 'Survey Area', 'Feature ID', 'Layer', 'IP Address', 'Detail',
+        ])
+        for log in qs.iterator():
+            writer.writerow([
+                log.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                log.user.get_full_name() if log.user else '',
+                getattr(getattr(log.user, 'organisation', None), 'name', '') if log.user else '',
+                log.get_action_display(),
+                log.activity_label,
+                log.project.name if log.project else '',
+                log.survey_area.name if log.survey_area else '',
+                log.feature_id or '',
+                log.layer_name,
+                log.ip_address or '',
+                str(log.detail) if log.detail else '',
+            ])
+        buf.seek(0)
+        from django.http import HttpResponse
+        response = HttpResponse(buf.read(), content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="map_activity_audit.csv"'
+        return response

@@ -1,10 +1,29 @@
 #!/bin/bash
 # RakshaGIS build / setup script
 # Usage: ./build.sh [--data-dir /path] [--save-images] [--load-images /path]
+#
+# MULTI-PROJECT SAFETY
+#   This script is safe to run on a dedicated server that already hosts other
+#   Docker projects.  It:
+#     • uses project name "rakshagis" (COMPOSE_PROJECT_NAME) so all containers,
+#       networks, and volumes are namespaced and cannot collide with others
+#     • NEVER runs docker system prune, docker volume prune, or docker rmi on
+#       images it did not build
+#     • detects whether required images (postgres, redis, nginx, onlyoffice…)
+#       are already cached locally; if so, skips pulling — it does NOT use
+#       another project's running containers, it only reuses the cached image
+#     • detects port 80 conflicts and offers a configurable host port
+#     • filters all container existence checks by COMPOSE_PROJECT_NAME so a
+#       service named "db" in another project is never confused with ours
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_DATA_DIR="/RakshaGIS"
+
+# ── Project isolation ──────────────────────────────────────────────────────────
+# All Docker resources created by this project are prefixed "rakshagis_".
+# This prevents collisions with any other Docker Compose project on the host.
+export COMPOSE_PROJECT_NAME=rakshagis
 
 print_banner() {
   echo ""
@@ -28,6 +47,8 @@ usage() {
   echo "  --no-build          Skip Docker image build (use existing images)"
   echo "  --import-osm        Download India OSM data and import into local tile server"
   echo "                      Requires internet once. Import takes 2-4 hours."
+  echo "  --port PORT         Host port for the web UI nginx (default: 80)."
+  echo "                      Use when port 80 is already occupied by another project."
   echo "  -h, --help          Show this help"
   echo ""
 }
@@ -39,6 +60,7 @@ LOAD_IMAGES_DIR=""
 NO_BUILD=false
 FORCE_BUILD=false
 IMPORT_OSM=false
+HOST_PORT=""      # override for nginx host port (default 80)
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -58,6 +80,8 @@ while [[ $# -gt 0 ]]; do
       FORCE_BUILD=true; shift ;;
     --import-osm)
       IMPORT_OSM=true; shift ;;
+    --port)
+      HOST_PORT="$2"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -67,8 +91,82 @@ done
 
 print_banner
 
-# ── GPU detection ─────────────────────────────────────────────────────────────
 BOLD='\033[1m'; CYAN='\033[0;36m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; RESET='\033[0m'
+
+# ── Multi-project safety check ────────────────────────────────────────────────
+echo -e "${BOLD}>>> Environment check${RESET}"
+
+# Confirm Docker is available
+if ! command -v docker &>/dev/null; then
+  echo -e "  ${RED}✗ Docker not found. Please install Docker Engine first.${RESET}"
+  exit 1
+fi
+echo -e "  ${GREEN}✓ Docker found:${RESET} $(docker --version)"
+
+# List other running Compose projects so the operator can see the landscape
+OTHER_PROJECTS=$(docker ps --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+  | sort -u | grep -v "^$" | grep -v "^rakshagis$" || true)
+if [[ -n "$OTHER_PROJECTS" ]]; then
+  echo ""
+  echo -e "  ${YELLOW}Other Docker Compose projects currently running on this host:${RESET}"
+  while IFS= read -r proj; do
+    echo "    • $proj"
+  done <<< "$OTHER_PROJECTS"
+  echo ""
+  echo -e "  ${CYAN}RakshaGIS runs as project 'rakshagis' — fully isolated via${RESET}"
+  echo "  COMPOSE_PROJECT_NAME, separate networks (rakshagis_raksha-net /rakshagis_raksha-edge),"
+  echo "  and volume names prefixed rakshagis_. No other project's resources will"
+  echo "  be touched, removed, or restarted."
+else
+  echo -e "  ${GREEN}✓ No other Compose projects currently running.${RESET}"
+fi
+
+# ── Port conflict check ───────────────────────────────────────────────────────
+# If the operator did not pass --port, auto-detect whether port 80 is free.
+# If it is occupied by a different project, prompt for an alternative port.
+if [[ -z "$HOST_PORT" ]]; then
+  if ss -tlnp 2>/dev/null | grep -q ':80 ' || \
+     netstat -tlnp 2>/dev/null | grep -q ':80 '; then
+    # Port 80 in use — find out who by checking if it is our own nginx
+    NGINX_OWNER=$(docker ps --format '{{.Ports}}\t{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+      | grep "0.0.0.0:80->" | awk '{print $2}' | head -1)
+    if [[ "$NGINX_OWNER" == "rakshagis" ]]; then
+      HOST_PORT=80
+      echo -e "  ${GREEN}✓ Port 80 already held by RakshaGIS nginx — OK.${RESET}"
+    else
+      echo ""
+      echo -e "  ${YELLOW}⚠  Port 80 is already in use${RESET} (by: ${NGINX_OWNER:-unknown process})."
+      echo "  RakshaGIS nginx cannot bind to port 80 without displacing it."
+      echo "  Enter a different host port for the RakshaGIS web UI (e.g. 8080, 8090, 9080),"
+      echo "  or press Enter to use 8080:"
+      read -rp "  Host port [8080]: " PORT_CHOICE
+      HOST_PORT="${PORT_CHOICE:-8080}"
+      echo -e "  ${CYAN}✓ Using port ${HOST_PORT} for RakshaGIS.${RESET}"
+    fi
+  else
+    HOST_PORT=80
+    echo -e "  ${GREEN}✓ Port 80 is free.${RESET}"
+  fi
+fi
+
+# Write the chosen port into the project .env so docker compose picks it up,
+# and patch docker-compose.yml's nginx port binding at compose runtime via
+# the RAKSHAGIS_HTTP_PORT env var (see docker-compose.yml nginx ports section).
+_upsert_env_early() { local key=$1 val=$2 file="$SCRIPT_DIR/.env"
+  if [[ -f "$file" ]]; then
+    grep -q "^${key}=" "$file" \
+      && sed -i "s|^${key}=.*|${key}=${val}|" "$file" \
+      || echo "${key}=${val}" >> "$file"
+  fi
+  # Also export for the remainder of this script session
+  export "${key}=${val}"
+}
+# Export immediately so docker compose commands in this script use the right port
+export RAKSHAGIS_HTTP_PORT="${HOST_PORT}"
+export RAKSHAGIS_HTTPS_PORT="${HTTPS_PORT:-443}"
+echo ""
+
+# ── GPU detection ─────────────────────────────────────────────────────────────
 
 _detect_nvidia_gpu() {
   command -v nvidia-smi &>/dev/null && nvidia-smi --query-gpu=name --format=csv,noheader &>/dev/null
@@ -126,15 +224,18 @@ printf "  %-14s %-42s %s\n" "Backend" "Status" "URL"
 printf "  %-14s %-42s %s\n" "-------" "------" "---"
 
 # ── Detection helpers ─────────────────────────────────────────────────────────
-# Check if a compose service container is currently running (uses Docker labels)
+# Both helpers filter by BOTH the service name AND the RakshaGIS project name so
+# a container named "db" or "redis" in any *other* Compose project on this host
+# is never confused with ours.
 _svc_running() {
   docker ps \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
     --filter "label=com.docker.compose.service=$1" \
     --format "{{.ID}}" 2>/dev/null | grep -q .
 }
-# Check if a compose service container exists at all (running OR stopped)
 _svc_exists() {
   docker ps -a \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
     --filter "label=com.docker.compose.service=$1" \
     --format "{{.ID}}" 2>/dev/null | grep -q .
 }
@@ -320,6 +421,14 @@ DEBUG=False
 SECRET_KEY=${SECRET_KEY}
 ALLOWED_HOSTS=localhost,127.0.0.1
 
+# Compose project name — all containers/networks/volumes are prefixed with this.
+# Changing it renames all resources; leave it as-is unless you know what you are doing.
+COMPOSE_PROJECT_NAME=rakshagis
+
+# Host port for the nginx web UI (change if port 80 is occupied by another project)
+RAKSHAGIS_HTTP_PORT=${HOST_PORT}
+RAKSHAGIS_HTTPS_PORT=443
+
 # Host path — mapped to /data inside containers
 DATA_DIR=${DATA_DIR}
 
@@ -371,14 +480,16 @@ else
   _upsert_env LOCALAI_BASE_URL    "${LOCALAI_BASE_URL_VAL}"
   _upsert_env LLAMACPP_BASE_URL   "${LLAMACPP_BASE_URL_VAL}"
   _upsert_env ANYTHINGLLM_BASE_URL "${ANYTHINGLLM_BASE_URL_VAL}"
-  _upsert_env AI_BACKEND_GPU         "${GPU_MODE}"
-  _upsert_env AI_BACKENDS            "${AI_BACKENDS_DOCKER}"
+  _upsert_env AI_BACKEND_GPU             "${GPU_MODE}"
+  _upsert_env AI_BACKENDS                "${AI_BACKENDS_DOCKER}"
+  _upsert_env RAKSHAGIS_HTTP_PORT        "${HOST_PORT}"
+  _upsert_env COMPOSE_PROJECT_NAME       "rakshagis"
   # Add OnlyOffice secrets/config if not already set
   grep -q "^ONLYOFFICE_JWT_SECRET=" "$ENV_FILE" || \
     echo "ONLYOFFICE_JWT_SECRET=$(openssl rand -base64 32 | tr -d '=+/')" >> "$ENV_FILE"
   grep -q "^ONLYOFFICE_INTERNAL_BASE_URL=" "$ENV_FILE" || \
     echo "ONLYOFFICE_INTERNAL_BASE_URL=http://nginx" >> "$ENV_FILE"
-  echo "    ✓ Updated .env (DATA_DIR + AI backend URLs + GPU settings)"
+  echo "    ✓ Updated .env (DATA_DIR + AI backend URLs + GPU settings + HTTP port)"
 fi
 
 # ── Step 4: Load Docker images from tarballs (offline install) ───────────────
@@ -737,17 +848,25 @@ fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
+ACCESS_URL="http://localhost"
+[[ "${HOST_PORT}" != "80" ]] && ACCESS_URL="http://localhost:${HOST_PORT}"
+
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║                RakshaGIS Setup Complete                 ║"
 echo "╠══════════════════════════════════════════════════════════╣"
+printf "║  Project name    : %-35s║\n" "rakshagis  (COMPOSE_PROJECT_NAME)"
 printf "║  Data directory  : %-35s║\n" "${DATA_DIR}"
+printf "║  HTTP port       : %-35s║\n" "${HOST_PORT}"
 printf "║  Compute mode    : %-35s║\n" "${GPU_MODE^^}"
 printf "║  AI backends     : %-35s║\n" "${AI_BACKENDS_DOCKER:-local only}"
 echo "║  Default login   : admin / admin123                     ║"
-echo "║  Access URL      : http://localhost                     ║"
+printf "║  Access URL      : %-35s║\n" "${ACCESS_URL}"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Use './RakshaGIS.sh start|stop|restart|status'         ║"
 echo "║  Go to Settings → AI Config to activate a backend       ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+echo "║  Multi-project isolation: all resources are prefixed    ║"
+echo "║  'rakshagis_' — other projects on this host are safe.   ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  OFFLINE TILE SERVER (one-time, needs internet):        ║"
 echo "║    ./build.sh --import-osm                              ║"

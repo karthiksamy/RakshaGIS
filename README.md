@@ -1056,6 +1056,10 @@ Interactive API documentation: `http://localhost/api/schema/swagger-ui/`
 | `/api/backups/jobs/` | Backup job management |
 | `/api/backups/jobs/{id}/download/` | Download (and decrypt) backup file |
 | `/api/backups/schedules/` | Backup schedule management |
+| `/api/external/databases/` | External DB connections (SUPERADMIN) |
+| `/api/external/layers/` | External DB layers — list, geojson, search, distinct-values |
+| `/api/external/gis-servers/` | GIS Server connections — CRUD, test, capabilities |
+| `/api/external/gis-server-layers/` | GIS Server layers — CRUD, features, tile-config |
 | `/api/core/basemaps/` | Basemap configurations |
 | `/api/core/terrain-config/` | Terrain/Cesium configuration |
 | `/tiles/` | MVT vector tiles via pg_tileserv |
@@ -1088,14 +1092,12 @@ curl -X POST http://localhost/api/accounts/token/refresh/ \
 
 | Role | Capabilities |
 |---|---|
-| **SUPERADMIN** | Full system access, master data, all backup operations, LLM config, create DGDE model |
-| **DEO_ADMIN / CEO_ADMIN / ADEO_ADMIN** | Manage users/orgs within own hierarchy; publish approved survey areas; approve/reject cross-org access requests; download own org backups |
+| **SUPERADMIN** | Full system access, master data, all backup operations, LLM config, create DGDE model; add global External DB layers and global GIS Server layers (visible to all users) |
+| **DEO_ADMIN / CEO_ADMIN / ADEO_ADMIN** | Manage users/orgs within own hierarchy; publish approved survey areas; approve/reject cross-org access requests; download own org backups; add org-scoped GIS Server layers |
 | **PDDE_VIEWER** | Read-only access to all data within own command jurisdiction; download command backups |
-| **SDO** | Create/submit survey areas; draw/edit features in DRAFT/RETURNED areas |
-| **SURVEYOR** | Draw and edit features in DRAFT/RETURNED survey areas |
-| **CHECKER** | Review submitted areas; return or forward to approver |
-| **APPROVER** | Approve or return areas from review |
-| **VIEWER** | Read-only map and report access |
+| **SDO / SURVEYOR / CHECKER / APPROVER / VIEWER** | Standard survey workflow access; can add org-scoped GIS Server layers for their own organisation |
+
+> **GIS Server Layers:** Any authenticated user can register GIS server connections and add layers. Layers added by SUPERADMIN have `organisation = null` and are visible globally. Layers added by any other user are automatically scoped to their own organisation and visible only within that organisation.
 
 ---
 
@@ -1239,9 +1241,18 @@ Optional services (Docker profiles)
 
 ## External Data Layers
 
-RakshaGIS can render **read-only layers that live in a separate PostgreSQL/PostGIS database** (e.g. a DGDE operational DB) without copying the geometry into RakshaGIS. Geometry is queried live, reprojected to WGS-84, and filtered per the logged-in user's office level.
+RakshaGIS supports two types of externally-sourced read-only layers, both accessible from the map toolbar's **Layers & Tools** panel:
 
-### How it works
+| Type | Who can add | Visibility |
+|------|-------------|------------|
+| **External DB Layers** | SUPERADMIN only | All users (filtered by office level) |
+| **GIS Server Layers** | Any authenticated user | Global (SUPERADMIN-added) or org-scoped (all other users) |
+
+---
+
+### External DB Layers (SuperAdmin only)
+
+Renders geometry queried live from a separate PostgreSQL/PostGIS database (e.g. a DGDE operational DB) without copying data into RakshaGIS.
 
 ```
 External PostGIS DB ──live query (psycopg2)──▶ Django (apps/external_data)
@@ -1255,10 +1266,10 @@ External PostGIS DB ──live query (psycopg2)──▶ Django (apps/external_d
 - **Per-layer styling**: stroke, fill colour/opacity, QGIS-style fill patterns, and classification (thematic) colouring.
 - **Performance**: large layers load by viewport (bbox + spatial index); smaller ones load fully.
 
-### Admin configuration (SuperAdmin only)
+#### Admin configuration (SuperAdmin only)
 
-1. **Add the external database** — Admin → External Data → Databases → set host/port/database/schema/user/password, then **Test Connection**. Use a **read-only** DB user.
-2. **Register a layer** — Admin → External Data → External Layers:
+1. **Add the external database** — Settings → External Data → Databases → set host/port/database/schema/user/password, then **Test Connection**. Use a **read-only** DB user.
+2. **Register a layer** — External Data → External Layers:
 
    | Field | Example | Notes |
    |-------|---------|-------|
@@ -1273,7 +1284,7 @@ External PostGIS DB ──live query (psycopg2)──▶ Django (apps/external_d
 
 3. **Refresh stats** — `POST /api/external/layers/{id}/refresh-stats/` populates `feature_count` and `bbox`.
 
-### Key endpoints
+#### Key endpoints
 
 ```
 GET  /api/external/layers/                          # active layers (role-filtered)
@@ -1285,32 +1296,89 @@ POST /api/external/layers/{id}/refresh-stats/       # SuperAdmin
 GET  /api/external/databases/{id}/tables/           # list spatial tables
 ```
 
-### Troubleshooting
+---
+
+### GIS Server Layers (All Users)
+
+Any authenticated user can register and consume layers from external GIS servers (GeoServer, ArcGIS, MapServer, QGIS Server, etc.) over standard protocols (WMS, WMTS, WFS, ArcGIS Map/Feature Service, XYZ).
+
+#### Visibility scoping
+
+| Added by | `organisation` field | Visible to |
+|----------|----------------------|------------|
+| SUPERADMIN | `null` (global) | All users across all organisations |
+| Any other user | Automatically set to their own org | Users within the same organisation only |
+
+Layers are tagged in the UI: **cyan "Global"** tag for SUPERADMIN-added layers; **purple "[OrgName]"** tag for org-scoped layers.
+
+#### How to use
+
+1. Go to **Map** → click the **Layers & Tools** toolbar button (left side of map).
+2. Switch to the **GIS Servers** tab (opens by default for non-SUPERADMIN users).
+3. Click **Add Server** to register a GIS server connection (name, type, URL, optional credentials).
+4. Use **Discover** on any server card to auto-detect available layers via GetCapabilities.
+5. Click any discovered layer tag or use **Add Layer** to register the layer with display name, protocol, and style.
+6. Toggle the **Show** switch on any layer to load it onto the map.
+
+#### Layer protocols supported
+
+| Protocol | Type | Use case |
+|----------|------|----------|
+| WMS | Tile (raster) | GeoServer, QGIS, MapServer raster rendering |
+| WMTS | Tile (raster) | Tiled WMS services |
+| WFS | Vector | GeoServer, QGIS vector feature queries |
+| ArcGIS Map Service | Tile | ArcGIS Server map services |
+| ArcGIS Feature Service | Vector | ArcGIS Server feature queries |
+| XYZ | Tile | Any XYZ/slippy tile endpoint |
+
+#### Key endpoints
+
+```
+GET    /api/external/gis-servers/                         # list server connections
+POST   /api/external/gis-servers/                         # register a new server
+GET    /api/external/gis-servers/{id}/capabilities/       # auto-discover layers
+POST   /api/external/gis-servers/{id}/test/               # test connectivity
+GET    /api/external/gis-server-layers/                   # list layers (org-filtered)
+POST   /api/external/gis-server-layers/                   # add a layer
+GET    /api/external/gis-server-layers/{id}/features/     # proxy WFS/ArcGIS features as GeoJSON
+GET    /api/external/gis-server-layers/{id}/tile-config/  # WMS/WMTS params for tile layer
+```
+
+---
+
+### Troubleshooting external layers
 
 | Problem | Check |
 |---------|-------|
-| Layer shows 0 features | `is_active=True`? DB connection OK? user's org level set? filter column names correct & present in the table? |
-| Connection fails | host/port/db correct; server reachable from container (`docker compose exec web psql -h HOST -U USER -d DB`); credentials |
-| Wrong rows | confirm filter column type is TEXT/CHAR; `SELECT DISTINCT officeid FROM table LIMIT 10` |
-| Slow | add `GIST` index on geometry + b-tree index on filter column |
+| External DB layer shows 0 features | `is_active=True`? DB connection OK? user's org level set? filter column names correct? |
+| GIS server connection fails | URL reachable from container? auth credentials correct? |
+| WMS layer shows blank | Check layer name matches exactly; verify CRS (EPSG:4326 or EPSG:3857) |
+| Slow external DB layer | Add `GIST` index on geometry + b-tree index on filter column |
 
-> **Security:** External DB passwords are stored in `ExternalDatabase.password`. Use a **read-only** account, restrict the Admin UI to SuperAdmins, and protect the link with firewall/VPN. Row-level filtering is enforced server-side — only SuperAdmins bypass it.
+> **Security:** External DB credentials are stored in `ExternalDatabase.password`. Use a **read-only** DB account, restrict to SuperAdmins, and protect with firewall/VPN. Row-level filtering is enforced server-side.
 
 ---
 
 ## Map Printing & High-Resolution Export
 
-RakshaGIS offers two complementary export paths:
+RakshaGIS offers three complementary export paths:
 
 | Path | Where | Quality | Use for |
 |------|-------|---------|---------|
-| **jsPDF + html2canvas** (client) | "Print/Export → PDF" | Screen DPI | quick previews, layouts with legend / scale bar / north arrow |
-| **Mapnik** (server, raster) | "Print/Export → PNG (300+ DPI)" | Publication (300+ DPI) | high-resolution cartographic output |
+| **jsPDF + html2canvas** (client) | Map toolbar → Print | Screen DPI | quick previews, layouts with legend / scale bar / north arrow |
+| **GeoTIFF / PNG (client)** | Map toolbar → Export TIFF | 150 DPI or 300 DPI | high-resolution raster export including basemap tiles |
+| **Mapnik** (server, raster) | Map toolbar → PNG (300+ DPI) | Publication (300+ DPI) | cartographic output direct from PostGIS |
 
-### Quick (client) export
-The **Print/Export** action in the map toolbar produces a PDF with optional **legend, scale bar, north arrow, and title** (jsPDF). It is instant and needs no server resources, but is limited to screen resolution.
+### Quick PDF export (client)
+The **Print** action produces a PDF with optional **legend, scale bar, north arrow, title, and coordinate grid** (jsPDF). Instant — no server resources.
 
-### High-resolution Mapnik export
+### High-resolution GeoTIFF / PNG export (client, 150–300 DPI)
+
+Captures the full map canvas — including basemap raster tiles and all vector layers — at 2× or 3× pixel density, then exports as a georeferenced GeoTIFF (with embedded world-file metadata) or plain PNG.
+
+**Tile-loading fix (v1.1):** At 300 DPI the map must load 3× more tiles than at screen resolution. A `waitForTilesLoaded()` listener is registered *before* `renderSync()` so that `tileloadstart` events are captured as soon as the render triggers tile requests. The export waits for an 800 ms idle, then a 400 ms post-last-tile settle, then a 300 ms final settle before compositing — preventing the blurred basemap that occurred when tiles were still in-flight during canvas capture.
+
+### High-resolution Mapnik export (server)
 
 Mapnik renders directly from PostGIS at arbitrary resolution using XML map styles.
 
@@ -1518,6 +1586,8 @@ A condensed history of notable fixes. The original per-issue notes are preserved
 | **OnlyOffice** | Document editor opened in a cramped modal | Open documents in a new browser tab. See `ONLYOFFICE_FIX_SUMMARY.md`. |
 | **Docker build** | `<none>` image tags, migration permission errors on WSL2 | Fixed image naming + entrypoint permissions. See `DOCKER_BUILD_FIXES.md`. |
 | **Mapnik** | `import mapnik` fails / export 503 | Install system `libmapnik` + `python-mapnik` (baked into the Docker image); see [Map Printing](#map-printing--high-resolution-export). |
+| **300 DPI TIFF export** | Basemap tiles appear blurred at 300 DPI | `waitForTilesLoaded()` is now attached *before* `renderSync()` so tile requests are caught as they fire; waits for 800 ms idle + 400 ms post-last-tile + 300 ms settle before compositing. |
+| **GIS Server Layers** | Add Layer / Add Server buttons not visible to non-SUPERADMIN users | Permission check changed from `ADMIN_ROLES` list to `!!user` — any authenticated user can now add GIS Server layers. Default tab in Layers & Tools panel changed to GIS Servers for non-SUPERADMIN users. |
 
 For broader status snapshots see `docs/archive/IMPLEMENTATION_SUMMARY.md`, `FIXES_COMPLETED_SUMMARY.md`, and `SETUP_PROGRESS.md`.
 
@@ -1552,6 +1622,8 @@ Several items first identified as "future scope" are now **delivered**:
 | Multi-language UI | ✅ English, Hindi, Tamil, Telugu, Bengali, Kannada, Marathi |
 | Automated DR backups | ✅ Encrypted PostgreSQL dumps + rotation (off-site replication pending) |
 | Regulatory reporting | ◑ Survey-area `.docx` + proximity/encroachment reports done; ministry-format templates in progress |
+| GIS Server Layers (all-user) | ✅ Any authenticated user can add WMS/WFS/ArcGIS/XYZ server layers; org-scoped or global (SUPERADMIN) |
+| 300 DPI map export | ✅ Client-side GeoTIFF/PNG export at 300 DPI with tile-load wait before canvas composite |
 
 **Still planned:** mobile field-survey PWA/React-Native app with offline sync · DILRMP (national land registry) connectors · PKI / smart-card (mutual-TLS) authentication · off-site backup replication to NIC Meghraj · ministry-prescribed report templates.
 

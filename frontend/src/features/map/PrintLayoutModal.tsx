@@ -1,13 +1,15 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef } from 'react'
 import {
   Form, Input, Select, Checkbox, Button, Space,
-  message, Radio, Divider, Tooltip,
+  message, Radio, Divider, Tooltip, Alert, Tag,
 } from 'antd'
 import DraggableModal from '@/components/DraggableModal'
 import { useBranding } from '@/context/BrandingContext'
-import { PrinterOutlined, DownloadOutlined, GlobalOutlined } from '@ant-design/icons'
+import { PrinterOutlined, DownloadOutlined, GlobalOutlined, SelectOutlined } from '@ant-design/icons'
 import { toLonLat } from 'ol/proj'
 import type OLMap from 'ol/Map'
+import type VectorLayer from 'ol/layer/Vector'
+import type VectorSource from 'ol/source/Vector'
 import type jsPDFType from 'jspdf'
 import api from '@/services/api'
 
@@ -24,6 +26,10 @@ interface Props {
   projectName?: string
   orgName?: string
   legend?: LayerLegendItem[]
+  /** Direct ref to the selection layer — avoids fragile zIndex lookup */
+  selectLayer?: React.RefObject<VectorLayer<VectorSource> | null>
+  /** selectedCount from MapPage state — keeps the badge reactive */
+  selectedCount?: number
 }
 
 // Portrait dims [w, h] in mm — landscape swaps them at render time
@@ -116,37 +122,263 @@ function drawScaleBar(doc: jsPDFType, x: number, y: number, resolution: number, 
   doc.text(`Scale  1 : ${scaleDenom.toLocaleString()}`, x, y + barH + 7 * scale)
 }
 
+interface CapturedLayer {
+  name: string
+  dataUrl: string
+}
+
+async function captureMapLayers(
+  mapInstance: OLMap,
+  dpi: string,
+  legend: LayerLegendItem[],
+  selectLayerRef?: React.RefObject<VectorLayer<VectorSource> | null>
+): Promise<CapturedLayer[]> {
+  const originalSize = mapInstance.getSize()
+  const view = mapInstance.getView()
+  const originalResolution = view.getResolution()
+  const captureScale = dpi === '300' ? 3 : dpi === '150' ? 2 : 1
+
+  const layers = mapInstance.getLayers().getArray()
+  const basemapLyr = layers.find(l => typeof (l as any).getSource === 'function' && l.getZIndex() === 0)
+  
+  const vectorLyr = layers.find(l => {
+    if (typeof (l as any).getSource === 'function') {
+      const source = (l as any).getSource()
+      return source && typeof source.getFeatures === 'function'
+    }
+    return false
+  }) as any
+
+  // Read selection: prefer direct ref (reliable), fall back to zIndex lookup
+  const selectLyr = selectLayerRef?.current
+    ?? (layers.find(l => l.getZIndex() === 11) as any)
+  const selectedFeatures: any[] = selectLyr?.getSource?.()?.getFeatures?.() ?? []
+
+  const hasSelection = selectedFeatures.length > 0
+  const selectedIds = new Set(selectedFeatures.map((f: any) => f.get('feature_id') || String(f.getId() || '')))
+  const selectedLayers = Array.from(new Set(selectedFeatures.map((f: any) => f.get('layer_name')).filter(Boolean))) as string[]
+
+  const geoTiffLyrs = layers.filter(l => l.get('isGeoTIFF') === true)
+  
+  const otherLyrs = layers.filter(l => 
+    l !== basemapLyr && 
+    l !== vectorLyr && 
+    l !== selectLyr &&
+    !geoTiffLyrs.includes(l)
+  )
+
+  // Save original states
+  const originalStates = new Map<any, { visible: boolean; style?: any }>()
+  layers.forEach(l => {
+    originalStates.set(l, {
+      visible: l.getVisible(),
+      style: (typeof (l as any).getStyle === 'function') ? (l as any).getStyle() : undefined
+    })
+  })
+
+  const captured: CapturedLayer[] = []
+
+  // Temporarily resize map container for high resolution rendering
+  if (captureScale > 1 && originalSize && originalResolution) {
+    const targetSize = [originalSize[0] * captureScale, originalSize[1] * captureScale]
+    mapInstance.setSize(targetSize)
+    view.setResolution(originalResolution / captureScale)
+    
+    // Wait for the high-res render to complete (tiles loaded)
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        mapInstance.once('rendercomplete', () => resolve())
+      }),
+      new Promise<void>((resolve) => setTimeout(resolve, 1500))
+    ])
+    mapInstance.renderSync()
+  }
+
+  const getCanvasData = (): string => {
+    const mapEl = mapInstance.getTargetElement()
+    const canvases = Array.from(mapEl?.querySelectorAll('canvas') ?? []) as HTMLCanvasElement[]
+    const valid = canvases.filter((c) => c.width > 0 && c.height > 0)
+    if (valid.length === 0) return ''
+    
+    const composite = document.createElement('canvas')
+    composite.width = valid[0].width
+    composite.height = valid[0].height
+    const ctx = composite.getContext('2d')!
+    valid.forEach((c) => {
+      try { ctx.drawImage(c, 0, 0) } catch { /* skip cross-origin */ }
+    })
+    return composite.toDataURL('image/png')
+  }
+
+  const hideAll = () => {
+    layers.forEach(l => l.setVisible(false))
+    if (vectorLyr) {
+      vectorLyr.setStyle(() => null)
+    }
+  }
+
+  // 1. Capture Base Map
+  const originalBasemapState = originalStates.get(basemapLyr)
+  if (basemapLyr && originalBasemapState?.visible) {
+    hideAll()
+    basemapLyr.setVisible(true)
+    mapInstance.renderSync()
+    const dataUrl = getCanvasData()
+    if (dataUrl) {
+      captured.push({ name: 'Base Map', dataUrl })
+    }
+  }
+
+  // 2. Capture GeoTIFF layers
+  for (const lyr of geoTiffLyrs) {
+    const name = lyr.get('name')
+    if (name && originalStates.get(lyr)?.visible) {
+      hideAll()
+      lyr.setVisible(true)
+      mapInstance.renderSync()
+      const dataUrl = getCanvasData()
+      if (dataUrl) {
+        captured.push({ name, dataUrl })
+      }
+    }
+  }
+
+  // 3. Capture Vector layers
+  //    • When features are selected: render each selected layer separately (one OCG layer per layer name)
+  //    • When nothing is selected: render ALL visible vector features in one pass
+  const originalVectorState = originalStates.get(vectorLyr)
+  if (vectorLyr && originalVectorState?.visible) {
+    const originalStyle = originalVectorState.style
+
+    if (hasSelection) {
+      // Selective: one canvas capture per selected layer name
+      for (const name of selectedLayers) {
+        hideAll()
+        vectorLyr.setVisible(true)
+        vectorLyr.setStyle((feature: any, resolution: any) => {
+          const ln = feature.get('layer_name')
+          const fid = feature.get('feature_id') || String(feature.getId() || '')
+          if (ln !== name || !selectedIds.has(fid)) return null
+          if (typeof originalStyle === 'function') return originalStyle(feature, resolution)
+          return originalStyle ?? null
+        })
+        mapInstance.renderSync()
+        const dataUrl = getCanvasData()
+        if (dataUrl) captured.push({ name, dataUrl })
+      }
+    } else {
+      // No selection: capture all visible features grouped by layer name
+      const allLayers = Array.from(new Set(
+        (vectorLyr.getSource?.()?.getFeatures?.() ?? [])
+          .map((f: any) => f.get('layer_name'))
+          .filter(Boolean)
+      )) as string[]
+
+      if (allLayers.length === 0) {
+        // Fallback: capture all features in a single pass
+        hideAll()
+        vectorLyr.setVisible(true)
+        if (typeof originalStyle !== 'undefined') vectorLyr.setStyle(originalStyle)
+        mapInstance.renderSync()
+        const dataUrl = getCanvasData()
+        if (dataUrl) captured.push({ name: 'Survey Features', dataUrl })
+      } else {
+        for (const name of allLayers) {
+          hideAll()
+          vectorLyr.setVisible(true)
+          vectorLyr.setStyle((feature: any, resolution: any) => {
+            if (feature.get('layer_name') !== name) return null
+            if (typeof originalStyle === 'function') return originalStyle(feature, resolution)
+            return originalStyle ?? null
+          })
+          mapInstance.renderSync()
+          const dataUrl = getCanvasData()
+          if (dataUrl) captured.push({ name, dataUrl })
+        }
+      }
+    }
+  }
+
+  // 4. Capture Annotations & Drawings
+  const visibleOtherLyrs = otherLyrs.filter(l => originalStates.get(l)?.visible)
+  if (visibleOtherLyrs.length > 0) {
+    hideAll()
+    visibleOtherLyrs.forEach(l => l.setVisible(true))
+    mapInstance.renderSync()
+    const dataUrl = getCanvasData()
+    if (dataUrl) {
+      captured.push({ name: 'Drawings & Annotations', dataUrl })
+    }
+  }
+
+  // Restore original states
+  layers.forEach(l => {
+    const state = originalStates.get(l)
+    if (state) {
+      l.setVisible(state.visible)
+      if (state.style !== undefined && typeof (l as any).setStyle === 'function') {
+        (l as any).setStyle(state.style)
+      }
+    }
+  })
+
+  if (captureScale > 1 && originalSize && originalResolution) {
+    mapInstance.setSize(originalSize)
+    view.setResolution(originalResolution)
+  }
+  mapInstance.renderSync()
+
+  return captured
+}
+
 export default function PrintLayoutModal({
-  open, onClose, mapInstance, projectName = 'Project', orgName = '', legend = []
+  open, onClose, mapInstance, projectName = 'Project', orgName = '', legend = [],
+  selectLayer, selectedCount: selectedCountProp = 0,
 }: Props) {
   const branding = useBranding()
   const [form] = Form.useForm()
   const [generating, setGenerating] = useState(false)
   const [exportingPng, setExportingPng] = useState(false)
-  // Track which legend items the user has chosen to include
-  const [enabledNames, setEnabledNames] = useState<Set<string>>(() => new Set(legend.map((l) => l.name)))
 
-  // Re-sync when legend prop changes (e.g. layers added/removed on the map)
-  useMemo(() => {
-    setEnabledNames((prev) => {
-      const next = new Set(legend.map((l) => l.name))
-      // Keep existing selections; add any new items as checked by default
-      for (const name of prev) { if (!next.has(name)) next.delete(name) }
-      return next
-    })
+  // Use the count passed from MapPage (reactive) — fall back to reading the layer directly
+  const selectedCount = selectedCountProp
+
+  // Derive selected layer names from the selection layer ref (evaluated at print time)
+  function getSelectedFeatures() {
+    if (selectLayer?.current) {
+      return selectLayer.current.getSource()?.getFeatures() ?? []
+    }
+    // Fallback: find by zIndex in map layers
+    if (mapInstance) {
+      const layers = mapInstance.getLayers().getArray()
+      const selLyr = layers.find(l => l.getZIndex() === 11) as any
+      return selLyr?.getSource()?.getFeatures() ?? []
+    }
+    return []
+  }
+
+  const selectedLayers = useMemo(() => {
+    if (!open) return []
+    const feats = getSelectedFeatures()
+    return Array.from(new Set(feats.map((f: any) => f.get('layer_name')).filter(Boolean))) as string[]
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [legend.map((l) => l.name).join('|')])
+  }, [open, selectedCountProp])   // re-run when selection changes
 
-  const activeLegend = useMemo(
-    () => legend.filter((l) => enabledNames.has(l.name)),
-    [legend, enabledNames],
-  )
+  // Legend: when features are selected, only show layers that have selections;
+  // when nothing is selected, show all legend items (print will use all features).
+  const activeLegend = useMemo(() => {
+    if (selectedCount === 0) return legend  // all layers visible
+    return legend.filter((item) => {
+      if (item.type === 'raster') return true
+      return selectedLayers.includes(item.name)
+    })
+  }, [legend, selectedLayers, selectedCount])
 
   async function handlePrint() {
     if (!mapInstance) { message.error('Map not ready'); return }
     const { default: jsPDF } = await import('jspdf')
     const vals = form.getFieldsValue()
-    const { title, subtitle, orientation, pageSize, dpi, showLegend, showNorth, showScale, showGrid, showCoords, showAttrib } = vals
+    const { title, subtitle, orientation, pageSize, dpi, showLegend, showNorth, showScale, showGrid, showCoords, showAttrib, exportAttributes } = vals
     setGenerating(true)
 
     try {
@@ -179,51 +411,8 @@ export default function PrintLayoutModal({
         grid:     ts(5,  tScale),
       }
 
-      // Capture map canvases — composite into single PNG
-      const mapEl = mapInstance.getTargetElement()
-      const canvases = Array.from(mapEl?.querySelectorAll('canvas') ?? []) as HTMLCanvasElement[]
-      const valid = canvases.filter((c) => c.width > 0 && c.height > 0)
-
-      let baseMapData = ''
-      let featuresData = ''
-      let mapCanvasW = 1
-      let mapCanvasH = 1
-
-      if (valid.length > 0) {
-        const dpiScale = dpi === '300' ? 2 : dpi === '150' ? 1.5 : 1
-        mapCanvasW = Math.round(valid[0].width * dpiScale)
-        mapCanvasH = Math.round(valid[0].height * dpiScale)
-
-        if (valid.length === 1) {
-          const comp = document.createElement('canvas')
-          comp.width = mapCanvasW
-          comp.height = mapCanvasH
-          const ctx = comp.getContext('2d')!
-          ctx.scale(dpiScale, dpiScale)
-          try { ctx.drawImage(valid[0], 0, 0) } catch { /* cross-origin */ }
-          featuresData = comp.toDataURL('image/png')
-        } else {
-          // 1. Base Map (first canvas)
-          const compBase = document.createElement('canvas')
-          compBase.width = mapCanvasW
-          compBase.height = mapCanvasH
-          const ctxBase = compBase.getContext('2d')!
-          ctxBase.scale(dpiScale, dpiScale)
-          try { ctxBase.drawImage(valid[0], 0, 0) } catch { /* cross-origin */ }
-          baseMapData = compBase.toDataURL('image/png')
-
-          // 2. Spatial Features (remaining canvases)
-          const compFeat = document.createElement('canvas')
-          compFeat.width = mapCanvasW
-          compFeat.height = mapCanvasH
-          const ctxFeat = compFeat.getContext('2d')!
-          ctxFeat.scale(dpiScale, dpiScale)
-          for (let i = 1; i < valid.length; i++) {
-            try { ctxFeat.drawImage(valid[i], 0, 0) } catch { /* cross-origin */ }
-          }
-          featuresData = compFeat.toDataURL('image/png')
-        }
-      }
+      // Capture map layers at high DPI with interactive filtering
+      const capturedLayers = await captureMapLayers(mapInstance, dpi, legend, selectLayer)
 
       // Create PDF
       const fmtParam = typeof paper.fmt === 'string'
@@ -236,6 +425,50 @@ export default function PrintLayoutModal({
         format: fmtParam,
         compress: true,
       })
+
+      // Extract active vector features attributes for the attribute table page
+      const printFeatures: any[] = []
+      if (exportAttributes) {
+        getSelectedFeatures().forEach((f: any) => {
+          const ln = f.get('layer_name')
+          if (ln) {
+            printFeatures.push({
+              layer_name: ln,
+              feature_id: f.get('feature_id') || String(f.getId() || ''),
+              attributes: f.get('attributes') || {}
+            })
+          }
+        })
+      }
+
+      // Calculate total pages including attributes
+      let attributePages = 0
+      const col1X = margin
+      const col2X = margin + 40 * tScale
+      const col3X = margin + 75 * tScale
+      const tableW = docW - margin * 2
+      
+      if (exportAttributes && printFeatures.length > 0) {
+        let currentY = margin + 15 * tScale
+        attributePages = 1
+        for (const feat of printFeatures) {
+          const attrLines: string[] = []
+          Object.entries(feat.attributes).forEach(([k, v]) => {
+            attrLines.push(`${k}: ${v}`)
+          })
+          if (attrLines.length === 0) attrLines.push('(no attributes)')
+          const wrappedAttrs = doc.splitTextToSize(attrLines.join('\n'), (docW - margin - col3X) - 4) as string[]
+          const wrappedLayer = doc.splitTextToSize(feat.layer_name, (col2X - col1X) - 4) as string[]
+          const wrappedId = doc.splitTextToSize(feat.feature_id, (col3X - col2X) - 4) as string[]
+          const rowH = Math.max(wrappedLayer.length, wrappedId.length, wrappedAttrs.length) * 4.5 * tScale + 2 * tScale
+          if (currentY + rowH > docH - margin - 10 * tScale) {
+            attributePages++
+            currentY = margin + 21 * tScale
+          }
+          currentY += rowH
+        }
+      }
+      const totalPages = 1 + attributePages
 
       // ── Header ────────────────────────────────────────────────────────
       const hGrad1: [number,number,number] = [10, 35, 75]
@@ -264,20 +497,19 @@ export default function PrintLayoutModal({
       doc.text(dateStr, docW - margin - 2 * tScale, margin + 8 * tScale, { align: 'right' })
       doc.text('CRS: WGS 84 / EPSG:4326', docW - margin - 2 * tScale, margin + 13 * tScale, { align: 'right' })
 
-      // ── Map image ─────────────────────────────────────────────────────
-      if (baseMapData) {
-        doc.addImage(baseMapData, 'PNG', margin, mapTop, mapW, mapH)
-      }
-      if (featuresData) {
-        doc.addImage(featuresData, 'PNG', margin, mapTop, mapW, mapH)
-      }
-      if (!baseMapData && !featuresData) {
+      // ── Map image stack ─────────────────────────────────────────────────────
+      if (capturedLayers.length > 0) {
+        capturedLayers.forEach(lyr => {
+          doc.addImage(lyr.dataUrl, 'PNG', margin, mapTop, mapW, mapH)
+        })
+      } else {
         doc.setFillColor(220, 225, 230)
         doc.rect(margin, mapTop, mapW, mapH, 'F')
         doc.setFontSize(FS.label)
         doc.setTextColor(120, 120, 120)
         doc.text('Map image unavailable', margin + mapW / 2, mapTop + mapH / 2, { align: 'center', baseline: 'middle' })
       }
+      
       // Map border
       doc.setDrawColor(60, 100, 150)
       doc.setLineWidth(0.5 * tScale)
@@ -340,6 +572,8 @@ export default function PrintLayoutModal({
         const res = mapInstance.getView().getResolution() ?? 1
         const sbX = margin + 4 * tScale
         const sbY = mapTop + mapH - 10 * tScale
+        const captureScale = dpi === '300' ? 3 : dpi === '150' ? 2 : 1
+        const mapCanvasW = (mapInstance.getSize()?.[0] ?? 800) * captureScale
         drawScaleBar(doc, sbX, sbY, res, mapCanvasW, mapW, tScale)
       }
 
@@ -421,7 +655,7 @@ export default function PrintLayoutModal({
       }
 
       doc.setFont('helvetica', 'normal')
-      doc.text('Page 1 of 1', docW - margin, fy + 4 * tScale, { align: 'right' })
+      doc.text(`Page 1 of ${totalPages}`, docW - margin, fy + 4 * tScale, { align: 'right' })
 
       // Calculate GFW (World File for PDF) coefficients at standard 150 DPI
       const view = mapInstance.getView()
@@ -455,6 +689,103 @@ export default function PrintLayoutModal({
       ]
       const gfwContent = gfwLines.join('\n') + '\n'
 
+      // ── Append Attribute Table Pages ───────────────────────────────────
+      if (exportAttributes && printFeatures.length > 0) {
+        let currentY = margin + 15 * tScale
+        let pageNum = 2
+        
+        const drawPageHeader = (pNum: number) => {
+          doc.setFillColor(...hGrad1)
+          doc.rect(margin, margin, docW - margin * 2, 12 * tScale, 'F')
+          doc.setTextColor(255, 255, 255)
+          doc.setFont('helvetica', 'bold')
+          doc.setFontSize(FS.title * 0.8)
+          doc.text('FEATURE ATTRIBUTES TABLE', margin + 4 * tScale, margin + 8 * tScale)
+          
+          doc.setFont('helvetica', 'italic')
+          doc.setFontSize(FS.small)
+          doc.setTextColor(180, 210, 240)
+          doc.text(`Page ${pNum} of ${totalPages}`, docW - margin - 4 * tScale, margin + 8 * tScale, { align: 'right' })
+          
+          doc.setTextColor(30, 30, 30)
+          doc.setFont('helvetica', 'normal')
+        }
+        
+        const drawTableHeader = (y: number) => {
+          doc.setFillColor(230, 235, 245)
+          doc.rect(margin, y, tableW, 6 * tScale, 'F')
+          doc.setDrawColor(180, 190, 210)
+          doc.setLineWidth(0.2 * tScale)
+          doc.rect(margin, y, tableW, 6 * tScale, 'S')
+          
+          doc.setFont('helvetica', 'bold')
+          doc.setFontSize(FS.label)
+          doc.setTextColor(40, 60, 100)
+          doc.text('Layer Name', col1X + 2, y + 4.5 * tScale)
+          doc.text('Feature ID', col2X + 2, y + 4.5 * tScale)
+          doc.text('Attributes', col3X + 2, y + 4.5 * tScale)
+          doc.setFont('helvetica', 'normal')
+          doc.setTextColor(30, 30, 30)
+        }
+        
+        doc.addPage(fmtParam, orientation as 'portrait' | 'landscape')
+        drawPageHeader(pageNum)
+        drawTableHeader(currentY)
+        currentY += 6 * tScale
+        
+        for (const feat of printFeatures) {
+          const attrLines: string[] = []
+          Object.entries(feat.attributes).forEach(([k, v]) => {
+            attrLines.push(`${k}: ${v}`)
+          })
+          if (attrLines.length === 0) {
+            attrLines.push('(no attributes)')
+          }
+          
+          const wrappedLayer = doc.splitTextToSize(feat.layer_name, (col2X - col1X) - 4) as string[]
+          const wrappedId = doc.splitTextToSize(feat.feature_id, (col3X - col2X) - 4) as string[]
+          const wrappedAttrs = doc.splitTextToSize(attrLines.join('\n'), (docW - margin - col3X) - 4) as string[]
+          
+          const rowH = Math.max(
+            wrappedLayer.length * 4.5 * tScale,
+            wrappedId.length * 4.5 * tScale,
+            wrappedAttrs.length * 4.5 * tScale
+          ) + 2 * tScale
+          
+          if (currentY + rowH > docH - margin - 10 * tScale) {
+            doc.setFontSize(FS.small)
+            doc.setTextColor(120, 120, 120)
+            doc.text(`Generated by ${branding.app_title}`, margin, docH - margin + 4 * tScale)
+            doc.text(`Page ${pageNum} of ${totalPages}`, docW - margin, docH - margin + 4 * tScale, { align: 'right' })
+            
+            doc.addPage(fmtParam, orientation as 'portrait' | 'landscape')
+            pageNum++
+            currentY = margin + 15 * tScale
+            drawPageHeader(pageNum)
+            drawTableHeader(currentY)
+            currentY += 6 * tScale
+          }
+          
+          doc.setDrawColor(210, 220, 235)
+          doc.setLineWidth(0.15 * tScale)
+          doc.rect(margin, currentY, tableW, rowH, 'S')
+          doc.line(col2X, currentY, col2X, currentY + rowH)
+          doc.line(col3X, currentY, col3X, currentY + rowH)
+          
+          doc.setFontSize(FS.label)
+          doc.text(wrappedLayer, col1X + 2, currentY + 4 * tScale)
+          doc.text(wrappedId, col2X + 2, currentY + 4 * tScale)
+          doc.text(wrappedAttrs, col3X + 2, currentY + 4 * tScale)
+          
+          currentY += rowH
+        }
+        
+        doc.setFontSize(FS.small)
+        doc.setTextColor(120, 120, 120)
+        doc.text(`Generated by ${branding.app_title}`, margin, docH - margin + 4 * tScale)
+        doc.text(`Page ${pageNum} of ${totalPages}`, docW - margin, docH - margin + 4 * tScale, { align: 'right' })
+      }
+
       // ── Save & Watermark ──────────────────────────────────────────────
       const filename = `${(title || projectName).replace(/[^a-zA-Z0-9_-]/g, '_')}_${pageSize}_${orientation}.pdf`
       const pdfBlob = doc.output('blob')
@@ -462,9 +793,7 @@ export default function PrintLayoutModal({
       const formData = new FormData()
       formData.append('file', pdfBlob, filename)
 
-      const layerNames: string[] = []
-      if (baseMapData) layerNames.push("Base Map")
-      if (featuresData) layerNames.push("Spatial Features")
+      const layerNames = capturedLayers.map(lyr => lyr.name)
       formData.append('layers', JSON.stringify(layerNames))
 
       const response = await api.post('/core/watermark-file/', formData, {
@@ -511,72 +840,44 @@ export default function PrintLayoutModal({
     try {
       const vals    = form.getFieldsValue()
       const view    = mapInstance.getView()
-      const mapEl   = mapInstance.getTargetElement()
-      const canvases = Array.from(mapEl?.querySelectorAll('canvas') ?? []) as HTMLCanvasElement[]
-      const valid   = canvases.filter((c) => c.width > 0 && c.height > 0)
-
-      // Capture scale: 300 DPI → 3× (≈2900px on a 1000px viewport, enough for A4),
-      // 150 DPI → 2×, screen → 1×.  Higher than 3× just upscales raster tiles with
-      // no real gain; Playwright's CSS rendering covers the rest via its `scale` option.
-      const captureScale = vals.dpi === '300' ? 3 : vals.dpi === '150' ? 2 : 1
-      let baseMapB64 = ''
-      let featuresB64 = ''
-      if (valid.length > 0) {
-        const mapCanvasW = valid[0].width * captureScale
-        const mapCanvasH = valid[0].height * captureScale
-
-        if (valid.length === 1) {
-          const comp = document.createElement('canvas')
-          comp.width = mapCanvasW
-          comp.height = mapCanvasH
-          const ctx = comp.getContext('2d')!
-          ctx.scale(captureScale, captureScale)
-          try { ctx.drawImage(valid[0], 0, 0) } catch { /* cross-origin */ }
-          featuresB64 = comp.toDataURL('image/png').split(',')[1]
-        } else {
-          // Base Map
-          const compBase = document.createElement('canvas')
-          compBase.width = mapCanvasW
-          compBase.height = mapCanvasH
-          const ctxBase = compBase.getContext('2d')!
-          ctxBase.scale(captureScale, captureScale)
-          try { ctxBase.drawImage(valid[0], 0, 0) } catch { /* cross-origin */ }
-          baseMapB64 = compBase.toDataURL('image/png').split(',')[1]
-
-          // Spatial Features
-          const compFeat = document.createElement('canvas')
-          compFeat.width = mapCanvasW
-          compFeat.height = mapCanvasH
-          const ctxFeat = compFeat.getContext('2d')!
-          ctxFeat.scale(captureScale, captureScale)
-          for (let i = 1; i < valid.length; i++) {
-            try { ctxFeat.drawImage(valid[i], 0, 0) } catch { /* cross-origin */ }
-          }
-          featuresB64 = compFeat.toDataURL('image/png').split(',')[1]
-        }
-      }
-
-      // Extent for footer
-      const size = mapInstance.getSize() ?? [800, 600]
-      const ext  = view.calculateExtent(size)
+      const size    = mapInstance.getSize() ?? [800, 600]
+      const ext     = view.calculateExtent(size)
       const [swLon, swLat] = toLonLat([ext[0], ext[1]])
       const [neLon, neLat] = toLonLat([ext[2], ext[3]])
+
+      // Capture map layers at high DPI with interactive filtering
+      const capturedLayers = await captureMapLayers(mapInstance, vals.dpi, legend, selectLayer)
+      
+      const layerImages = capturedLayers.map(lyr => ({
+        name: lyr.name,
+        image_b64: lyr.dataUrl.split(',')[1]
+      }))
 
       // Scale denominator: (m/px) * (px/mm_on_paper) * 1000 mm/m
       const paper  = PAPER_SIZES[vals.pageSize as string] ?? PAPER_SIZES.A4
       const isLand = vals.orientation === 'landscape'
       const mapWmm = isLand ? Math.max(paper.w, paper.h) : Math.min(paper.w, paper.h)
       const res    = view.getResolution() ?? 1
-      const scaleDenom = Math.round(res * (valid[0]?.width ?? size[0]) / mapWmm * 1000)
+      const scaleDenom = Math.round(res * size[0] / mapWmm * 1000)
 
-      const layerNames: string[] = []
-      if (baseMapB64) layerNames.push("Base Map")
-      if (featuresB64) layerNames.push("Spatial Features")
+      // Extract active vector features attributes for the attribute table page
+      const printFeatures: any[] = []
+      if (vals.exportAttributes) {
+        getSelectedFeatures().forEach((f: any) => {
+          const ln = f.get('layer_name')
+          if (ln) {
+            printFeatures.push({
+              layer_name: ln,
+              feature_id: f.get('feature_id') || String(f.getId() || ''),
+              attributes: f.get('attributes') || {}
+            })
+          }
+        })
+      }
 
       const payload = {
-        basemap_image_b64:  baseMapB64,
-        features_image_b64: featuresB64,
-        layers:             layerNames,
+        layer_images:       layerImages,
+        layers:             capturedLayers.map(lyr => lyr.name),
         title:              vals.title || projectName,
         subtitle:           vals.subtitle || '',
         org_name:           orgName,
@@ -591,6 +892,8 @@ export default function PrintLayoutModal({
         legend:             activeLegend,
         extent:             { sw_lat: swLat, sw_lon: swLon, ne_lat: neLat, ne_lon: neLon },
         scale_denominator:  scaleDenom,
+        export_attributes:  vals.exportAttributes,
+        features:           printFeatures,
       }
 
       // Calculate GFW (World File for PDF) coefficients at standard 150 DPI
@@ -686,7 +989,7 @@ export default function PrintLayoutModal({
             <Button
               icon={<GlobalOutlined />}
               loading={exportingPng}
-              disabled={generating}
+              disabled={generating || selectedCount === 0}
               onClick={handleExportServer}
             >
               Export PDF (ArcGIS)
@@ -697,7 +1000,7 @@ export default function PrintLayoutModal({
               type="primary"
               icon={<DownloadOutlined />}
               loading={generating}
-              disabled={exportingPng}
+              disabled={exportingPng || selectedCount === 0}
               onClick={handlePrint}
             >
               Generate PDF
@@ -721,6 +1024,7 @@ export default function PrintLayoutModal({
           showGrid: false,
           showCoords: true,
           showAttrib: true,
+          exportAttributes: false,
         }}
         style={{ marginTop: 12 }}
       >
@@ -792,6 +1096,7 @@ export default function PrintLayoutModal({
               { name: 'showGrid',   label: 'Coordinate Grid'   },
               { name: 'showCoords', label: 'Extent Coordinates'},
               { name: 'showAttrib', label: 'Attribution'       },
+              { name: 'exportAttributes', label: 'Feature Attributes Table' },
             ].map(({ name, label }) => (
               <Form.Item key={name} name={name} valuePropName="checked" noStyle>
                 <Checkbox style={{ color: '#ccc', fontSize: 12 }}>{label}</Checkbox>
@@ -800,67 +1105,39 @@ export default function PrintLayoutModal({
           </div>
         </Form.Item>
 
-        {legend.length > 0 && (
-          <div style={{ background: '#0a0e1a', border: '1px solid #1a3a5a', borderRadius: 4, padding: '8px 12px' }}>
-            {/* Header row with select-all toggle */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-              <span style={{ color: '#666', fontSize: 11 }}>
-                Legend layers — {enabledNames.size}/{legend.length} selected
-              </span>
-              <Space size={4}>
-                <Button
-                  type="link" size="small"
-                  style={{ fontSize: 11, padding: 0, height: 'auto', color: '#4a8adc' }}
-                  onClick={() => setEnabledNames(new Set(legend.map((l) => l.name)))}
-                >
-                  All
-                </Button>
-                <span style={{ color: '#444' }}>·</span>
-                <Button
-                  type="link" size="small"
-                  style={{ fontSize: 11, padding: 0, height: 'auto', color: '#4a8adc' }}
-                  onClick={() => setEnabledNames(new Set())}
-                >
-                  None
-                </Button>
+        {selectedCount === 0 ? (
+          <Alert
+            type="info"
+            showIcon
+            icon={<SelectOutlined />}
+            message={
+              <Space>
+                <span>All Features Mode</span>
+                <Tag color="blue" style={{ fontSize: 10 }}>No selection</Tag>
               </Space>
-            </div>
-
-            {/* Per-layer checkboxes */}
-            <div style={{ maxHeight: 160, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
-              {legend.map((item) => (
-                <label
-                  key={item.name}
-                  style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer', padding: '2px 0' }}
-                >
-                  <Checkbox
-                    checked={enabledNames.has(item.name)}
-                    onChange={(e) => {
-                      setEnabledNames((prev) => {
-                        const next = new Set(prev)
-                        if (e.target.checked) next.add(item.name)
-                        else next.delete(item.name)
-                        return next
-                      })
-                    }}
-                  />
-                  <span style={{
-                    display: 'inline-block', width: 12, height: 12, flexShrink: 0,
-                    background: item.type === 'raster'
-                      ? 'linear-gradient(135deg, #a0c4e0 50%, #5588aa 50%)'
-                      : item.color,
-                    borderRadius: 2, border: '1px solid rgba(255,255,255,0.2)',
-                  }} />
-                  <span style={{
-                    color: enabledNames.has(item.name) ? '#ccc' : '#555',
-                    fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1,
-                  }}>
-                    {item.name}
-                  </span>
-                </label>
-              ))}
-            </div>
-          </div>
+            }
+            description={
+              <span>
+                No features are selected — the export will include <strong>all visible features</strong> from the current map view.{' '}
+                To export specific features only, close this dialog, use the{' '}
+                <strong>SELECTION</strong> tools (Box Select or Polygon Select) on the left toolbar, then reopen Print/Export.
+              </span>
+            }
+            style={{ marginBottom: 12 }}
+          />
+        ) : (
+          <Alert
+            type="success"
+            showIcon
+            message={
+              <Space>
+                <span>Feature Selection Active</span>
+                <Tag color="green" style={{ fontSize: 10 }}>{selectedCount} feature{selectedCount !== 1 ? 's' : ''}</Tag>
+              </Space>
+            }
+            description={`${selectedCount} feature(s) across ${selectedLayers.length} layer(s) selected. The export will contain only these features with their attributes.`}
+            style={{ marginBottom: 12 }}
+          />
         )}
       </Form>
     </DraggableModal>

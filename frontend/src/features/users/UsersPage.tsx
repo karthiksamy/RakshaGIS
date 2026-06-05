@@ -13,6 +13,7 @@ import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 import { qk } from '@/services/queryKeys'
 import { useAppStore } from '@/app/store'
+import { sha512hex } from '@/utils/crypto'
 import type { User } from '@/types'
 import { ADMIN_ROLES } from '@/types'
 
@@ -43,10 +44,16 @@ export default function UsersPage() {
   })
 
   const saveUser = useMutation({
-    mutationFn: (values: any) =>
-      editingUser
-        ? api.patch(`/accounts/users/${editingUser.id}/`, values)
-        : api.post('/accounts/users/', values),
+    mutationFn: async (values: any) => {
+      const payload = { ...values }
+      if (payload.password) {
+        payload.password_sha512 = await sha512hex(payload.password)
+        delete payload.password
+      }
+      return editingUser
+        ? api.patch(`/accounts/users/${editingUser.id}/`, payload)
+        : api.post('/accounts/users/', payload)
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.users() })
       message.success(editingUser ? t('user.user_updated') : t('user.user_created'))
@@ -75,8 +82,10 @@ export default function UsersPage() {
   })
 
   const changePwd = useMutation({
-    mutationFn: ({ id, new_password }: { id: number; new_password: string }) =>
-      api.post(`/accounts/users/${id}/change-password/`, { new_password }),
+    mutationFn: async ({ id, new_password }: { id: number; new_password: string }) => {
+      const new_password_sha512 = await sha512hex(new_password)
+      return api.post(`/accounts/users/${id}/change-password/`, { new_password_sha512 })
+    },
     onSuccess: () => { message.success(t('common.success')); setPwdModalOpen(false); pwdForm.resetFields() },
     onError: (e: any) => message.error(e?.response?.data?.detail || 'Failed'),
   })

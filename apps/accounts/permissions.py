@@ -8,6 +8,12 @@ class IsSuperAdmin(BasePermission):
         return request.user.is_authenticated and request.user.role == User.SUPERADMIN
 
 
+class IsAnyAdmin(BasePermission):
+    """SUPERADMIN, DEO_ADMIN, CEO_ADMIN, or ADEO_ADMIN."""
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role in User.ADMIN_ROLES
+
+
 class CanManageUsers(BasePermission):
     """
     SUPERADMIN can manage any user.

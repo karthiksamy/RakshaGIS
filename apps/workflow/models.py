@@ -139,3 +139,75 @@ class DisputeReport(models.Model):
 
     def __str__(self):
         return f'DisputeReport({self.survey_area}, {self.status}, {self.checked_at:%Y-%m-%d})'
+
+
+class MapActivityLog(models.Model):
+    """
+    Fine-grained audit trail of every user action on the map.
+    Covers the full lifecycle: viewing → drawing → editing → submission → approval.
+    Used for audit-trail exports attached to survey area submissions.
+    """
+    # ── Action constants ──────────────────────────────────────────────────────
+    VIEW_MAP         = 'VIEW_MAP'
+    SELECT_AREA      = 'SELECT_AREA'
+    TOOL_CHANGE      = 'TOOL_CHANGE'
+    CREATE_FEATURE   = 'CREATE_FEATURE'
+    EDIT_FEATURE     = 'EDIT_FEATURE'
+    DELETE_FEATURE   = 'DELETE_FEATURE'
+    LOCK_FEATURE     = 'LOCK_FEATURE'
+    IMPORT_GIS       = 'IMPORT_GIS'
+    EXPORT_MAP       = 'EXPORT_MAP'
+    SUBMIT_AREA      = 'SUBMIT_AREA'
+    RETURN_AREA      = 'RETURN_AREA'
+    APPROVE_AREA     = 'APPROVE_AREA'
+    PUBLISH_AREA     = 'PUBLISH_AREA'
+
+    ACTION_CHOICES = [
+        (VIEW_MAP,       'Viewed Map'),
+        (SELECT_AREA,    'Selected Survey Area'),
+        (TOOL_CHANGE,    'Changed Map Tool'),
+        (CREATE_FEATURE, 'Created Feature'),
+        (EDIT_FEATURE,   'Edited Feature'),
+        (DELETE_FEATURE, 'Deleted Feature'),
+        (LOCK_FEATURE,   'Locked Feature for Edit'),
+        (IMPORT_GIS,     'Imported GIS Data'),
+        (EXPORT_MAP,     'Exported Map'),
+        (SUBMIT_AREA,    'Submitted Survey Area'),
+        (RETURN_AREA,    'Returned Survey Area'),
+        (APPROVE_AREA,   'Approved Survey Area'),
+        (PUBLISH_AREA,   'Published Survey Area'),
+    ]
+
+    user         = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, related_name='map_activity_logs',
+    )
+    project      = models.ForeignKey(
+        'survey_projects.SurveyProject', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='map_activity_logs',
+    )
+    survey_area  = models.ForeignKey(
+        'survey_projects.SurveyArea', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='map_activity_logs',
+    )
+    action       = models.CharField(max_length=30, choices=ACTION_CHOICES)
+    # Human-readable status label sent from the frontend (e.g. "Drawing Polygon")
+    activity_label = models.CharField(max_length=100, blank=True)
+    feature_id   = models.IntegerField(null=True, blank=True)
+    layer_name   = models.CharField(max_length=100, blank=True)
+    # Extra context: geometry_type, old_status, new_status, tool_key, etc.
+    detail       = models.JSONField(default=dict, blank=True)
+    ip_address   = models.GenericIPAddressField(null=True, blank=True)
+    timestamp    = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['user', 'timestamp']),
+            models.Index(fields=['project', 'timestamp']),
+            models.Index(fields=['survey_area', 'timestamp']),
+            models.Index(fields=['action', 'timestamp']),
+        ]
+
+    def __str__(self):
+        return f'{self.action} by {self.user} @ {self.timestamp:%Y-%m-%d %H:%M}'

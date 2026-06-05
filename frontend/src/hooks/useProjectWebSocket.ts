@@ -18,6 +18,7 @@ export interface CollabUser {
   id: number
   name: string
   color: string
+  activity: string   // current activity label e.g. "Viewing", "Drawing Polygon"
 }
 
 export type CollabEventType =
@@ -91,6 +92,20 @@ export function useProjectWebSocket(projectId: number | null) {
     send({ type: 'cursor', lng, lat })
   }, [send])
 
+  const sendActivity = useCallback((
+    activity: string,
+    opts?: { toolKey?: string; projectId?: number | null; surveyAreaId?: number | null; surveyAreaName?: string }
+  ) => {
+    send({
+      type: 'activity_update',
+      activity,
+      tool_key: opts?.toolKey ?? '',
+      project_id: opts?.projectId ?? null,
+      survey_area_id: opts?.surveyAreaId ?? null,
+      survey_area_name: opts?.surveyAreaName ?? '',
+    })
+  }, [send])
+
   // Main connection logic
   useEffect(() => {
     if (!projectId || !user) return
@@ -141,7 +156,9 @@ export function useProjectWebSocket(projectId: number | null) {
 
         switch (msg.type) {
           case 'room_state':
-            setPresenceUsers(msg.users ?? [])
+            setPresenceUsers(
+              (msg.users ?? []).map((u: any) => ({ ...u, activity: u.activity ?? 'Viewing' }))
+            )
             setLockedFeatures(new Map(
               Object.entries(msg.locked_features ?? {}).map(([fid, u]) => [parseInt(fid), u as CollabUser])
             ))
@@ -149,11 +166,18 @@ export function useProjectWebSocket(projectId: number | null) {
 
           case 'presence':
             setPresenceUsers(prev => {
+              const user = { ...msg.user, activity: msg.user.activity ?? 'Viewing' }
               if (msg.event === 'joined') {
-                return prev.some(u => u.id === msg.user.id) ? prev : [...prev, msg.user]
+                return prev.some(u => u.id === user.id) ? prev : [...prev, user]
               }
-              return prev.filter(u => u.id !== msg.user.id)
+              return prev.filter(u => u.id !== user.id)
             })
+            break
+
+          case 'presence_activity':
+            setPresenceUsers(prev =>
+              prev.map(u => u.id === msg.user_id ? { ...u, activity: msg.activity } : u)
+            )
             break
 
           case 'feature_locked':
@@ -209,5 +233,6 @@ export function useProjectWebSocket(projectId: number | null) {
     lockFeature,
     unlockFeature,
     sendCursor,
+    sendActivity,
   }
 }

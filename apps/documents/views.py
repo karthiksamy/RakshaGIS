@@ -193,6 +193,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.error(f"Failed to watermark uploaded document: {wexc}")
+                file.seek(0)
                 file_size = file.size
         serializer.save(
             uploaded_by=self.request.user,
@@ -492,6 +493,17 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         if oo_status in (2, 6):
             download_url = body.get('url', '')
+            if download_url:
+                # If OnlyOffice is running behind docker, the callback url may contain localhost or public domain/IP.
+                # Since Django runs in the 'web' container, it cannot resolve localhost/public IP to OnlyOffice.
+                # We rewrite the URL to use the internal docker hostname 'onlyoffice'.
+                if '/onlyoffice/cache/files/' in download_url:
+                    parts = download_url.split('/onlyoffice/cache/files/', 1)
+                    download_url = f"http://onlyoffice/cache/files/{parts[1]}"
+                elif '://localhost/cache/files/' in download_url or '://127.0.0.1/cache/files/' in download_url:
+                    import re
+                    download_url = re.sub(r'://[^/]+', '://onlyoffice', download_url)
+
             doc = Document.objects.filter(pk=pk).first()
             if not doc:
                 logger.error("OnlyOffice callback: document %s not found", pk)
@@ -535,8 +547,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
             try:
                 doc.file.save(fname, ContentFile(content), save=False)
+                doc.file_size = len(content)
                 doc.version += 1
-                doc.save(update_fields=['file', 'version'])
+                doc.save(update_fields=['file', 'version', 'file_size'])
                 logger.info("OnlyOffice persisted doc %s -> version %s (%d bytes)",
                             pk, doc.version, len(content))
             except Exception as exc:
@@ -667,6 +680,38 @@ class DocumentViewSet(viewsets.ModelViewSet):
         doc.file.save(filename, ContentFile(buf_content), save=True)
 
         return Response({'doc_id': doc.id, 'title': doc.title}, status=201)
+
+    @action(detail=True, methods=['get'], url_path='download',
+            permission_classes=[permissions.IsAuthenticated])
+    def download(self, request, pk=None):
+        """
+        GET /api/documents/{id}/download/
+
+        Serve the document file with Content-Disposition: attachment so the
+        browser always prompts a file download regardless of content type.
+        Requires authentication — avoids unauthenticated direct-media access.
+        """
+        import mimetypes
+        doc = self.get_object()
+        if not doc.file:
+            raise Http404
+
+        try:
+            file_obj = doc.file.open('rb')
+        except Exception:
+            raise Http404
+
+        filename = doc.file.name.rsplit('/', 1)[-1]
+        content_type = doc.mime_type or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+
+        response = FileResponse(file_obj, content_type=content_type)
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        try:
+            response['Content-Length'] = doc.file.size
+        except Exception:
+            if doc.file_size:
+                response['Content-Length'] = doc.file_size
+        return response
 
     @action(detail=False, methods=['post'], url_path='verify-watermark',
             permission_classes=[permissions.IsAuthenticated])

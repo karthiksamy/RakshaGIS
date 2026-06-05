@@ -1,3 +1,4 @@
+from django.contrib.auth.hashers import make_password
 from rest_framework import serializers
 from .models import Organisation, User, UserSession, LoginAuditLog, ExportAuditLog
 
@@ -32,7 +33,7 @@ class OrganisationSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     organisation_name = serializers.CharField(source='organisation.name', read_only=True)
     full_name = serializers.SerializerMethodField()
-    password = serializers.CharField(write_only=True, required=False)
+    password_sha512 = serializers.CharField(write_only=True, required=False)
 
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
@@ -42,24 +43,26 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'username', 'first_name', 'last_name', 'full_name', 'email',
             'employee_id', 'role', 'organisation', 'organisation_name',
-            'phone', 'designation', 'is_active', 'password',
+            'phone', 'designation', 'is_active', 'password_sha512',
         ]
         read_only_fields = ['id']
 
+    def _apply_password(self, user, pw_sha512):
+        if pw_sha512:
+            user.sha512_password = pw_sha512
+            user.password = make_password(pw_sha512)
+            user.save(update_fields=['password', 'sha512_password'])
+
     def create(self, validated_data):
-        password = validated_data.pop('password', None)
+        pw_sha512 = validated_data.pop('password_sha512', None)
         user = super().create(validated_data)
-        if password:
-            user.set_password(password)
-            user.save()
+        self._apply_password(user, pw_sha512)
         return user
 
     def update(self, instance, validated_data):
-        password = validated_data.pop('password', None)
+        pw_sha512 = validated_data.pop('password_sha512', None)
         user = super().update(instance, validated_data)
-        if password:
-            user.set_password(password)
-            user.save()
+        self._apply_password(user, pw_sha512)
         return user
 
 

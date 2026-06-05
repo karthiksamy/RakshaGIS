@@ -197,8 +197,42 @@ do_start() {
     echo -e "  ${GREEN}✓ Monitoring started${RESET}"
   fi
 
+  # ── Wait for the web service to actually serve HTTP ──────────────────────
+  # On Windows/WSL2 boot the web container runs migrations + collectstatic before
+  # it starts accepting requests.  Poll until we get an HTTP response so the
+  # operator isn't greeted with a "login failed" screen.
   echo ""
-  echo -e "  ${GREEN}✓ RakshaGIS is running at http://localhost${RESET}"
+  echo -n ">>> Waiting for web service"
+  _WEB_ATTEMPTS=0
+  _WEB_MAX=90   # 90 × 2 s = 3 minutes
+  _WEB_OK=false
+  while [[ "$_WEB_ATTEMPTS" -lt "$_WEB_MAX" ]]; do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost/ 2>/dev/null || echo "000")
+    if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" || "$HTTP_CODE" == "301" ]]; then
+      _WEB_OK=true
+      break
+    fi
+    # Also check if the container exited (crash loop)
+    WEB_STATE=$($COMPOSE ps web --format "{{.Status}}" 2>/dev/null | head -1)
+    if echo "$WEB_STATE" | grep -qi "exited\|error"; then
+      echo ""
+      echo -e "  ${RED}✗ Web container exited unexpectedly.${RESET}"
+      echo "    Check logs:  ./RakshaGIS.sh logs web"
+      return 1
+    fi
+    _WEB_ATTEMPTS=$((_WEB_ATTEMPTS + 1))
+    echo -n "."
+    sleep 2
+  done
+  echo ""
+
+  if [[ "$_WEB_OK" == "true" ]]; then
+    echo -e "  ${GREEN}✓ RakshaGIS is ready at http://localhost${RESET}"
+  else
+    echo -e "  ${YELLOW}⚠  Web service is still starting up (migrations may still be running).${RESET}"
+    echo "    Check status:  ./RakshaGIS.sh logs web"
+    echo "    Try again in a moment:  http://localhost"
+  fi
   echo "  Admin: http://localhost/admin/"
   echo ""
   echo -e "  ${CYAN}Go to Settings → AI Config to activate an AI backend.${RESET}"

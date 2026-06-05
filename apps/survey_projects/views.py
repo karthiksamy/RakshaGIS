@@ -279,7 +279,7 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'], url_path='export')
     def export(self, request, pk=None):
-        """Export project features in various formats."""
+        """Export project features in various formats (legacy GeoJSON/CSV/Shapefile)."""
         project = self.get_object()
         fmt = request.query_params.get('format', 'geojson').lower()
         layer_name = request.query_params.get('layer_name', None)
@@ -292,6 +292,64 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
             qs = qs.filter(folder_id=folder_id)
 
         return _export_features(qs, project, fmt)
+
+    @action(detail=True, methods=['post'], url_path='export-full')
+    def export_full(self, request, pk=None):
+        """
+        POST /api/projects/{id}/export-full/
+
+        Queue an async export of the COMPLETE project:
+          • All survey areas with their GIS features, documents, rasters,
+            and uploaded shapefile ZIPs
+          • C2PA / LP-DNA watermarks applied to every file
+          • provenance.json manifest
+
+        Returns: { task_uuid, status, message }
+        Poll GET /api/core/export/status/{task_uuid}/ until status=='DONE'.
+        Download via GET /api/core/export/download/{task_uuid}/.
+        """
+        from django.http import JsonResponse
+        from apps.core.models import ExportTask
+        from apps.core.tasks import build_export_zip
+        from django.conf import settings as _settings
+
+        project = self.get_object()
+        user = request.user
+        org_id = getattr(user, 'organisation_id', None)
+
+        active_statuses = (ExportTask.PENDING, ExportTask.RUNNING)
+        _max_user = getattr(_settings, 'EXPORT_MAX_CONCURRENT_PER_USER', 2)
+        _max_org  = getattr(_settings, 'EXPORT_MAX_CONCURRENT_PER_ORG', 3)
+
+        if ExportTask.objects.filter(requested_by=user, status__in=active_statuses).count() >= _max_user:
+            return JsonResponse({
+                'error': 'Too many active exports',
+                'detail': 'Wait for your current export(s) to finish before starting another.',
+            }, status=429)
+
+        if org_id and ExportTask.objects.filter(
+            organisation_id=org_id, status__in=active_statuses
+        ).count() >= _max_org:
+            return JsonResponse({
+                'error': 'Office export limit reached',
+                'detail': 'Your office has too many exports running. Please wait.',
+            }, status=429)
+
+        et = ExportTask.objects.create(
+            export_type=ExportTask.PROJECT,
+            object_id=project.id,
+            object_name=project.project_number or str(project.id),
+            requested_by=user,
+            organisation_id=org_id,
+            progress_msg='Queued…',
+        )
+        build_export_zip.delay(et.pk)
+
+        return JsonResponse({
+            'task_uuid': str(et.task_uuid),
+            'status': et.status,
+            'message': 'Full project export queued.',
+        }, status=202)
 
 
 class GISFeatureViewSet(viewsets.ModelViewSet):
@@ -322,6 +380,10 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
             )
             if org_id:
                 areas = areas.filter(project__organisation_id=org_id)
+            # Narrow to a single survey area when the map browser drills down
+            area_id = self.request.query_params.get('area')
+            if area_id:
+                areas = areas.filter(id=area_id)
             folder_ids: list[int] = []
             for a in areas.only('folder_id'):
                 folder_ids.extend(_get_subtree_folder_ids(a.folder_id))
@@ -329,6 +391,24 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
                 return base_qs.none()
             return own_qs.filter(folder_id__in=folder_ids)
         if user.is_superadmin or user.role == 'PDDE_VIEWER':
+            # When browsing a specific office via the field browser, filter to
+            # that office's PUBLISHED survey area features only.
+            if org_id:
+                from apps.survey_projects.models import SurveyArea as _SA
+                areas = _SA.objects.filter(
+                    status=_SA.PUBLISHED, map_enabled=True,
+                    project__map_enabled=True, folder__isnull=False,
+                    project__organisation_id=org_id,
+                )
+                area_id = self.request.query_params.get('area')
+                if area_id:
+                    areas = areas.filter(id=area_id)
+                folder_ids: list[int] = []
+                for a in areas.only('folder_id'):
+                    folder_ids.extend(_get_subtree_folder_ids(a.folder_id))
+                if not folder_ids:
+                    return base_qs.none()
+                return base_qs.filter(folder_id__in=folder_ids, is_deleted=False)
             return own_qs
         # Include features from approved cross-org areas (in their folder subtrees)
         approved_area_ids = get_approved_area_ids(user)
@@ -1263,6 +1343,18 @@ def _convert_to_pdf_via_onlyoffice(doc, project, doc_folder, user, report_title,
                     pdf_content = pdf_resp.read()
                 
                 pdf_filename = docx_filename.replace('.docx', '.pdf')
+                try:
+                    from apps.core.watermark import embed_watermark
+                    wm_meta = {
+                        "project_id": project.id,
+                        "project_number": project.project_number,
+                        "title": f'{report_title} (PDF)',
+                        "uploaded_by": user.username,
+                        "export_format": "pdf",
+                    }
+                    pdf_content = embed_watermark(pdf_content, pdf_filename, 'application/pdf', wm_meta)
+                except Exception:
+                    pass
                 pdf_doc = Document.objects.create(
                     project=project,
                     folder=doc_folder,
@@ -1613,21 +1705,39 @@ def _build_survey_report(area, user, include_features=True, include_photos=True,
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
+    docx_bytes = buf.read()
 
     report_title = f'Survey Report — {area.name}'
     safe_name = area.name.replace('/', '_').replace(' ', '_')
     docx_filename = f'survey_report_{safe_name}_{date.today().isoformat()}.docx'
+
+    try:
+        from apps.core.watermark import embed_watermark
+        wm_meta = {
+            "project_id": project.id,
+            "project_number": project.project_number,
+            "title": report_title,
+            "uploaded_by": user.username,
+            "export_format": "docx",
+        }
+        docx_bytes = embed_watermark(
+            docx_bytes, docx_filename,
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            wm_meta,
+        )
+    except Exception:
+        pass
 
     db_doc = Document.objects.create(
         project=project,
         folder=doc_folder,
         title=report_title,
         category=Document.SURVEY_REPORT,
-        file_size=buf.getbuffer().nbytes,
+        file_size=len(docx_bytes),
         mime_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         uploaded_by=user,
     )
-    db_doc.file.save(docx_filename, ContentFile(buf.read()), save=True)
+    db_doc.file.save(docx_filename, ContentFile(docx_bytes), save=True)
 
     result = {
         'doc_id':   db_doc.id,
@@ -1695,6 +1805,14 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(project__organisation_id=org_id)
             return qs
         if user.is_superadmin or user.role == 'PDDE_VIEWER':
+            # Field-browser: when a specific office is passed, return only its
+            # PUBLISHED survey areas — same scope as DGDE/PDDE office browsing.
+            if org_id:
+                return SurveyArea.objects.filter(
+                    status=SurveyArea.PUBLISHED, map_enabled=True,
+                    project__map_enabled=True,
+                    project__organisation_id=org_id,
+                )
             return own_qs
         # Also include survey areas shared via ProjectShare or SurveyAreaAccessRequest
         shared_project_ids = get_shared_project_ids(user)
@@ -1860,6 +1978,67 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
                 # CASCADE on ProjectLayerFolder.parent removes the whole subtree.
                 ProjectLayerFolder.objects.filter(pk=root_folder.pk).delete()
 
+    @action(detail=True, methods=['post'], url_path='export',
+            permission_classes=[permissions.IsAuthenticated])
+    def export(self, request, pk=None):
+        """
+        POST /api/projects/survey-areas/{id}/export/
+
+        Queue an async export of ALL data for this survey area:
+          • GIS features (per-layer Shapefiles, EPSG:4326)
+          • Documents (C2PA / LP-DNA watermarked)
+          • GeoTIFF rasters (C2PA watermarked)
+          • Uploaded shapefile ZIPs
+          • provenance.json manifest
+
+        Returns: { task_uuid, status, message }
+        Poll GET /api/core/export/status/{task_uuid}/ until status=='DONE',
+        then download via GET /api/core/export/download/{task_uuid}/.
+        """
+        from django.http import JsonResponse
+        from apps.core.models import ExportTask
+        from apps.core.tasks import build_export_zip
+
+        area = self.get_object()
+        user = request.user
+        org_id = getattr(user, 'organisation_id', None)
+
+        active_statuses = (ExportTask.PENDING, ExportTask.RUNNING)
+        _max_user = getattr(__import__('django.conf', fromlist=['settings']).settings,
+                            'EXPORT_MAX_CONCURRENT_PER_USER', 2)
+        _max_org  = getattr(__import__('django.conf', fromlist=['settings']).settings,
+                            'EXPORT_MAX_CONCURRENT_PER_ORG', 3)
+
+        if ExportTask.objects.filter(requested_by=user, status__in=active_statuses).count() >= _max_user:
+            return JsonResponse({
+                'error': 'Too many active exports',
+                'detail': 'Wait for your current export(s) to finish before starting another.',
+            }, status=429)
+
+        if org_id and ExportTask.objects.filter(
+            organisation_id=org_id, status__in=active_statuses
+        ).count() >= _max_org:
+            return JsonResponse({
+                'error': 'Office export limit reached',
+                'detail': 'Your office has too many exports running. Please wait.',
+            }, status=429)
+
+        et = ExportTask.objects.create(
+            export_type=ExportTask.SURVEY_AREA,
+            object_id=area.id,
+            object_name=area.name,
+            requested_by=user,
+            organisation_id=org_id,
+            progress_msg='Queued…',
+        )
+        build_export_zip.delay(et.pk)
+
+        return JsonResponse({
+            'task_uuid': str(et.task_uuid),
+            'status': et.status,
+            'message': 'Export queued.',
+        }, status=202)
+
     @action(detail=True, methods=['post'], url_path='generate-report',
             permission_classes=[permissions.IsAuthenticated])
     def generate_report(self, request, pk=None):
@@ -1944,6 +2123,23 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
         safe_name = ''.join(c if c.isalnum() or c in '-_ ' else '_' for c in area.name)
         filename = f'report_{safe_name}.docx'
 
+        try:
+            from apps.core.watermark import embed_watermark
+            wm_meta = {
+                "project_id": area.project_id,
+                "project_number": area.project.project_number if area.project else None,
+                "title": title,
+                "uploaded_by": user.username,
+                "export_format": "docx",
+            }
+            buf_content = embed_watermark(
+                buf_content, filename,
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                wm_meta,
+            )
+        except Exception:
+            pass
+
         db_doc = Doc(
             project=area.project,
             folder=doc_folder,
@@ -2009,13 +2205,32 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
 
         safe_name = ''.join(c if c.isalnum() or c in '-_ ' else '_' for c in area.name)
         title = f'DGDE Survey Report — {area.name}'
+        docx_filename = f'survey_report_{safe_name}.docx'
+
+        try:
+            from apps.core.watermark import embed_watermark
+            wm_meta = {
+                "project_id": area.project_id,
+                "project_number": area.project.project_number if area.project else None,
+                "title": title,
+                "uploaded_by": user.username,
+                "export_format": "docx",
+            }
+            content = embed_watermark(
+                content, docx_filename,
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                wm_meta,
+            )
+        except Exception:
+            pass
+
         db_doc = Doc(
             project=area.project, folder=doc_folder, title=title, category='REPORT',
             file_size=len(content),
             mime_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             uploaded_by=user,
         )
-        db_doc.file.save(f'survey_report_{safe_name}.docx', ContentFile(content), save=True)
+        db_doc.file.save(docx_filename, ContentFile(content), save=True)
         return Response({
             'doc_id': db_doc.id,
             'file_url': request.build_absolute_uri(db_doc.file.url) if db_doc.file else None,

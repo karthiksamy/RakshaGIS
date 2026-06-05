@@ -32,6 +32,8 @@ const QGISSyncPage           = lazy(() => import('@/features/qgis-sync/QGISSyncP
 const AIConfigPage           = lazy(() => import('@/features/ai-config/AIConfigPage'))
 const ExternalDatabasePage   = lazy(() => import('@/features/admin/ExternalDatabasePage'))
 const AccessRequestsPage = lazy(() => import('@/features/projects/AccessRequestsPage'))
+const ProvenanceVerifyPage = lazy(() => import('@/features/provenance/ProvenanceVerifyPage'))
+const DroneDatasetsPage = lazy(() => import('@/features/drone/DroneDatasetsPage'))
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const user = useAppStore((s) => s.user)
@@ -78,6 +80,7 @@ export default function AppRoutes() {
           <Route path="master/villages" element={<VillageMasterPage />} />
           <Route path="master/boundary-import" element={<BoundaryImportPage />} />
           <Route path="terrain" element={<TerrainPage />} />
+          <Route path="drone" element={<DroneDatasetsPage />} />
           <Route path="ai-vision" element={<BoundaryExtractionPage />} />
           <Route path="boundary-review/:jobId" element={<BoundaryReviewPage />} />
           <Route path="backups" element={<BackupPage />} />
@@ -85,6 +88,7 @@ export default function AppRoutes() {
           <Route path="settings/ai-config"     element={<AIConfigPage />} />
           <Route path="settings/external-data" element={<ExternalDatabasePage />} />
           <Route path="qgis-sync" element={<QGISSyncPage />} />
+          <Route path="verify" element={<ProvenanceVerifyPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

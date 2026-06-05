@@ -40,7 +40,7 @@ import {
   Tabs, Badge, Form, Radio, Collapse, Segmented, Dropdown, Checkbox, AutoComplete, Spin,
 } from 'antd'
 import {
-  DragOutlined, AimOutlined, EditOutlined,
+  DragOutlined, AimOutlined, EditOutlined, InfoCircleOutlined,
   RadiusSettingOutlined, ColumnHeightOutlined,
   ZoomInOutlined, ZoomOutOutlined, GlobalOutlined,
   BarsOutlined, ColumnWidthOutlined, RadiusUpleftOutlined,
@@ -56,7 +56,7 @@ import {
   HistoryOutlined, RetweetOutlined,
   SearchOutlined, NodeIndexOutlined, FunctionOutlined, SisternodeOutlined,
   RadiusUprightOutlined, MinusCircleOutlined, FileAddOutlined, UploadOutlined,
-  CloudServerOutlined,
+  CloudServerOutlined, BankOutlined,
 } from '@ant-design/icons'
 import TileWMS from 'ol/source/TileWMS'
 import HeatmapLayer from 'ol/layer/Heatmap'
@@ -79,6 +79,7 @@ import { resolveExtStyle, type ExtStyleResolved } from './extStyle'
 import DraggableModal from '@/components/DraggableModal'
 import NewLayerModal from './NewLayerModal'
 import ImportGISModal from './ImportGISModal'
+import FieldOfficeBrowserModal from './FieldOfficeBrowserModal'
 import 'ol/ol.css'
 
 const INDIA_CENTER = fromLonLat([78.9629, 22.5937])
@@ -190,7 +191,7 @@ function getLayerStyle(styles: Record<string, LayerStyle>, ln: string): LayerSty
 
 const PRIMARY_TOOLS = [
   { key: 'pan',      icon: <DragOutlined />,    label: 'Pan / Navigate',   desc: 'Drag to pan the map' },
-  { key: 'identify', icon: <AimOutlined />,     label: 'Identify Feature', desc: 'Click a feature to view its attributes' },
+  { key: 'identify', icon: <InfoCircleOutlined />, label: 'Identify Feature (Info)', desc: 'Click a feature to view its attributes' },
 ]
 
 const SELECT_TOOLS = [
@@ -233,8 +234,40 @@ const EDIT_TOOLS = [
 const BASE_TOOL_BUTTONS = [...PRIMARY_TOOLS, ...SELECT_TOOLS, ...MEASURE_TOOLS]
 const DRAW_TOOL_BUTTONS = [...DRAW_TOOLS, ...EDIT_TOOLS]
 
+// Human-readable activity labels broadcast to collaborators and stored in audit logs
+const TOOL_ACTIVITY_LABEL: Record<string, string> = {
+  pan:              'Viewing',
+  identify:         'Identifying Feature',
+  box_select:       'Box Selecting',
+  select_location:  'Selecting by Polygon',
+  coord_picker:     'Picking Coordinates',
+  measure:          'Measuring',
+  buffer:           'Buffer Analysis',
+  draw_point:       'Drawing Point',
+  draw_line:        'Drawing Line',
+  draw_polygon:     'Drawing Polygon',
+  vertex_tool:      'Editing Vertices',
+  move_feature:     'Moving Feature',
+  copy_move:        'Copying Feature',
+  rotate_feature:   'Rotating Feature',
+  scale_feature:    'Scaling Feature',
+  simplify_feature: 'Simplifying Geometry',
+  add_part:         'Adding Part',
+  delete_part:      'Deleting Part',
+  reshape_feature:  'Reshaping Feature',
+  offset_curve:     'Offsetting Curve',
+  reverse_line:     'Reversing Line',
+  trim_extend:      'Trimming / Extending',
+  split_feature:    'Splitting Feature',
+  split_parts:      'Exploding Parts',
+  merge_features:   'Merging Features',
+  merge_attributes: 'Merging Attributes',
+  delete_feature:   'Deleting Feature',
+}
+
 function makeBasemapSource(bm: BasemapConfig | null) {
   if (!bm || bm.provider === 'OSM') return new OSM()
+  if (bm.provider === 'LOCAL_COG') return new OSM()  // hidden when LOCAL_COG active; placeholder
   return new XYZ({ url: bm.url_template, crossOrigin: 'anonymous' })
 }
 
@@ -366,6 +399,7 @@ export default function MapPage() {
   const mapRef = useRef<HTMLDivElement>(null)
   const mapInstance = useRef<Map | null>(null)
   const basemapLayer = useRef<TileLayer<OSM | XYZ> | null>(null)
+  const cogBasemapLayer = useRef<WebGLTileLayer | null>(null)
   const projectLayer = useRef<VectorLayer<VectorSource> | null>(null)
   const projectSource = useRef<VectorSource | null>(null)  // exposed for collab updates
   const selectLayer = useRef<VectorLayer<VectorSource> | null>(null)
@@ -397,6 +431,14 @@ export default function MapPage() {
   const [extVisibleIds, setExtVisibleIds] = useState<Set<string>>(new Set())
   // Classification legends for visible external layers, keyed by 'ext:{id}'
   const [extClassLegends, setExtClassLegends] = useState<Record<string, ExtClassLegend>>({})
+  const [legendPanelCollapsed, setLegendPanelCollapsed] = useState(true)
+
+  // ── GIS Server layers (gsrv: = vector WFS/ArcGIS Feature, wms: = tile WMS/WMTS) ──
+  const gsrvLayerRefs = useRef<Record<string, VectorLayer<VectorSource>>>({})
+  const gsrvMoveKeys  = useRef<Record<string, any>>({})
+  const gsrvTileRefs  = useRef<Record<string, TileLayer<TileWMS>>>({})
+  const [gsrvVisibleIds, setGsrvVisibleIds] = useState<Set<string>>(new Set())
+  const [gsrvClassLegends, setGsrvClassLegends] = useState<Record<string, ExtClassLegend>>({})
   // New shapes drawn by a CEO/ADEO surveyor can be shared with the parent DEO (default Yes).
   const [deoVisible, setDeoVisible] = useState(true)
   const deoVisibleRef = useRef(true)
@@ -417,6 +459,10 @@ export default function MapPage() {
     selectedFolderId, setSelectedFolderId,
     user,
   } = useAppStore()
+  const mapToolRef = useRef(mapTool)
+  useEffect(() => {
+    mapToolRef.current = mapTool
+  }, [mapTool])
   const canDraw = user ? DRAW_ROLES.includes(user.role) : false
   const isCantonmentUploader = user?.role === 'SURVEYOR'
   const [selectedAreaStatus, setSelectedAreaStatus] = useState<string | null>(null)
@@ -424,12 +470,13 @@ export default function MapPage() {
   // DGDE/PDDE (national/command) get a simplified, read-only viewer: pick an office,
   // see only its PUBLISHED layers with basic controls. No draw/edit tools or feature lists.
   const simplified = user?.organisation_level === 'DGDE' || user?.organisation_level === 'PDDE'
+  // SUPERADMIN also gets the field-office browser so they can inspect any office's published data.
+  const showFieldBrowser = simplified || user?.role === 'SUPERADMIN'
   const [officeFilter, setOfficeFilter] = useState<number | null>(null)
-  const { data: officeOptions = [] } = useQuery<any[]>({
-    queryKey: ['map-offices'],
-    queryFn: () => api.get('/accounts/organisations/').then(r => r.data.results ?? r.data),
-    enabled: simplified,
-  })
+  // Rich drill-down state for DGDE/PDDE/SUPERADMIN field office browser
+  const [fieldBrowserOpen, setFieldBrowserOpen] = useState(false)
+  const [selectedFieldOrg, setSelectedFieldOrg] = useState<{ id: number; name: string; level: string } | null>(null)
+  const [selectedFieldArea, setSelectedFieldArea] = useState<{ id: number; name: string } | null>(null)
 
   // ── Real-time collaboration ─────────────────────────────────────────────────
   const {
@@ -441,6 +488,7 @@ export default function MapPage() {
     sendFeatureCreated: wsSendCreated,
     sendFeatureUpdated: wsSendUpdated,
     sendFeatureDeleted: wsSendDeleted,
+    sendActivity: wsSendActivity,
   } = useProjectWebSocket(selectedProjectId)
   // isReadOnly and toolButtons are computed after surveyAreas / flatFolders queries below
   const [searchParams, setSearchParams] = useSearchParams()
@@ -471,6 +519,7 @@ export default function MapPage() {
   const pendingMoveRef = useRef(false)
   // Survey-area-wise map mode: null = "All Areas" overview (read-only)
   const [selectedSurveyAreaId, setSelectedSurveyAreaId] = useState<number | null>(null)
+  const [areaSearch, setAreaSearch] = useState('')
 
   // Draw layer chooser
   const [drawLayerModal, setDrawLayerModal] = useState(false)
@@ -748,19 +797,22 @@ export default function MapPage() {
   })
 
   const { data: mapFeatures = [] } = useQuery<GISFeature[]>({
-    queryKey: ['map-features', simplified ? `org:${officeFilter}` : selectedProjectId],
+    queryKey: ['map-features', showFieldBrowser
+      ? `org:${officeFilter}:area:${selectedFieldArea?.id ?? ''}`
+      : selectedProjectId],
     queryFn: () => {
-      // DGDE/PDDE: load the picked office's PUBLISHED features (backend enforces status).
-      if (simplified) {
-        return officeFilter
-          ? api.get(`/projects/features/?organisation=${officeFilter}&is_deleted=false`).then((r) => r.data.results ?? r.data)
-          : Promise.resolve([])
+      // DGDE/PDDE/SUPERADMIN: load the picked office's PUBLISHED features.
+      if (showFieldBrowser) {
+        if (!officeFilter) return Promise.resolve([])
+        const params: Record<string, unknown> = { organisation: officeFilter, is_deleted: false }
+        if (selectedFieldArea) params.area = selectedFieldArea.id
+        return api.get('/projects/features/', { params }).then((r) => r.data.results ?? r.data)
       }
       return selectedProjectId
         ? api.get(`/projects/features/?project=${selectedProjectId}&is_deleted=false`).then((r) => r.data.results ?? r.data)
         : Promise.resolve([])
     },
-    enabled: simplified ? !!officeFilter : !!selectedProjectId,
+    enabled: showFieldBrowser ? !!officeFilter : !!selectedProjectId,
   })
 
   const rawLayerNames = useMemo(
@@ -876,6 +928,9 @@ export default function MapPage() {
 
     const bm = new TileLayer({ source: new OSM(), zIndex: 0 })
     basemapLayer.current = bm
+    // Dedicated WebGL layer for LOCAL_COG basemaps — no source until one is selected
+    const cogBm = new WebGLTileLayer({ zIndex: 0, visible: false })
+    cogBasemapLayer.current = cogBm
 
     const boundaryLayer = new VectorTileLayer({
       source: new VectorTileSource({
@@ -1002,6 +1057,8 @@ export default function MapPage() {
 
     // Enhanced click handler that works with all layers including external layers
     const handleMapClick = (e: any) => {
+      if (mapToolRef.current !== 'identify') return
+
       const pixel = e.pixel
       let featureFound = false
 
@@ -1045,38 +1102,12 @@ export default function MapPage() {
       })
     }
 
-    const identifySelect = new SelectInteraction({
-      condition: click,
-      layers: [vl],
-      style: new Style({
-        fill: new Fill({ color: 'rgba(21,101,192,0.3)' }),
-        stroke: new Stroke({ color: '#1565c0', width: 2.5 }),
-        image: new CircleStyle({
-          radius: 7,
-          fill: new Fill({ color: '#1565c0' }),
-          stroke: new Stroke({ color: '#fff', width: 1.5 }),
-        }),
-      }),
-    })
-    identifySelect.on('select', (e) => {
-      if (e.selected.length > 0) {
-        const props = e.selected[0].getProperties()
-        const displayProps: Record<string, unknown> = { ...props }
-        delete displayProps.geometry
-        const layerLabel = displayProps.layer_name ? String(displayProps.layer_name) : 'Feature'
-        setFeatureInfo(displayProps)
-        setFeatureModalMeta({ layerLabel, layerType: 'project' })
-        setDrawerOpen(true)
-      }
-    })
-
     const map = new Map({
       target: mapRef.current,
-      layers: [bm, boundaryLayer, vl, selLayer, ml, bl],
+      layers: [bm, cogBm, boundaryLayer, vl, selLayer, ml, bl],
       view: new View({ center: INDIA_CENTER, zoom: 5 }),
       controls: defaultControls({ zoom: false }).extend([new ScaleLine({ units: 'metric' })]),
     })
-    map.addInteraction(identifySelect)
     
     // Add generic click handler for external layers and other features
     map.on('singleclick', handleMapClick)
@@ -1144,10 +1175,29 @@ export default function MapPage() {
     })()
   }, [])
 
-  // Update basemap
+  // Update basemap — toggle between TileLayer (OSM/XYZ) and WebGLTileLayer (LOCAL_COG)
   useEffect(() => {
-    if (!basemapLayer.current) return
-    basemapLayer.current.setSource(makeBasemapSource(activeBasemap))
+    if (!basemapLayer.current || !cogBasemapLayer.current) return
+    const bm = activeBasemap as any
+    if (bm?.provider === 'LOCAL_COG' && bm?.cog_url && bm?.cog_status === 'DONE') {
+      // Switch to COG WebGL layer
+      basemapLayer.current.setVisible(false)
+      cogBasemapLayer.current.setSource(new GeoTIFFSource({ sources: [{ url: bm.cog_url }] }))
+      cogBasemapLayer.current.setVisible(true)
+      // Fly to bounds if available
+      if (bm.bounds_west != null && mapInstance.current) {
+        mapInstance.current.getView().fit(
+          [...fromLonLat([bm.bounds_west, bm.bounds_south]),
+           ...fromLonLat([bm.bounds_east, bm.bounds_north])],
+          { duration: 600, padding: [20, 20, 20, 20] }
+        )
+      }
+    } else {
+      // Normal tile basemap
+      cogBasemapLayer.current.setVisible(false)
+      basemapLayer.current.setSource(makeBasemapSource(activeBasemap))
+      basemapLayer.current.setVisible(true)
+    }
   }, [activeBasemap])
 
   useEffect(() => {
@@ -1272,9 +1322,9 @@ export default function MapPage() {
     })
   }, [visibleFeatures])
 
-  // Simplified DGDE/PDDE viewer: frame the picked office's published features once loaded.
+  // Field-browser users (DGDE/PDDE/SUPERADMIN): frame the picked office's features once loaded.
   useEffect(() => {
-    if (!simplified) return
+    if (!showFieldBrowser) return
     const src = projectLayer.current?.getSource()
     const map = mapInstance.current
     if (!src || !map || visibleFeatures.length === 0) return
@@ -1283,7 +1333,37 @@ export default function MapPage() {
       map.getView().fit(ext, { padding: [60, 60, 60, 60], maxZoom: 17, duration: 500 })
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [simplified, officeFilter, visibleFeatures.length])
+  }, [showFieldBrowser, officeFilter, selectedFieldArea?.id, visibleFeatures.length])
+
+  // Broadcast activity status to collaborators whenever the map tool or survey area changes.
+  // Also logs VIEW_MAP + SELECT_AREA events to the REST audit trail.
+  useEffect(() => {
+    if (!collabConnected) return
+    const label = TOOL_ACTIVITY_LABEL[mapTool] ?? 'Viewing'
+    const areaLabel = selectedSurveyArea
+      ? `${label} · ${selectedSurveyArea.name}`
+      : label
+    wsSendActivity(areaLabel, {
+      toolKey: mapTool,
+      projectId: selectedProjectId,
+      surveyAreaId: selectedSurveyAreaId,
+      surveyAreaName: selectedSurveyArea?.name,
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mapTool, selectedSurveyAreaId, collabConnected])
+
+  // Log SELECT_AREA to REST audit trail when user picks a survey area
+  useEffect(() => {
+    if (!selectedProjectId || !selectedSurveyAreaId) return
+    api.post('/workflow/map-activity/', {
+      action: 'SELECT_AREA',
+      activity_label: `Selected: ${selectedSurveyArea?.name ?? ''}`,
+      project: selectedProjectId,
+      survey_area: selectedSurveyAreaId,
+      detail: { area_name: selectedSurveyArea?.name, area_status: selectedSurveyArea?.status },
+    }).catch(() => {/* non-critical */})
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSurveyAreaId])
 
   // Sync COG layers
   useEffect(() => {
@@ -1302,6 +1382,8 @@ export default function MapPage() {
       const src = new GeoTIFFSource({ sources: [{ url: g.cog_url }] })
       const visible = g.is_visible !== false
       const layer = new WebGLTileLayer({ source: src, opacity: g.opacity, zIndex: 2, visible })
+      layer.set('name', g.name)
+      layer.set('isGeoTIFF', true)
       map.addLayer(layer)
       cogLayers.current[g.id] = layer
       setCogOpacities((prev) => ({ ...prev, [g.id]: g.opacity }))
@@ -1417,7 +1499,7 @@ export default function MapPage() {
   }, [mapTool, bufferDistances, bufferUnit, bufferDissolve, bufferMode])
 
   // ── Temporary layer show/hide ──────────────────────────────────────────────
-  function showTempLayer(id: number, geojson: Record<string, unknown>) {
+  function showTempLayer(id: number, geojson: Record<string, unknown>, name?: string) {
     const map = mapInstance.current
     if (!map) return
     // Remove existing if already shown
@@ -1444,7 +1526,7 @@ export default function MapPage() {
         return new Style({ stroke, fill: new Fill({ color: hexToRgba(color, 0.18) }) })
       },
       zIndex: 80,
-      properties: { _tempLayerId: id },
+      properties: { _tempLayerId: id, _layerName: name || `Temp Layer ${id}` },
     })
     map.addLayer(lyr)
     tempLayerRefs.current[id] = lyr
@@ -1481,7 +1563,7 @@ export default function MapPage() {
       source: src,
       style: makeExtStyle(layer),
       zIndex: 75,
-      properties: { _extLayerKey: key, _readOnly: true },
+      properties: { _extLayerKey: key, _readOnly: true, _layerName: layer?.display_name || 'External Layer' },
     })
     map.addLayer(lyr)
     extLayerRefs.current[key] = lyr
@@ -1564,6 +1646,156 @@ export default function MapPage() {
     })
   }
 
+  // ── GIS Server vector layer (WFS / ArcGIS Feature) show/hide ─────────────
+  function showGsrvLayer(key: string, layer: any) {
+    const map = mapInstance.current
+    if (!map || !layer) return
+    if (gsrvLayerRefs.current[key]) map.removeLayer(gsrvLayerRefs.current[key])
+    if (gsrvMoveKeys.current[key]) { unByKey(gsrvMoveKeys.current[key]); delete gsrvMoveKeys.current[key] }
+
+    const src = new VectorSource()
+    const lyr = new VectorLayer({
+      source: src,
+      style: makeExtStyle(layer),
+      opacity: layer.opacity ?? 1,
+      zIndex: 76,
+      properties: { _extLayerKey: key, _readOnly: true, _layerName: layer.display_name },
+    })
+    map.addLayer(lyr)
+    gsrvLayerRefs.current[key] = lyr
+    setGsrvVisibleIds(prev => new Set([...prev, key]))
+
+    const legend = makeExtLegend(layer)
+    setGsrvClassLegends(prev => {
+      const next = { ...prev }
+      if (legend) next[key] = legend; else delete next[key]
+      return next
+    })
+
+    const layerId = key.split(':')[1]
+    const loadFeatures = async (withBbox: boolean) => {
+      const params: Record<string, unknown> = { limit: 20000 }
+      if (withBbox) {
+        const view = map.getView()
+        if ((view.getZoom() ?? 0) < (layer.min_zoom ?? 0)) { src.clear(); return }
+        const ext4326 = transformExtent(view.calculateExtent(map.getSize()), 'EPSG:3857', 'EPSG:4326')
+        params.bbox = ext4326.join(',')
+      }
+      try {
+        const r = await api.get(`/external/gis-server-layers/${layerId}/features/`, { params })
+        const feats = new GeoJSON().readFeatures(r.data, { featureProjection: 'EPSG:3857' })
+        src.clear()
+        src.addFeatures(feats)
+      } catch { /* leave on transient error */ }
+    }
+
+    const count = layer.feature_count ?? 0
+    if (count > EXT_BBOX_THRESHOLD) {
+      if (layer.bbox?.length === 4) {
+        const ext = transformExtent(layer.bbox, 'EPSG:4326', 'EPSG:3857')
+        if (ext[0] !== Infinity) map.getView().fit(ext, { padding: [40, 40, 40, 40], maxZoom: 14, duration: 400 })
+      }
+      const handler = debounce(() => loadFeatures(true), 350)
+      gsrvMoveKeys.current[key] = map.on('moveend', handler)
+      loadFeatures(true)
+    } else {
+      loadFeatures(false).then(() => {
+        const extent = src.getExtent()
+        if (extent && extent[0] !== Infinity) map.getView().fit(extent, { padding: [40, 40, 40, 40], maxZoom: 16, duration: 500 })
+      })
+    }
+  }
+
+  function hideGsrvLayer(key: string) {
+    const map = mapInstance.current
+    if (!map) return
+    if (gsrvMoveKeys.current[key]) { unByKey(gsrvMoveKeys.current[key]); delete gsrvMoveKeys.current[key] }
+    if (gsrvLayerRefs.current[key]) {
+      map.removeLayer(gsrvLayerRefs.current[key])
+      delete gsrvLayerRefs.current[key]
+    }
+    setGsrvVisibleIds(prev => { const s = new Set(prev); s.delete(key); return s })
+    setGsrvClassLegends(prev => { const n = { ...prev }; delete n[key]; return n })
+  }
+
+  function restyleGsrvLayer(key: string, layer: any) {
+    const lyr = gsrvLayerRefs.current[key]
+    if (!lyr) return
+    lyr.setStyle(makeExtStyle(layer))
+    lyr.changed()
+    const legend = makeExtLegend(layer)
+    setGsrvClassLegends(prev => {
+      const next = { ...prev }
+      if (legend) next[key] = legend; else delete next[key]
+      return next
+    })
+  }
+
+  // ── GIS Server tile layer (WMS / WMTS / ArcGIS Map) show/hide ─────────────
+  function showWmsTileLayer(key: string, layer: any) {
+    const map = mapInstance.current
+    if (!map) return
+    const layerId = key.split(':')[1]
+    if (gsrvTileRefs.current[key]) map.removeLayer(gsrvTileRefs.current[key])
+
+    const tileLayer = new TileLayer({
+      source: new TileWMS({
+        url: layer._tileUrl ?? '',
+        params: layer._wmsParams ?? { LAYERS: layer.layer_name, VERSION: layer.wms_version ?? '1.1.1', FORMAT: layer.wms_format ?? 'image/png', TRANSPARENT: 'TRUE' },
+        crossOrigin: 'anonymous',
+      }),
+      opacity: layer.opacity ?? 1,
+      zIndex: 70,
+    })
+    map.addLayer(tileLayer)
+    gsrvTileRefs.current[key] = tileLayer
+    setGsrvVisibleIds(prev => new Set([...prev, key]))
+
+    // Fit to bbox if available
+    if (layer.bbox?.length === 4) {
+      const ext = transformExtent(layer.bbox, 'EPSG:4326', 'EPSG:3857')
+      if (ext[0] !== Infinity) map.getView().fit(ext, { padding: [40, 40, 40, 40], maxZoom: 14, duration: 400 })
+    }
+  }
+
+  function hideWmsTileLayer(key: string) {
+    const map = mapInstance.current
+    if (!map) return
+    if (gsrvTileRefs.current[key]) {
+      map.removeLayer(gsrvTileRefs.current[key])
+      delete gsrvTileRefs.current[key]
+    }
+    setGsrvVisibleIds(prev => { const s = new Set(prev); s.delete(key); return s })
+  }
+
+  // Unified GIS server show/hide: routes by key prefix
+  async function toggleGisServerLayer(key: string, layer: any) {
+    if (gsrvVisibleIds.has(key)) {
+      if (key.startsWith('wms:')) hideWmsTileLayer(key)
+      else hideGsrvLayer(key)
+      return
+    }
+    if (key.startsWith('wms:')) {
+      // Fetch tile config from backend (has auth-aware URL)
+      const layerId = key.split(':')[1]
+      try {
+        const r = await api.get(`/external/gis-server-layers/${layerId}/tile-config/`)
+        const cfg = r.data
+        const enriched = { ...layer, _tileUrl: cfg.url, _wmsParams: cfg.params }
+        showWmsTileLayer(key, enriched)
+      } catch {
+        showWmsTileLayer(key, layer)
+      }
+    } else {
+      showGsrvLayer(key, layer)
+    }
+  }
+
+  function setGsrvOpacity(key: string, opacity: number) {
+    if (gsrvLayerRefs.current[key]) gsrvLayerRefs.current[key].setOpacity(opacity)
+    if (gsrvTileRefs.current[key]) gsrvTileRefs.current[key].setOpacity(opacity)
+  }
+
   // ── External-layer keyword search ─────────────────────────────────────────
   const runExtSearch = useMemo(() => debounce(async (q: string) => {
     if (q.trim().length < 2) { setExtSearchResults([]); setExtSearchLoading(false); return }
@@ -1614,18 +1846,94 @@ export default function MapPage() {
     window.setTimeout(() => { try { hsrc.clear() } catch { /* noop */ } }, 6000)
   }
 
-  // DragBox (box select) interaction
+  // ── Click-to-select in pan mode ─────────────────────────────────────────
+  // Best UX: just click any feature to select it; Ctrl/Shift+click multi-select;
+  // click empty space to deselect.  No tool switching needed.
+  useEffect(() => {
+    const map = mapInstance.current
+    if (!map) return
+
+    // Change cursor to pointer when hovering over a selectable feature
+    const handlePointerMove = (e: any) => {
+      if (mapTool !== 'pan') return
+      const hit = map.hasFeatureAtPixel(e.pixel, {
+        layerFilter: (l) => l === projectLayer.current,
+        hitTolerance: 5,
+      })
+      const el = map.getTargetElement() as HTMLElement
+      if (el) el.style.cursor = hit ? 'pointer' : ''
+    }
+
+    // Single-click: select the top-most feature (or deselect if empty space)
+    const handleClick = (e: any) => {
+      if (mapTool !== 'pan') return
+      const selSrc = selectLayer.current?.getSource()
+      if (!selSrc) return
+
+      const hit: Feature[] = []
+      map.forEachFeatureAtPixel(e.pixel, (f, layer) => {
+        if (layer === projectLayer.current) hit.push(f as Feature)
+      }, { hitTolerance: 5 })
+
+      if (hit.length === 0) {
+        // Click on empty space → clear selection
+        if (selSrc.getFeatures().length > 0) {
+          selSrc.clear()
+          setSelectedCount(0)
+        }
+        return
+      }
+
+      const feature = hit[0]
+      const multi = e.originalEvent.ctrlKey || e.originalEvent.metaKey || e.originalEvent.shiftKey
+
+      if (multi) {
+        // Toggle: add if not in selection, remove if already there
+        const fid = String(feature.getId() ?? feature.get('feature_id') ?? '')
+        const existing = selSrc.getFeatures().find(
+          (f) => String(f.getId() ?? f.get('feature_id') ?? '') === fid
+        )
+        if (existing) {
+          selSrc.removeFeature(existing)
+        } else {
+          const clone = (feature as Feature).clone()
+          clone.setId(feature.getId())
+          selSrc.addFeature(clone)
+        }
+      } else {
+        // Replace selection with this one feature
+        selSrc.clear()
+        const clone = (feature as Feature).clone()
+        clone.setId(feature.getId())
+        selSrc.addFeature(clone)
+      }
+      setSelectedCount(selSrc.getFeatures().length)
+    }
+
+    map.on('pointermove', handlePointerMove)
+    map.on('singleclick', handleClick)
+    return () => {
+      map.un('pointermove', handlePointerMove)
+      map.un('singleclick', handleClick)
+      // Reset cursor when unmounting
+      const el = map.getTargetElement() as HTMLElement
+      if (el) el.style.cursor = ''
+    }
+  }, [mapTool])
+
+  // ── DragBox (box-select) — disable DragPan while active so drag draws a box ──
   useEffect(() => {
     const map = mapInstance.current
     if (!map || mapTool !== 'box_select') return
-    if (isOverviewMode) {
-      message.warning('Select a survey area first to use Box Select.')
-      setMapTool('pan')
-      return
-    }
     const src = projectLayer.current?.getSource()
     const selSrc = selectLayer.current?.getSource()
     if (!src || !selSrc) return
+
+    // Disable DragPan so the drag gesture draws a selection box instead of panning
+    const dragPans = map.getInteractions().getArray().filter(
+      (i) => i.constructor.name === 'DragPan'
+    )
+    dragPans.forEach((i) => i.setActive(false))
 
     const dragBox = new DragBox({})
     dragBox.on('boxend', () => {
@@ -1635,12 +1943,11 @@ export default function MapPage() {
       selSrc.clear()
       selected.forEach((f) => {
         const clone = f.clone()
-        clone.setId(f.getId())   // OL clone() does not copy the feature ID — restore it
+        clone.setId(f.getId())
         selSrc.addFeature(clone)
       })
       setSelectedCount(selected.length)
       if (selected.length > 0) {
-        // Auto-resume Move if box_select was triggered from Move Feature
         if (pendingMoveRef.current) {
           pendingMoveRef.current = false
           setMapTool('move_feature')
@@ -1648,7 +1955,7 @@ export default function MapPage() {
           message.info(`${selected.length} feature(s) selected`)
         }
       } else {
-        message.warning('No features found in selection box')
+        message.warning('No features in selection box')
       }
     })
 
@@ -1657,18 +1964,25 @@ export default function MapPage() {
     return () => {
       map.removeInteraction(dragBox)
       dragBoxInteraction.current = null
-      // Do NOT clear selSrc here — selection must persist so Move/Copy/Rotate can use it
+      // Re-enable DragPan on cleanup
+      dragPans.forEach((i) => i.setActive(true))
     }
   }, [mapTool])
 
   // Clear box-selection when switching to tools that don't use it
-  const SELECTION_TOOLS = new Set(['box_select', 'move_feature', 'copy_move', 'rotate_feature', 'scale_feature', 'identify', 'buffer', 'attribute_select', 'spatial_select'])
+  const SELECTION_TOOLS = new Set([
+    'pan', 'box_select', 'select_location',
+    'move_feature', 'copy_move', 'rotate_feature', 'scale_feature',
+    'identify', 'buffer', 'attribute_select', 'spatial_select'
+  ])
   useEffect(() => {
     if (!SELECTION_TOOLS.has(mapTool)) {
       selectLayer.current?.getSource()?.clear()
       setSelectedCount(0)
     }
   }, [mapTool])
+
+  // Click-to-select is now handled by the pan-mode singleclick handler above.
 
   // Click-to-delete handler — fires when delete_feature is active and no features pre-selected
   useEffect(() => {
@@ -1804,33 +2118,55 @@ export default function MapPage() {
     })
   }, [mapLocked])
 
-  // Select by location
+  // Select by polygon — disable DragPan so drawing doesn't pan the map
   useEffect(() => {
     const map = mapInstance.current
     if (!map || mapTool !== 'select_location') return
+
+    const dragPans = map.getInteractions().getArray().filter(
+      (i) => i.constructor.name === 'DragPan'
+    )
+    dragPans.forEach((i) => i.setActive(false))
+
     const draw = new Draw({ type: 'Polygon', source: new VectorSource() })
     selectLocationDraw.current = draw
     draw.on('drawend', (e) => {
       const geom = e.feature.getGeometry() as Polygon
-      const src = projectLayer.current?.getSource()
-      if (!src) return
-      const selected: Feature[] = []
-      src.getFeatures().forEach((f) => {
-        const fg = f.getGeometry()
-        if (fg && geom.intersectsExtent(fg.getExtent())) {
-          selected.push(f)
+      const selectedClones: Feature[] = []
+
+      if (projectLayer.current) {
+        const src = projectLayer.current.getSource()
+        if (src) {
+          src.getFeatures().forEach((f) => {
+            const fg = f.getGeometry()
+            if (fg && geom.intersectsExtent(fg.getExtent())) {
+              const clone = f.clone()
+              clone.setId(f.getId())
+              if (!clone.get('feature_id')) clone.set('feature_id', String(f.getId() || ''))
+              selectedClones.push(clone)
+            }
+          })
         }
-      })
-      selectLayer.current?.getSource()?.clear()
-      selectLayer.current?.getSource()?.addFeatures(selected)
-      setSelectedCount(selected.length)
-      message.info(`Selected ${selected.length} feature(s) by location`)
+      }
+
+      const selSrc = selectLayer.current?.getSource()
+      if (selSrc) {
+        selSrc.clear()
+        selSrc.addFeatures(selectedClones)
+      }
+      setSelectedCount(selectedClones.length)
+      if (selectedClones.length > 0) {
+        message.info(`${selectedClones.length} feature(s) selected`)
+      } else {
+        message.warning('No features found in drawn polygon')
+      }
       setMapTool('pan')
     })
     map.addInteraction(draw)
     return () => {
       map.removeInteraction(draw)
       selectLocationDraw.current = null
+      dragPans.forEach((i) => i.setActive(true))
     }
   }, [mapTool])
 
@@ -2859,23 +3195,13 @@ export default function MapPage() {
         />
       </div>
 
-      {/* Collaboration presence indicator */}
-      {(collabConnected || collabReconnecting) && (
-        <div style={{ position: 'absolute', top: 8, right: 8, zIndex: 30 }}>
-          <CollabPresence
-            connected={collabConnected}
-            reconnecting={collabReconnecting}
-            users={presenceUsers}
-          />
-        </div>
-      )}
 
       {/* ═══════════════════════════════════════════════════════════════════
            Left toolbar — QGIS-style collapsible tool groups
           ═══════════════════════════════════════════════════════════════════ */}
       <div style={{
         position: 'absolute', top: 8, left: 8, zIndex: 20,
-        width: 148,
+        width: 156,
         maxHeight: 'calc(100% - 16px)',
         overflowY: 'auto',
         overflowX: 'hidden',
@@ -2883,6 +3209,11 @@ export default function MapPage() {
         flexDirection: 'column',
         gap: 2,
         scrollbarWidth: 'none',
+        background: 'rgba(8,12,22,0.93)',
+        borderRadius: 6,
+        padding: '6px',
+        boxShadow: '0 2px 12px rgba(0,0,0,0.6)',
+        backdropFilter: 'blur(4px)',
       }}>
         {/* Helper to render a collapsible group */}
         {(() => {
@@ -2972,58 +3303,174 @@ export default function MapPage() {
 
           return (
             <>
-              {/* ── Survey Area Selector ── */}
-              {surveyAreas.length > 0 && (
+              {/* ══ DGDE/PDDE/SUPERADMIN Field Office Browser ══ */}
+              {showFieldBrowser && (
                 <div style={{ marginBottom: 8, borderBottom: '1px solid #1e2a3a', paddingBottom: 8 }}>
-                  <div style={{ fontSize: 10, fontWeight: 700, color: '#64b5f6', letterSpacing: 1, marginBottom: 4, textTransform: 'uppercase' }}>
-                    Survey Areas
-                  </div>
-                  {/* All Areas */}
-                  <div
-                    onClick={() => setSelectedSurveyAreaId(null)}
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: 6,
-                      padding: '5px 8px', borderRadius: 4, cursor: 'pointer', marginBottom: 3,
-                      fontSize: 11, fontWeight: !selectedSurveyAreaId ? 700 : 500,
-                      background: !selectedSurveyAreaId ? 'rgba(100,181,246,0.2)' : 'rgba(255,255,255,0.04)',
-                      border: `1px solid ${!selectedSurveyAreaId ? '#64b5f6' : 'rgba(255,255,255,0.08)'}`,
-                      color: !selectedSurveyAreaId ? '#64b5f6' : 'rgba(255,255,255,0.65)',
-                    }}
-                  >
-                    <GlobalOutlined style={{ fontSize: 11, flexShrink: 0 }} />
-                    <span style={{ flex: 1 }}>All Areas</span>
-                    <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.35)' }}>{surveyAreas.length}</span>
-                  </div>
-                  {/* Individual areas */}
-                  {surveyAreas.map((area) => {
-                    const col = areaStatusColor(area.status)
-                    const active = selectedSurveyAreaId === area.id
-                    return (
-                      <Tooltip key={area.id} title={`${area.name} — ${areaStatusLabel(area.status)}`} placement="right">
+                  <GroupHeader id="fieldoffices" label="FIELD OFFICES" color="#ce93d8" />
+                  {!toolGroupsCollapsed.has('fieldoffices') && (
+                    <div style={{ paddingTop: 4, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {/* Browse button */}
+                      <div
+                        onClick={() => setFieldBrowserOpen(true)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 6,
+                          padding: '5px 8px', borderRadius: 4, cursor: 'pointer',
+                          fontSize: 11, fontWeight: 600,
+                          background: 'rgba(206,147,216,0.18)', border: '1px solid #ce93d8',
+                          color: '#ce93d8', transition: 'all 0.15s',
+                        }}
+                      >
+                        <BankOutlined style={{ fontSize: 12 }} />
+                        <span>Browse Offices</span>
+                      </div>
+
+                      {/* Selected office chip */}
+                      {selectedFieldOrg && (
+                        <div style={{
+                          display: 'flex', alignItems: 'center', gap: 6,
+                          padding: '5px 8px', borderRadius: 4,
+                          fontSize: 11, fontWeight: 500,
+                          background: 'rgba(79,195,247,0.15)', border: '1px solid #4fc3f7',
+                          color: '#4fc3f7',
+                        }}>
+                          <BankOutlined style={{ fontSize: 11, flexShrink: 0 }} />
+                          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {selectedFieldOrg.name}
+                          </span>
+                          <span
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setSelectedFieldOrg(null)
+                              setSelectedFieldArea(null)
+                              setOfficeFilter(null)
+                            }}
+                            style={{ cursor: 'pointer', color: 'rgba(255,255,255,0.45)', fontSize: 11, flexShrink: 0 }}
+                          >
+                            ×
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Selected area chip */}
+                      {selectedFieldArea && (
+                        <div style={{
+                          display: 'flex', alignItems: 'center', gap: 6,
+                          padding: '5px 8px', borderRadius: 4,
+                          fontSize: 11, fontWeight: 500,
+                          background: 'rgba(82,196,26,0.15)', border: '1px solid #52c41a',
+                          color: '#52c41a',
+                        }}>
+                          <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#52c41a', flexShrink: 0 }} />
+                          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {selectedFieldArea.name}
+                          </span>
+                          <span
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setSelectedFieldArea(null)
+                            }}
+                            style={{ cursor: 'pointer', color: 'rgba(255,255,255,0.45)', fontSize: 11, flexShrink: 0 }}
+                          >
+                            ×
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Hint when nothing selected */}
+                      {!selectedFieldOrg && (
+                        <div style={{
+                          fontSize: 10, color: 'rgba(255,255,255,0.35)',
+                          padding: '2px 4px', lineHeight: 1.5,
+                        }}>
+                          Select an office to view published survey data on the map.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ── Survey Area Selector (field users: DEO/CEO/ADEO only) ── */}
+              {!showFieldBrowser && surveyAreas.length > 0 && (
+                <div style={{ marginBottom: 8, borderBottom: '1px solid #1e2a3a', paddingBottom: 8 }}>
+                  <GroupHeader
+                    id="areas"
+                    label={`SURVEY AREAS${surveyAreas.length > 0 ? ` (${surveyAreas.length})` : ''}`}
+                    color="#64b5f6"
+                  />
+                  {!toolGroupsCollapsed.has('areas') && (
+                    <>
+                      {/* Search — shown when there are many areas */}
+                      {surveyAreas.length > 6 && (
+                        <input
+                          value={areaSearch}
+                          onChange={(e) => setAreaSearch(e.target.value)}
+                          placeholder="Search areas…"
+                          style={{
+                            width: '100%', marginTop: 4, marginBottom: 4,
+                            background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.18)',
+                            borderRadius: 4, color: '#e0e0e0', fontSize: 11, padding: '4px 8px',
+                            outline: 'none', boxSizing: 'border-box',
+                          }}
+                        />
+                      )}
+                      {/* Scrollable area list */}
+                      <div style={{ maxHeight: '28vh', overflowY: 'auto', overflowX: 'hidden', scrollbarWidth: 'thin', paddingTop: 4 }}>
+                        {/* All Areas */}
                         <div
-                          onClick={() => setSelectedSurveyAreaId(area.id)}
+                          onClick={() => setSelectedSurveyAreaId(null)}
                           style={{
                             display: 'flex', alignItems: 'center', gap: 6,
                             padding: '5px 8px', borderRadius: 4, cursor: 'pointer', marginBottom: 3,
-                            fontSize: 11, fontWeight: active ? 700 : 500,
-                            background: active ? `${col}26` : 'rgba(255,255,255,0.04)',
-                            border: `1px solid ${active ? col : 'rgba(255,255,255,0.08)'}`,
-                            color: active ? col : 'rgba(255,255,255,0.75)',
-                            transition: 'all 0.15s',
+                            fontSize: 11, fontWeight: !selectedSurveyAreaId ? 700 : 500,
+                            background: !selectedSurveyAreaId ? 'rgba(100,181,246,0.25)' : 'rgba(255,255,255,0.08)',
+                            border: `1px solid ${!selectedSurveyAreaId ? '#64b5f6' : 'rgba(255,255,255,0.22)'}`,
+                            color: !selectedSurveyAreaId ? '#64b5f6' : '#d0d8e8',
                           }}
                         >
-                          <span style={{ width: 8, height: 8, borderRadius: '50%', background: col, flexShrink: 0, boxShadow: active ? `0 0 5px ${col}` : 'none' }} />
-                          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{area.name}</span>
-                          <span style={{
-                            fontSize: 9, background: `${col}33`, color: col,
-                            borderRadius: 3, padding: '1px 4px', flexShrink: 0, fontWeight: 600,
-                          }}>
-                            {areaStatusLabel(area.status)}
-                          </span>
+                          <GlobalOutlined style={{ fontSize: 11, flexShrink: 0 }} />
+                          <span style={{ flex: 1 }}>All Areas</span>
+                          <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.45)' }}>{surveyAreas.length}</span>
                         </div>
-                      </Tooltip>
-                    )
-                  })}
+                        {/* Individual areas — filtered by search */}
+                        {surveyAreas
+                          .filter((a) => !areaSearch.trim() || a.name.toLowerCase().includes(areaSearch.toLowerCase()))
+                          .map((area) => {
+                            const col = areaStatusColor(area.status)
+                            const active = selectedSurveyAreaId === area.id
+                            return (
+                              <Tooltip key={area.id} title={`${area.name} — ${areaStatusLabel(area.status)}`} placement="right">
+                                <div
+                                  onClick={() => setSelectedSurveyAreaId(area.id)}
+                                  style={{
+                                    display: 'flex', alignItems: 'center', gap: 6,
+                                    padding: '5px 8px', borderRadius: 4, cursor: 'pointer', marginBottom: 3,
+                                    fontSize: 11, fontWeight: active ? 700 : 500,
+                                    background: active ? `${col}2a` : 'rgba(255,255,255,0.08)',
+                                    border: `1px solid ${active ? col : 'rgba(255,255,255,0.22)'}`,
+                                    color: active ? col : '#d0d8e8',
+                                    transition: 'all 0.15s',
+                                  }}
+                                >
+                                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: col, flexShrink: 0, boxShadow: active ? `0 0 5px ${col}` : 'none' }} />
+                                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{area.name}</span>
+                                  <span style={{
+                                    fontSize: 9, background: `${col}33`, color: col,
+                                    borderRadius: 3, padding: '1px 4px', flexShrink: 0, fontWeight: 600,
+                                  }}>
+                                    {areaStatusLabel(area.status)}
+                                  </span>
+                                </div>
+                              </Tooltip>
+                            )
+                          })}
+                        {/* No match message */}
+                        {areaSearch.trim() && !surveyAreas.some((a) => a.name.toLowerCase().includes(areaSearch.toLowerCase())) && (
+                          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)', padding: '4px 8px' }}>No match</div>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -3037,8 +3484,8 @@ export default function MapPage() {
                         flex: 1, display: 'flex', alignItems: 'center', gap: 6,
                         padding: '5px 8px', borderRadius: 4, cursor: 'pointer',
                         fontSize: 11, fontWeight: 600,
-                        background: 'rgba(79,195,247,0.12)',
-                        border: '1px dashed #4fc3f7',
+                        background: 'rgba(79,195,247,0.22)',
+                        border: '1px solid #4fc3f7',
                         color: '#4fc3f7',
                         transition: 'all 0.15s',
                       }}
@@ -3060,8 +3507,8 @@ export default function MapPage() {
                         flex: 1, display: 'flex', alignItems: 'center', gap: 6,
                         padding: '5px 8px', borderRadius: 4, cursor: 'pointer',
                         fontSize: 11, fontWeight: 600,
-                        background: 'rgba(82,196,26,0.10)',
-                        border: '1px dashed #52c41a',
+                        background: 'rgba(82,196,26,0.20)',
+                        border: '1px solid #52c41a',
                         color: '#52c41a',
                         transition: 'all 0.15s',
                       }}
@@ -3115,21 +3562,19 @@ export default function MapPage() {
                 </Tooltip>
               )}
 
-              {/* ── Navigate (hidden in overview mode) ── */}
-              {!isOverviewMode && (
-                <>
-                  <GroupHeader id="nav" label="NAVIGATE" color="#4fc3f7" />
-                  {!toolGroupsCollapsed.has('nav') && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2, padding: '2px 0' }}>
-                      {PRIMARY_TOOLS.map((t) => (
-                        <Tooltip key={t.key} title={<span><b>{t.label}</b><br /><span style={{fontSize:11,color:'#aaa'}}>{(t as any).desc}</span></span>} placement="right">
-                          <div style={btnStyle(mapTool === t.key)} onClick={() => setMapTool(t.key as any)}>{t.icon}</div>
-                        </Tooltip>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )}
+              {/* ── Navigate (always visible) ── */}
+              <>
+                <GroupHeader id="nav" label="NAVIGATE" color="#4fc3f7" />
+                {!toolGroupsCollapsed.has('nav') && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2, padding: '2px 0' }}>
+                    {PRIMARY_TOOLS.map((t) => (
+                      <Tooltip key={t.key} title={<span><b>{t.label}</b><br /><span style={{fontSize:11,color:'#aaa'}}>{(t as any).desc}</span></span>} placement="right">
+                        <div style={btnStyle(mapTool === t.key)} onClick={() => setMapTool(t.key as any)}>{t.icon}</div>
+                      </Tooltip>
+                    ))}
+                  </div>
+                )}
+              </>
 
               {/* ── Zoom / View (always visible) ── */}
               <GroupHeader id="zoom" label="ZOOM / VIEW" color="#80cbc4" />
@@ -3153,8 +3598,8 @@ export default function MapPage() {
                 </div>
               )}
 
-              {/* ── Selection (hidden in overview / simplified mode) ── */}
-              {!isOverviewMode && !simplified && (
+              {/* ── Selection (always visible when not in simplified DGDE/PDDE view) ── */}
+              {!simplified && (
                 <>
                   <GroupHeader id="sel" label="SELECTION" color="#ce93d8" />
                   <ToolGrid tools={SELECT_TOOLS} groupKey="sel" />
@@ -3215,7 +3660,7 @@ export default function MapPage() {
                   <Tooltip title={<span><b>Layers & Tools</b><br /><span style={{fontSize:11,color:'#aaa'}}>View and enable external data layers</span></span>} placement="right">
                     <div style={btnStyle(extLayersPanelOpen)} onClick={() => setExtLayersPanelOpen(v => !v)}>
                       <CloudServerOutlined />
-                      {extVisibleIds.size > 0 && (
+                      {(extVisibleIds.size > 0 || gsrvVisibleIds.size > 0) && (
                         <span style={{ position: 'absolute', top: 1, right: 1, width: 8, height: 8, borderRadius: '50%', background: '#1890ff', display: 'block' }} />
                       )}
                     </div>
@@ -3254,8 +3699,8 @@ export default function MapPage() {
               {isOverviewMode && (
                 <div style={{
                   margin: '6px 2px', padding: '6px 8px', borderRadius: 4, fontSize: 10,
-                  background: 'rgba(100,181,246,0.08)', border: '1px solid rgba(100,181,246,0.25)',
-                  color: 'rgba(255,255,255,0.5)', lineHeight: 1.5,
+                  background: 'rgba(100,181,246,0.18)', border: '1px solid rgba(100,181,246,0.5)',
+                  color: 'rgba(255,255,255,0.82)', lineHeight: 1.5,
                 }}>
                   Select a survey area above to enable editing tools.
                 </div>
@@ -3272,6 +3717,18 @@ export default function MapPage() {
                   🔒 {areaStatusLabel(selectedSurveyArea.status)} — read-only
                 </div>
               )}
+
+              {/* Click-to-select hint — shown in pan mode with no selection */}
+              {!simplified && mapTool === 'pan' && selectedCount === 0 && (
+                <div style={{
+                  margin: '4px 2px', padding: '5px 8px', borderRadius: 4, fontSize: 10,
+                  background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)',
+                  color: 'rgba(255,255,255,0.45)', lineHeight: 1.5,
+                }}>
+                  Click any feature to select it.<br />
+                  Ctrl+click to multi-select. Then Print/Export.
+                </div>
+              )}
             </>
           )
         })()}
@@ -3284,33 +3741,34 @@ export default function MapPage() {
           display: 'flex', flexDirection: 'column', gap: 8, zIndex: 20,
         }}
       >
-        {simplified && (
-          <AntSelect
-            size="small"
-            style={{ width: 200 }}
-            placeholder="Select office"
-            showSearch
-            optionFilterProp="label"
-            allowClear
-            value={officeFilter}
-            onChange={(v) => setOfficeFilter(v ?? null)}
-            options={officeOptions.map((o: any) => ({
-              value: o.id,
-              label: o.level ? `${o.name} (${o.level})` : o.name,
-            }))}
-          />
-        )}
+        {/* DGDE/PDDE office selector moved to left toolbar — nothing here */}
         <AntSelect
           size="small"
           style={{ width: 160 }}
           placeholder="Basemap"
           value={activeBasemap?.id}
           onChange={(id) => setActiveBasemap(basemaps?.find((b) => b.id === id) ?? null)}
-          options={basemaps?.filter((b) => b.is_active).map((b) => ({
-            label: b.is_default ? `${b.name} ★` : b.name,
-            value: b.id,
-          }))}
+          options={basemaps?.filter((b) => b.is_active).map((b) => {
+            const bm = b as any
+            const isLocal = bm.provider === 'LOCAL_COG'
+            const cogReady = !isLocal || bm.cog_status === 'DONE'
+            return {
+              label: `${b.is_default ? '★ ' : ''}${b.name}${isLocal ? (cogReady ? ' 📍' : ' ⏳') : ''}`,
+              value: b.id,
+              disabled: isLocal && !cogReady,
+            }
+          })}
         />
+        {/* Collaboration presence — icon only, click for details */}
+        {(collabConnected || collabReconnecting) && (
+          <CollabPresence
+            connected={collabConnected}
+            reconnecting={collabReconnecting}
+            users={presenceUsers}
+            lockedFeatures={lockedFeatures}
+          />
+        )}
+
         <Tooltip title="Layers" placement="left">
           <Button
             icon={<BarsOutlined />} size="small"
@@ -3340,31 +3798,46 @@ export default function MapPage() {
         </div>
       )}
 
-      {/* Classification legend(s) for visible thematic external layers */}
-      {Object.keys(extClassLegends).length > 0 && (
+      {/* Classification legend(s) for visible thematic layers (DB + GIS server) */}
+      {(Object.keys(extClassLegends).length > 0 || Object.keys(gsrvClassLegends).length > 0) && (
         <div style={{
           position: 'absolute', bottom: 28, right: 12, zIndex: 30,
           background: 'rgba(26,26,26,0.92)', border: '1px solid #333', borderRadius: 6,
-          padding: '8px 12px', maxWidth: 240, maxHeight: '45vh', overflowY: 'auto',
-          color: '#e0e0e0', fontSize: 12, boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+          maxWidth: 240, color: '#e0e0e0', fontSize: 12, boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
         }}>
-          {Object.entries(extClassLegends).map(([key, lg]) => (
-            <div key={key} style={{ marginBottom: 8 }}>
-              <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                {lg.title}
-                <span style={{ color: '#888', fontWeight: 400 }}> · {lg.field}</span>
-              </div>
-              {lg.entries.map((e) => (
-                <div key={e.value} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-                  <span style={{
-                    display: 'inline-block', width: 14, height: 14, borderRadius: 3,
-                    background: hexToRgba(e.color, e.opacity), border: `1px solid ${e.color}`,
-                  }} />
-                  <span style={{ color: '#ccc' }}>{e.value}</span>
+          {/* Legend header — click to collapse */}
+          <div
+            onClick={() => setLegendPanelCollapsed((v) => !v)}
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '6px 10px', cursor: 'pointer', userSelect: 'none',
+              borderBottom: legendPanelCollapsed ? 'none' : '1px solid #333',
+            }}
+          >
+            <span style={{ fontWeight: 700, fontSize: 11, color: '#aaa', letterSpacing: '0.04em' }}>LEGEND</span>
+            <span style={{ fontSize: 10, color: '#555' }}>{legendPanelCollapsed ? '▶' : '▼'}</span>
+          </div>
+          {!legendPanelCollapsed && (
+            <div style={{ padding: '6px 12px 10px', maxHeight: '40vh', overflowY: 'auto' }}>
+              {[...Object.entries(extClassLegends), ...Object.entries(gsrvClassLegends)].map(([key, lg]) => (
+                <div key={key} style={{ marginBottom: 8 }}>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                    {lg.title}
+                    <span style={{ color: '#888', fontWeight: 400 }}> · {lg.field}</span>
+                  </div>
+                  {lg.entries.map((e) => (
+                    <div key={e.value} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                      <span style={{
+                        display: 'inline-block', width: 14, height: 14, borderRadius: 3,
+                        background: hexToRgba(e.color, e.opacity), border: `1px solid ${e.color}`,
+                      }} />
+                      <span style={{ color: '#ccc' }}>{e.value}</span>
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
-          ))}
+          )}
         </div>
       )}
 
@@ -3431,27 +3904,55 @@ export default function MapPage() {
         </div>
       )}
 
-      {/* Box select count + merge */}
-      {mapTool === 'box_select' && selectedCount > 0 && (
+      {/* Selection banner — shown whenever features are selected, regardless of active tool */}
+      {selectedCount > 0 && (
         <div
           style={{
             position: 'absolute', top: 48, left: '50%', transform: 'translateX(-50%)',
-            background: 'rgba(255,152,0,0.15)', color: '#ff9800',
-            padding: '4px 8px 4px 12px', borderRadius: 4, fontSize: 12, fontWeight: 600,
-            border: '1px solid #ff9800', zIndex: 20, display: 'flex', alignItems: 'center', gap: 8,
+            background: 'rgba(8,12,22,0.92)', color: '#ff9800',
+            padding: '5px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600,
+            border: '1px solid #ff9800', zIndex: 20,
+            display: 'flex', alignItems: 'center', gap: 8,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
           }}
         >
-          <span>{selectedCount} feature(s) selected</span>
+          <span style={{ color: '#ff9800' }}>● {selectedCount} feature{selectedCount !== 1 ? 's' : ''} selected</span>
+
+          {/* Quick Print/Export buttons right in the banner */}
+          <Tooltip title="Print selected features to PDF">
+            <Button size="small" icon={<PrinterOutlined />}
+              style={{ fontSize: 11, height: 22, background: 'rgba(255,255,255,0.1)', border: '1px solid #555', color: '#ddd' }}
+              onClick={() => setPrintOpen(true)}>
+              Print
+            </Button>
+          </Tooltip>
+          <Tooltip title="Export selected features as GeoTIFF">
+            <Button size="small" icon={<DownloadOutlined />}
+              style={{ fontSize: 11, height: 22, background: 'rgba(255,255,255,0.1)', border: '1px solid #555', color: '#ddd' }}
+              onClick={() => setMapExportOpen(true)}>
+              Export
+            </Button>
+          </Tooltip>
+
+          {/* Merge — only when ≥2 features selected and user has draw permission */}
           {selectedCount >= 2 && canDraw && (
-            <Button
-              size="small" type="primary" danger icon={<ApartmentOutlined />}
+            <Button size="small" type="primary" danger icon={<ApartmentOutlined />}
               loading={merging}
               style={{ fontSize: 11, height: 22 }}
-              onClick={handleMergeSelected}
-            >
+              onClick={handleMergeSelected}>
               Merge
             </Button>
           )}
+
+          {/* Clear selection */}
+          <Tooltip title="Clear selection (Esc)">
+            <Button size="small" type="text" icon={<CloseOutlined />}
+              style={{ fontSize: 10, height: 22, color: '#888', padding: '0 4px' }}
+              onClick={() => {
+                selectLayer.current?.getSource()?.clear()
+                setSelectedCount(0)
+              }} />
+          </Tooltip>
         </div>
       )}
 
@@ -3618,6 +4119,8 @@ export default function MapPage() {
         projectName={projects?.results?.find((p) => p.id === selectedProjectId)?.name ?? 'Project'}
         orgName={user?.organisation_name ?? ''}
         legend={printLegend}
+        selectLayer={selectLayer}
+        selectedCount={selectedCount}
       />
 
       <MapExportModal
@@ -3628,6 +4131,9 @@ export default function MapPage() {
           center: mapInstance.current ? (toLonLat(mapInstance.current.getView().getCenter() || [78, 20]) as [number, number]) : [78, 20],
           zoom: mapInstance.current ? mapInstance.current.getView().getZoom() || 10 : 10,
         }}
+        legend={printLegend}
+        selectLayer={selectLayer}
+        selectedCount={selectedCount}
       />
 
       <ExternalLayersPanel
@@ -3637,16 +4143,21 @@ export default function MapPage() {
         onToggleVisible={(key, layer) => showExtLayer(key, layer as ExtLayerConfig)}
         onHide={(key) => hideExtLayer(key)}
         onStyleApply={(key, layer) => restyleExtLayer(key, layer as ExtLayerConfig)}
+        gsrvVisibleIds={gsrvVisibleIds}
+        onToggleGsrv={(key, layer) => toggleGisServerLayer(key, layer)}
+        onHideGsrv={(key) => key.startsWith('wms:') ? hideWmsTileLayer(key) : hideGsrvLayer(key)}
+        onGsrvStyleApply={(key, layer) => restyleGsrvLayer(key, layer)}
+        onGsrvOpacity={(key, opacity) => setGsrvOpacity(key, opacity)}
       />
 
       <TempLayersPanel
         open={tempLayerPanelOpen}
         onClose={() => setTempLayerPanelOpen(false)}
         visibleIds={tempVisibleIds}
-        onToggleVisible={(id, geojson) => showTempLayer(id, geojson)}
+        onToggleVisible={(id, geojson, name) => showTempLayer(id, geojson, name)}
         onHide={(id) => hideTempLayer(id)}
         extVisibleIds={extVisibleIds}
-        onToggleExtVisible={(key, geojson) => showExtLayer(key, geojson)}
+        onToggleExtVisible={(key, layer) => showExtLayer(key, layer as ExtLayerConfig)}
         onHideExt={(key) => hideExtLayer(key)}
       />
 
@@ -4775,6 +5286,28 @@ export default function MapPage() {
           <div style={{ color: '#666', fontSize: 11 }}>A new line feature will be created parallel to the selected line(s).</div>
         </Space>
       </DraggableModal>
+
+      {/* ── Field Office Browser Modal (DGDE/PDDE/SUPERADMIN) ── */}
+      {showFieldBrowser && (
+        <FieldOfficeBrowserModal
+          open={fieldBrowserOpen}
+          onClose={() => setFieldBrowserOpen(false)}
+          userOrgLevel={user?.organisation_level}
+          userOrgId={user?.organisation ?? null}
+          selectedOrgId={selectedFieldOrg?.id ?? null}
+          selectedAreaId={selectedFieldArea?.id ?? null}
+          onSelectOrg={(org) => {
+            setSelectedFieldOrg({ id: org.id, name: org.name, level: org.level })
+            setSelectedFieldArea(null)
+            setOfficeFilter(org.id)
+          }}
+          onSelectArea={(org, area) => {
+            setSelectedFieldOrg({ id: org.id, name: org.name, level: org.level })
+            setSelectedFieldArea({ id: area.id, name: area.name })
+            setOfficeFilter(org.id)
+          }}
+        />
+      )}
 
       {/* ── New Shapefile Layer Modal ─────────────────────────── */}
       {selectedProjectId && (

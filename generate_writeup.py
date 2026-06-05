@@ -390,7 +390,51 @@ for text in [
     add_plain_bullet(doc, text)
 
 # 3.9
-add_heading(doc, '3.9  UI Themes', level=2)
+add_heading(doc, '3.9  External Data Layers', level=2)
+add_body(doc,
+    'RakshaGIS supports two types of externally-sourced read-only layers, both accessible from the '
+    'map toolbar\'s Layers & Tools panel.')
+
+add_heading(doc, '3.9a  External Database Layers (SuperAdmin)', level=3)
+for text in [
+    'Renders geometry queried live from a separate PostgreSQL/PostGIS database (e.g. DGDE operational DB) '
+    'without copying data into RakshaGIS. Uses psycopg2 for direct queries; returns GeoJSON.',
+    'Org-level row filtering: DGDE/SUPERADMIN see all rows; PDDE/DEO/CEO/ADEO see only rows matching their office code.',
+    'Per-layer styling: stroke, fill colour/opacity, QGIS-style fill patterns, and thematic (classification) colouring.',
+    'Viewport (bbox) spatial filtering to avoid loading unnecessary geometry for large tables.',
+    'Configuration via Settings → External Data (SuperAdmin only): add DB connection, register table as a layer, set filter fields, refresh feature count and bounding box.',
+]:
+    add_plain_bullet(doc, text)
+
+add_heading(doc, '3.9b  GIS Server Layers (All Users)', level=3)
+add_body(doc,
+    'Any authenticated user can register external GIS servers and add layers from them. '
+    'This enables field offices to consume their own WMS/WFS/ArcGIS services without requiring SuperAdmin involvement.')
+for text in [
+    'Supported protocols: WMS, WMTS, WFS, ArcGIS Map Service, ArcGIS Feature Service, XYZ tile layers.',
+    'Supported server types: GeoServer, ArcGIS Server, MapServer, QGIS Server, and any generic OGC/XYZ endpoint.',
+    'Auto-discovery via GetCapabilities: click "Discover" on any registered server to see all available layers and one-click register them.',
+    'Org-scoped visibility: layers added by non-SUPERADMIN users are automatically tagged with the user\'s organisation and are visible only within that organisation. Layers added by SUPERADMIN have organisation = null and are globally visible to all users.',
+    'Visual tagging: cyan "Global" badge for SUPERADMIN layers; purple organisation name badge for org-scoped layers.',
+    'Configurable opacity per layer via a real-time slider when the layer is visible on the map.',
+    'Vector layers (WFS/ArcGIS Feature) support classification colouring and custom style rules; tile layers (WMS/WMTS/XYZ) support opacity control.',
+    'Accessible from Map → Layers & Tools → GIS Servers tab. Non-SUPERADMIN users land on this tab by default when opening the panel.',
+]:
+    add_plain_bullet(doc, text)
+
+# 3.10
+add_heading(doc, '3.10  Map Export & High-Resolution Printing', level=2)
+for text in [
+    'PDF export (jsPDF): instant client-side A4/A3/Letter layout with captured map canvas, north arrow, scale bar, legend, optional coordinate grid, and DGDE-branded header/footer.',
+    'GeoTIFF / PNG export at 150 DPI or 300 DPI: captures the full map canvas including basemap raster tiles and all vector layers; exports as a georeferenced GeoTIFF with embedded world-file metadata.',
+    '300 DPI tile-loading fix: waitForTilesLoaded() is registered before renderSync() so that tileloadstart events are captured as soon as the render triggers tile requests. The export waits for an 800 ms idle period, then a 400 ms post-last-tile settle, then a 300 ms final settle before compositing — ensuring basemap tiles are fully loaded at high resolution.',
+    'Server-side Mapnik export: renders directly from PostGIS at arbitrary resolution using XML map styles for publication-quality cartographic output.',
+    'ArcGIS-style server PDF export via Playwright/print-service for complex layout requirements.',
+]:
+    add_plain_bullet(doc, text)
+
+# 3.11
+add_heading(doc, '3.11  UI Themes', level=2)
 for text in [
     'Six built-in themes: Dark, Light, Navy, Forest, Midnight, Saffron.',
     'All UI surfaces — header, sidebar, drawers, map panels — use CSS custom properties (--bg-base, --bg-card, --accent, etc.) ensuring complete theme coverage.',
@@ -398,8 +442,9 @@ for text in [
 ]:
     add_plain_bullet(doc, text)
 
-# 3.10
-add_heading(doc, '3.10  Infrastructure, DevOps & Offline Operation', level=2)
+# 3.12
+add_heading(doc, '3.12  Infrastructure, DevOps & Offline Operation', level=2)
+
 add_body(doc,
     'RakshaGIS is designed for fully offline operation on a dedicated secure line after initial installation. '
     'No service requires internet access during normal operation.')
@@ -445,7 +490,8 @@ tech_rows = [
     ('JWT authentication',    'SimpleJWT 5.3',                          'Short-lived access + rotating refresh tokens'),
     ('JWT document signing',  'PyJWT 2.x',                             'OnlyOffice editor config + callback signing'),
     ('Monitoring',            'Prometheus v2.55.1 + Grafana 11.4.2',   'Metrics collection, dashboards, alerting'),
-    ('Web server',            'Nginx 1.27 + Gunicorn (4 workers)',      'Reverse proxy, static file serving'),
+    ('Map rendering',         'Mapnik + python-mapnik',                 'Server-side high-resolution raster map export from PostGIS'),
+    ('Web server',            'Nginx 1.27 + Daphne (ASGI)',             'Reverse proxy, static file serving, WebSocket'),
     ('Containerisation',      'Docker 24 + Docker Compose v2',         'Isolated, reproducible on-premise deployment'),
     ('API documentation',     'drf-spectacular 0.27',                   'OpenAPI 3 schema + Swagger UI'),
     ('File validation',       'python-magic 0.4',                       'MIME-type check on all uploaded files'),
@@ -537,6 +583,14 @@ for label, detail in [
     ('Regulatory reporting',
      'Survey-area report generation (.docx, editable in OnlyOffice) and proximity / encroachment '
      'analysis reports are delivered; ministry-prescribed template formats are in progress.'),
+    ('GIS Server Layers for all users',
+     'Any authenticated user can register WMS, WFS, ArcGIS, and XYZ server connections and add layers. '
+     'Layers are automatically org-scoped (visible only within the user\'s organisation); '
+     'SUPERADMIN-added layers are global. Auto-discovery via GetCapabilities is supported.'),
+    ('300 DPI map export',
+     'Client-side GeoTIFF/PNG export at 150 or 300 DPI with correct tile-loading wait — '
+     'a waitForTilesLoaded() listener is attached before renderSync() to ensure all '
+     'basemap tiles are fully loaded before canvas composite, eliminating blur at high resolution.'),
 ]:
     add_bullet(doc, label, detail, OLIVE)
 

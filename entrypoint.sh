@@ -11,25 +11,39 @@ if [ -f "$LOG_FILE" ] && [ ! -w "$LOG_FILE" ]; then
 fi
 touch "$LOG_FILE" 2>/dev/null || true
 
-echo "==> Waiting for PostgreSQL..."
+echo "==> Waiting for PostgreSQL to be fully ready..."
+_ATTEMPT=0
+_MAX=90   # 90 × 2 s = 3 minutes — enough for a cold Windows/WSL2 boot
 until python -c "
 import psycopg2, os, sys
 try:
-    psycopg2.connect(
+    conn = psycopg2.connect(
         dbname=os.getenv('DB_NAME', 'rakshagis'),
         user=os.getenv('DB_USER', 'raksha'),
         password=os.getenv('DB_PASSWORD', ''),
         host=os.getenv('DB_HOST', 'db'),
         port=int(os.getenv('DB_PORT', 5432)),
-    ).close()
+        connect_timeout=5,
+    )
+    # Verify we can actually run a query (not just open a connection)
+    cur = conn.cursor()
+    cur.execute('SELECT 1')
+    cur.close()
+    conn.close()
     sys.exit(0)
 except Exception as e:
-    print(f'    not ready: {e}', flush=True)
+    print(f'    db not ready ({type(e).__name__}): {e}', flush=True)
     sys.exit(1)
 " 2>&1; do
+    _ATTEMPT=$((_ATTEMPT + 1))
+    if [ "$_ATTEMPT" -ge "$_MAX" ]; then
+        echo "==> ERROR: PostgreSQL did not become ready after $((_MAX * 2)) seconds."
+        echo "    Check: docker compose logs db"
+        exit 1
+    fi
     sleep 2
 done
-echo "==> PostgreSQL ready."
+echo "==> PostgreSQL ready (attempt ${_ATTEMPT:-1})."
 
 # Only the web/daphne container runs schema management.
 case "$1" in

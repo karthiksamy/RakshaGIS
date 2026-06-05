@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import WorkflowStep, AuditLog, Notification, DisputeReport
+from .models import WorkflowStep, AuditLog, Notification, DisputeReport, MapActivityLog
 
 
 class WorkflowStepSerializer(serializers.ModelSerializer):
@@ -46,6 +46,38 @@ class DisputeReportSerializer(serializers.ModelSerializer):
             'acknowledged_by_name', 'acknowledged_at',
         ]
         read_only_fields = fields
+
+
+class MapActivityLogSerializer(serializers.ModelSerializer):
+    user_name = serializers.SerializerMethodField()
+    action_display = serializers.CharField(source='get_action_display', read_only=True)
+    project_name = serializers.CharField(source='project.name', read_only=True, default='')
+    survey_area_name = serializers.CharField(source='survey_area.name', read_only=True, default='')
+    organisation_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MapActivityLog
+        fields = [
+            'id', 'user', 'user_name', 'organisation_name',
+            'project', 'project_name', 'survey_area', 'survey_area_name',
+            'action', 'action_display', 'activity_label',
+            'feature_id', 'layer_name', 'detail',
+            'ip_address', 'timestamp',
+        ]
+        read_only_fields = [
+            'id', 'user', 'user_name', 'organisation_name',
+            'action_display', 'project_name', 'survey_area_name', 'ip_address', 'timestamp',
+        ]
+
+    def get_user_name(self, obj):
+        if not obj.user:
+            return ''
+        return obj.user.get_full_name() or obj.user.username
+
+    def get_organisation_name(self, obj):
+        if not obj.user:
+            return ''
+        return getattr(getattr(obj.user, 'organisation', None), 'name', '')
 
 
 class NotificationSerializer(serializers.ModelSerializer):

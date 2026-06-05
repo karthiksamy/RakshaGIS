@@ -111,16 +111,10 @@ def _legend_items_html(legend: list[dict]) -> str:
             f'  <div style="width:5mm;height:3.5mm;flex-shrink:0;border:0.3px solid rgba(0,0,0,0.25);'
             f'border-radius:0.5px;overflow:hidden">{swatch}</div>'
             f'  <span style="font-size:6pt;color:#1a1a2e;overflow:hidden;text-overflow:ellipsis;'
-            f'white-space:nowrap;flex:1">{name}</span>'
-            f'</div>'
-        )
-    return ''.join(parts)
-
-
-# ── Main export ──────────────────────────────────────────────────────────────
-
-def generate_arcgis_print_html(
+            f'white-space:ndef generate_arcgis_print_html(
     *,
+    layer_images: Optional[list[dict]] = None,
+    # Keep old args for backward compatibility
     map_image_b64: str = '',
     basemap_image_b64: str = '',
     features_image_b64: str = '',
@@ -138,10 +132,13 @@ def generate_arcgis_print_html(
     extent: Optional[dict] = None,
     scale_denominator: int = 0,
     classification: str = '',
+    export_attributes: bool = False,
+    features: Optional[list[dict]] = None,
 ) -> str:
     """Return a complete, self-contained HTML document for Playwright to render as PDF."""
 
     legend = legend or []
+    features = features or []
     pw, ph = PAPER_SIZES.get(paper_size, (210, 297))
     if orientation == 'landscape':
         pw, ph = max(pw, ph), min(pw, ph)
@@ -230,17 +227,100 @@ def generate_arcgis_print_html(
         classif_html_top = f'<div style="{banner_style}">{classif_safe}</div>'
         classif_html_bot = f'<div style="{banner_style}">{classif_safe}</div>'
 
-    # Map image — encode into img src or layers
-    map_img_content = ''
-    if basemap_image_b64 or features_image_b64:
+    # Map image stack
+    if layer_images is None:
+        layer_images = []
         if basemap_image_b64:
-            map_img_content += f'<img src="data:image/png;base64,{basemap_image_b64}" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;" />'
+            layer_images.append({'name': 'Base Map', 'image_b64': basemap_image_b64})
         if features_image_b64:
-            map_img_content += f'<img src="data:image/png;base64,{features_image_b64}" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;" />'
-    elif map_image_b64:
-        map_img_content = f'<img src="data:image/png;base64,{map_image_b64}" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;" />'
+            layer_images.append({'name': 'Spatial Features', 'image_b64': features_image_b64})
+        if not layer_images and map_image_b64:
+            layer_images.append({'name': 'Spatial Features', 'image_b64': map_image_b64})
+
+    map_img_content = ''
+    if layer_images:
+        for idx, img_data in enumerate(layer_images):
+            b64 = img_data.get('image_b64', '')
+            if b64:
+                map_img_content += f'<img src="data:image/png;base64,{b64}" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;" />'
     else:
         map_img_content = '<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;background:#e0e5ea;font-size:8pt;color:#777;">Map image unavailable</div>'
+
+    # ── Paginate Feature Attributes Table ──────────────────────────────────────
+    attribute_pages_html = ''
+    if export_attributes and features:
+        features_per_page = 15
+        pages_data = []
+        for i in range(0, len(features), features_per_page):
+            pages_data.append(features[i:i+features_per_page])
+            
+        total_pages = 1 + len(pages_data)
+        
+        for idx, page_feats in enumerate(pages_data):
+            page_num = 2 + idx
+            
+            rows_html = []
+            for feat in page_feats:
+                layer_name = _html.escape(feat.get('layer_name', ''))
+                feature_id = _html.escape(feat.get('feature_id', ''))
+                attrs_dict = feat.get('attributes') or {}
+                
+                attrs_list = []
+                for k, v in attrs_dict.items():
+                    attrs_list.append(
+                        f'<div class="attr-row">'
+                        f'  <span class="attr-k">{_html.escape(str(k))}:</span>'
+                        f'  <span class="attr-v">{_html.escape(str(v))}</span>'
+                        f'</div>'
+                    )
+                if not attrs_list:
+                    attrs_list.append('<span style="color:#aaa;font-style:italic;">(no attributes)</span>')
+                attrs_html = ''.join(attrs_list)
+                
+                rows_html.append(
+                    f'<tr>'
+                    f'  <td style="font-weight:bold;color:#0d2b5e;width:30%;">{layer_name}</td>'
+                    f'  <td style="width:25%;">{feature_id}</td>'
+                    f'  <td><div class="attr-grid">{attrs_html}</div></td>'
+                    f'</tr>'
+                )
+            
+            table_rows = '\n'.join(rows_html)
+            
+            attribute_pages_html += f'''
+<div class="page page-break">
+  {classif_html_top}
+  
+  <div class="title-block-compact">
+    <div class="tb-title">Feature Attributes Table</div>
+    <div class="tb-subtitle">{title_safe}</div>
+  </div>
+  
+  <div class="table-container">
+    <table class="attributes-table">
+      <thead>
+        <tr>
+          <th>Layer Name</th>
+          <th>Feature ID</th>
+          <th>Attributes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {table_rows}
+      </tbody>
+    </table>
+  </div>
+  
+  <div class="footer">
+    <div>{attrib_html}</div>
+    <div class="footer-page">Page {page_num} of {total_pages}</div>
+  </div>
+  
+  {classif_html_bot}
+</div>
+'''
+    else:
+        total_pages = 1
 
     page_w = f'{pw}mm'
     page_h = f'{ph}mm'
@@ -263,18 +343,22 @@ body {{
   height: {page_h};
   font-family: 'Arial', 'Helvetica Neue', Helvetica, sans-serif;
   background: #ffffff;
-  overflow: hidden;
   -webkit-print-color-adjust: exact;
   print-color-adjust: exact;
 }}
 
 .page {{
   width: 100%;
-  height: 100%;
+  height: {page_h};
   padding: {outer_pad}mm;
   display: flex;
   flex-direction: column;
   gap: {gap}mm;
+}}
+
+.page-break {{
+  page-break-before: always;
+  break-before: page;
 }}
 
 /* ── TITLE BLOCK ── */
@@ -324,6 +408,23 @@ body {{
 .tb-date {{ color: #90b8d8; }}
 .tb-crs  {{ color: #6888a0; font-style: italic; }}
 
+/* ── COMPACT TITLE BLOCK ── */
+.title-block-compact {{
+  background: #0d2b5e;
+  color: #ffffff;
+  padding: {2*scale:.1f}mm {4*scale:.1f}mm;
+  flex-shrink: 0;
+  border-bottom: {1.5*scale:.1f}px solid #1e5091;
+}}
+.title-block-compact .tb-title {{
+  font-size: {max(9, round(11*scale, 0)):.0f}pt;
+  font-weight: bold;
+}}
+.title-block-compact .tb-subtitle {{
+  font-size: {max(5.5, round(6.5*scale, 0)):.0f}pt;
+  color: #a8c8ec;
+}}
+
 /* ── CONTENT AREA (map + legend side-by-side) ── */
 .content-area {{
   flex: 1;
@@ -347,6 +448,48 @@ body {{
   height: 100%;
   object-fit: cover;
   display: block;
+}}
+
+/* ── ATTRIBUTES TABLE ── */
+.table-container {{
+  flex: 1;
+  overflow: hidden;
+  margin-top: {gap}mm;
+}}
+.attributes-table {{
+  width: 100%;
+  border-collapse: collapse;
+  font-size: {max(6.5, round(7.5*scale, 0)):.0f}pt;
+}}
+.attributes-table th, .attributes-table td {{
+  border: 0.3mm solid #cbd5e1;
+  padding: {2*scale:.1f}mm {3*scale:.1f}mm;
+  text-align: left;
+  vertical-align: top;
+}}
+.attributes-table th {{
+  background: #0d2b5e;
+  color: white;
+  font-weight: bold;
+}}
+.attributes-table tr:nth-child(even) {{
+  background: #f8fafc;
+}}
+.attr-grid {{
+  display: flex;
+  flex-direction: column;
+  gap: 0.5mm;
+}}
+.attr-row {{
+  display: flex;
+  gap: 2mm;
+}}
+.attr-k {{
+  color: #64748b;
+  font-weight: bold;
+}}
+.attr-v {{
+  color: #1e293b;
 }}
 
 /* ── FOOTER ── */
@@ -414,11 +557,14 @@ body {{
   <div class="footer">
     <div>{attrib_html}</div>
     <div class="footer-mid">{extent_html}</div>
-    <div class="footer-page">Page 1 of 1</div>
+    <div class="footer-page">Page 1 of {total_pages}</div>
   </div>
 
   {classif_html_bot}
 
 </div>
+
+{attribute_pages_html}
+
 </body>
 </html>"""

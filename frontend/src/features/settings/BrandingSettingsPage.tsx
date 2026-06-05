@@ -32,7 +32,10 @@ export default function BrandingSettingsPage() {
     mutationFn: (values: Partial<BrandingConfig>) => api.patch('/core/branding/', values).then((r) => r.data),
     onSuccess: (updated) => {
       message.success(t('branding.updated'))
+      // Update cache immediately for this session, then invalidate so all
+      // components (including the login page on next visit) fetch fresh data.
       qc.setQueryData(['branding'], updated)
+      qc.invalidateQueries({ queryKey: ['branding'] })
     },
     onError: () => message.error(t('common.error')),
   })

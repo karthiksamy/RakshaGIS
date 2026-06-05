@@ -64,10 +64,14 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://localhost:8000', changeOrigin: true },
-      '/tiles': { target: 'http://localhost:7800', changeOrigin: true },
-      '/media': { target: 'http://localhost:8000', changeOrigin: true },
-      '/terrain-tiles': { target: 'http://localhost:8765', changeOrigin: true },
+      '/api':           { target: 'http://localhost:8000', changeOrigin: true },
+      '/media':         { target: 'http://localhost:8000', changeOrigin: true },
+      // Static files (Cesium, collected assets) served by Django in dev mode
+      '/static':        { target: 'http://localhost:8000', changeOrigin: true },
+      '/tiles':         { target: 'http://localhost:7800',  changeOrigin: true },
+      '/terrain-tiles': { target: 'http://localhost:8765',  changeOrigin: true },
+      // WebSocket — real-time collaboration
+      '/ws': { target: 'ws://localhost:8000', ws: true, changeOrigin: true },
     },
   },
   build: {

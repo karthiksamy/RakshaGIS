@@ -1,26 +1,10 @@
-import { Modal, Button, Form, Select, InputNumber, Space, message, Spin, Alert, Radio } from 'antd'
+import { Modal, Button, Form, Radio, message, Spin, Alert } from 'antd'
 import { DownloadOutlined, FileImageOutlined } from '@ant-design/icons'
-import { useState, useEffect } from 'react'
+import { useState, useMemo } from 'react'
 import type OLMap from 'ol/Map'
-import { fromLonLat } from 'ol/proj'
+
 import api from '@/services/api'
 
-// EPSG:3857 (Web Mercator) projection WKT — written as a .prj sidecar so QGIS/ArcGIS
-// place the georeferenced PNG using the correct CRS instead of assuming the project
-// CRS (a plain .pgw world file carries no CRS, which is why Mercator-metre coordinates
-// were landing far outside the lat/lon world extent).
-const EPSG_3857_WKT =
-  'PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",' +
-  'SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],' +
-  'AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],' +
-  'UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]],' +
-  'PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],' +
-  'PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1,' +
-  'AUTHORITY["EPSG","9001"]],AXIS["X",EAST],AXIS["Y",NORTH],' +
-  'EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 ' +
-  '+k=1 +units=m +nadgrids=@null +wktext +no_defs"],AUTHORITY["EPSG","3857"]]'
-
-// Trigger a browser download for an in-memory blob/string.
 function downloadBlob(data: BlobPart, filename: string, type: string) {
   const url = window.URL.createObjectURL(new Blob([data], { type }))
   const link = document.createElement('a')
@@ -32,6 +16,64 @@ function downloadBlob(data: BlobPart, filename: string, type: string) {
   window.URL.revokeObjectURL(url)
 }
 
+/**
+ * Attach tile-load listeners on all layer sources and return a Promise that
+ * resolves when all in-flight tile requests finish (or when the hard timeout fires).
+ *
+ * IMPORTANT: call this BEFORE triggering any map render so that tileloadstart
+ * events fired synchronously during renderSync() are captured.
+ */
+function waitForTilesLoaded(map: OLMap, timeoutMs = 10000): Promise<void> {
+  return new Promise((resolve) => {
+    let pending = 0
+    let settled = false
+    let hardTimer: ReturnType<typeof setTimeout> | null = null
+    let idleTimer: ReturnType<typeof setTimeout> | null = null
+
+    const done = (extraMs = 200) => {
+      if (settled) return
+      settled = true
+      if (hardTimer) clearTimeout(hardTimer)
+      if (idleTimer) clearTimeout(idleTimer)
+      setTimeout(resolve, extraMs)
+    }
+
+    const onStart  = () => {
+      pending++
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+    }
+    const onFinish = () => {
+      pending = Math.max(0, pending - 1)
+      if (pending === 0) {
+        // Wait a bit longer to let the browser composite the last tile before resolving
+        idleTimer = setTimeout(() => done(300), 400)
+      }
+    }
+
+    // Attach per-source listeners (including sublayers from nested groups)
+    const attachListeners = (layer: any) => {
+      const source = layer.getSource?.()
+      if (source && typeof source.on === 'function') {
+        source.on('tileloadstart',  onStart)
+        source.on('tileloadend',    onFinish)
+        source.on('tileloaderror',  onFinish)
+      }
+      // Handle layer groups
+      if (typeof layer.getLayers === 'function') {
+        layer.getLayers().forEach(attachListeners)
+      }
+    }
+    map.getLayers().forEach(attachListeners)
+
+    // Hard timeout — never block forever
+    hardTimer = setTimeout(() => done(0), timeoutMs)
+
+    // If no tiles start loading within 800 ms the viewport must be fully cached —
+    // resolve after the same idle delay used above
+    idleTimer = setTimeout(() => done(300), 800)
+  })
+}
+
 interface MapExportModalProps {
   visible: boolean
   onClose: () => void
@@ -40,182 +82,181 @@ interface MapExportModalProps {
     center?: [number, number]
     zoom?: number
   }
+  legend?: { name: string; color: string; type?: 'vector' | 'raster' }[]
+  selectedCount?: number
+  selectLayer?: React.RefObject<any>
 }
 
-export default function MapExportModal({ visible, onClose, mapInstance, mapState }: MapExportModalProps) {
+export default function MapExportModal({
+  visible, onClose, mapInstance, legend,
+  selectedCount: selectedCountProp = 0, selectLayer,
+}: MapExportModalProps) {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
-  const [styles, setStyles] = useState<string[]>([])
-  const [mapnikAvailable, setMapnikAvailable] = useState(true)
 
-  // Load available styles on mount
-  useEffect(() => {
-    const loadStyles = async () => {
-      try {
-        const response = await api.get('/core/map-styles/')
-        setStyles(response.data.styles || [])
-      } catch (error) {
-        console.warn('Could not load map styles:', error)
-        setMapnikAvailable(false)
-      }
-    }
+  const selectedCount = selectedCountProp
 
-    if (visible) {
-      loadStyles()
+  const selectedLayers = useMemo(() => {
+    if (!visible) return []
+    let feats: any[] = []
+    if (selectLayer?.current) {
+      feats = selectLayer.current.getSource?.()?.getFeatures?.() ?? []
+    } else if (mapInstance) {
+      const layers = mapInstance.getLayers().getArray()
+      const selLyr = layers.find((l: any) => l.getZIndex?.() === 11) as any
+      feats = selLyr?.getSource?.()?.getFeatures?.() ?? []
     }
-  }, [visible])
+    return Array.from(new Set(feats.map((f: any) => f.get('layer_name')).filter(Boolean))) as string[]
+  }, [visible, selectedCountProp, selectLayer, mapInstance])
 
   const handleExport = async (values: any) => {
     setLoading(true)
     try {
-      let pgwContent = ''
-      const filename = `rakshagis_map_${new Date().toISOString().split('T')[0]}.png`
+      if (!mapInstance) throw new Error('Map instance is not ready.')
 
-      if (values.method === 'canvas') {
-        if (!mapInstance) {
-          throw new Error('Map instance is not ready.')
+      const dateStr = new Date().toISOString().split('T')[0]
+      const view = mapInstance.getView()
+      const originalSize = mapInstance.getSize()!
+      const originalResolution = view.getResolution()!
+
+      // Scale factor: 300 DPI → 3×, 150 DPI → 2×, 72 DPI → 1×
+      const captureScale = values.dpi === '300' ? 3 : values.dpi === '150' ? 2 : 1
+      const isHiDpi = captureScale > 1
+
+      // ── Save and restore map state ────────────────────────────────────────
+      const layers = mapInstance.getLayers().getArray()
+      const originalStates: { layer: any; visible: boolean; style?: any }[] = []
+      layers.forEach(l => {
+        originalStates.push({
+          layer: l,
+          visible: l.getVisible(),
+          style: typeof (l as any).getStyle === 'function' ? (l as any).getStyle() : undefined,
+        })
+      })
+
+      const restoreMap = () => {
+        if (isHiDpi) {
+          mapInstance.setSize(originalSize)
+          view.setResolution(originalResolution)
         }
-
-        // Composite visible map canvases on the client
-        const mapEl = mapInstance.getTargetElement()
-        const canvases = Array.from(mapEl?.querySelectorAll('canvas') ?? []) as HTMLCanvasElement[]
-        const valid = canvases.filter((c) => c.width > 0 && c.height > 0)
-
-        if (valid.length === 0) {
-          throw new Error('No map layers are currently visible in the viewer to export.')
-        }
-
-        const captureScale = values.dpi === '300' ? 3 : values.dpi === '150' ? 2 : 1
-        const composite = document.createElement('canvas')
-        composite.width  = valid[0].width  * captureScale
-        composite.height = valid[0].height * captureScale
-
-        const ctx = composite.getContext('2d')!
-        ctx.scale(captureScale, captureScale)
-
-        valid.forEach((c) => {
-          try {
-            ctx.drawImage(c, 0, 0)
-          } catch (e) {
-            console.warn('Cross-origin canvas layer skipped in export:', e)
+        originalStates.forEach(s => {
+          s.layer.setVisible(s.visible)
+          if (s.style !== undefined && typeof s.layer.setStyle === 'function') {
+            s.layer.setStyle(s.style)
           }
         })
-
-        // Convert the composite canvas to Blob
-        const blob = await new Promise<Blob | null>((resolve) => {
-          composite.toBlob((b) => resolve(b), 'image/png')
-        })
-
-        if (!blob) {
-          throw new Error('Failed to generate PNG image data from map view.')
-        }
-
-        // Calculate georeferencing coefficients (PGW) for Web Mercator EPSG:3857
-        const view = mapInstance.getView()
-        const res = view.getResolution() ?? 1
-        const center = view.getCenter() ?? [0, 0]
-        // OpenLayers sizes the canvas backing store at devicePixelRatio × CSS size, while
-        // getResolution() returns map-units per CSS pixel. Divide by DPR so the world
-        // file's per-pixel ground size matches the actual exported pixels (backing store
-        // × captureScale); otherwise the georeferencing is off by the DPR factor on HiDPI.
-        const dpr = window.devicePixelRatio || 1
-        const exportRes = res / captureScale / dpr
-
-        const halfW = (composite.width * exportRes) / 2
-        const halfH = (composite.height * exportRes) / 2
-        
-        const ulX = center[0] - halfW + (exportRes / 2)
-        const ulY = center[1] + halfH - (exportRes / 2)
-        
-        const pgwLines = [
-          exportRes.toFixed(10),
-          '0.0',
-          '0.0',
-          (-exportRes).toFixed(10),
-          ulX.toFixed(5),
-          ulY.toFixed(5)
-        ]
-        pgwContent = pgwLines.join('\n') + '\n'
-
-        // Send blob to backend for watermarking and Trust Registry inclusion
-        const formData = new FormData()
-        formData.append('file', blob, filename)
-
-        const response = await api.post('/core/watermark-file/', formData, {
-          responseType: 'blob',
-          headers: {
-            'Content-Type': 'multipart/form-data',
-          }
-        })
-
-        // Download the georeferenced package: PNG + PGW world file + PRJ projection.
-        downloadBlob(response.data, filename, 'image/png')
-        downloadBlob(pgwContent, filename.replace(/\.png$/, '.pgw'), 'text/plain')
-        downloadBlob(EPSG_3857_WKT, filename.replace(/\.png$/, '.prj'), 'text/plain')
-
-        message.success('Georeferenced PNG package (PNG + PGW + PRJ) downloaded successfully!')
-        onClose()
-        return
+        mapInstance.renderSync()
       }
 
-      // Mapnik export method (Server-side)
-      const center = mapState.center || [78, 20]
-      const zoom = mapState.zoom || 10
+      // ── Apply high-DPI scaling ────────────────────────────────────────────
+      // Enlarging the canvas AND halving the resolution causes OL to request
+      // tiles at a higher zoom level → more tile pixels → sharper basemap.
+      // Crucially, attach tile-load listeners BEFORE triggering the render so
+      // that synchronous tileloadstart events (fired inside renderSync) are caught.
+      if (isHiDpi) {
+        const targetSize: [number, number] = [
+          originalSize[0] * captureScale,
+          originalSize[1] * captureScale,
+        ]
+        mapInstance.setSize(targetSize)
+        view.setResolution(originalResolution / captureScale)
+      }
 
-      // Calculate Mapnik georeferencing coefficients (PGW)
-      const centerMerc = fromLonLat(center)
-      const circumference = 2.0 * Math.PI * 6378137.0
-      const mapnikRes = circumference / (256.0 * Math.pow(2.0, zoom))
-      
-      const halfW = (values.width * mapnikRes) / 2
-      const halfH = (values.height * mapnikRes) / 2
-      
-      const ulX = centerMerc[0] - halfW + (mapnikRes / 2)
-      const ulY = centerMerc[1] + halfH - (mapnikRes / 2)
-      
-      const pgwLines = [
-        mapnikRes.toFixed(10),
-        '0.0',
-        '0.0',
-        (-mapnikRes).toFixed(10),
-        ulX.toFixed(5),
-        ulY.toFixed(5)
-      ]
-      pgwContent = pgwLines.join('\n') + '\n'
+      // ── Hide selection highlight, optionally filter vector layer ──────────
+      const selHighlightLyr = selectLayer?.current
+        ?? (layers.find((l: any) => l.getZIndex?.() === 11) as any)
+      if (selHighlightLyr) selHighlightLyr.setVisible(false)
 
-      const response = await api.post(
-        '/core/export-map/',
-        {
-          width: values.width,
-          height: values.height,
-          zoom: zoom,
-          center_lon: center[0],
-          center_lat: center[1],
-          style: values.style,
-        },
-        {
-          responseType: 'blob',
-        }
+      const selFeatures: any[] = selHighlightLyr?.getSource?.()?.getFeatures?.() ?? []
+      const hasSelection = selFeatures.length > 0
+      const selectedIds = new Set(
+        selFeatures.map((f: any) => f.get('feature_id') || String(f.getId() || ''))
       )
 
-      // Download the georeferenced package: PNG + PGW world file + PRJ projection.
-      downloadBlob(response.data, filename, 'image/png')
-      downloadBlob(pgwContent, filename.replace(/\.png$/, '.pgw'), 'text/plain')
-      downloadBlob(EPSG_3857_WKT, filename.replace(/\.png$/, '.prj'), 'text/plain')
+      const vectorLyr = layers.find((l: any) => {
+        const src = l.getSource?.()
+        return src && typeof src.getFeatures === 'function' && l !== selHighlightLyr
+      }) as any
 
-      message.success('Georeferenced Mapnik PNG package (PNG + PGW + PRJ) downloaded successfully!')
+      if (vectorLyr && hasSelection) {
+        const origState = originalStates.find(s => s.layer === vectorLyr)
+        const origStyle = origState?.style
+        if (origState?.visible) {
+          vectorLyr.setStyle((feature: any, resolution: any) => {
+            const fid = feature.get('feature_id') || String(feature.getId() || '')
+            if (!selectedIds.has(fid)) return null
+            if (typeof origStyle === 'function') return origStyle(feature, resolution)
+            return origStyle || null
+          })
+        }
+      }
+
+      // ── Attach tile listeners FIRST, then trigger render ─────────────────
+      // If we call waitForTilesLoaded after renderSync(), the synchronous
+      // tileloadstart events have already fired and pending stays at 0 —
+      // the listener resolves immediately with tiles still in-flight.
+      const tileWaitMs = captureScale === 3 ? 18000 : captureScale === 2 ? 12000 : 8000
+      const tilesDone = waitForTilesLoaded(mapInstance, tileWaitMs)
+
+      // Trigger the actual tile requests
+      mapInstance.renderSync()
+
+      // Wait for every tile to finish loading
+      await tilesDone
+
+      // One final synchronous render to composite the freshly-loaded tiles
+      mapInstance.renderSync()
+
+      // ── Composite all visible canvases ────────────────────────────────────
+      const mapEl = mapInstance.getTargetElement()
+      const canvases = Array.from(mapEl?.querySelectorAll('canvas') ?? []) as HTMLCanvasElement[]
+      const valid = canvases.filter(c => c.width > 0 && c.height > 0)
+      if (valid.length === 0) throw new Error('No map layers are currently visible to export.')
+
+      const composite = document.createElement('canvas')
+      composite.width  = valid[0].width
+      composite.height = valid[0].height
+      const ctx = composite.getContext('2d')!
+      valid.forEach(c => { try { ctx.drawImage(c, 0, 0) } catch { /* cross-origin tile */ } })
+
+      const blob = await new Promise<Blob | null>((res) =>
+        composite.toBlob(b => res(b), 'image/png')
+      )
+      if (!blob) throw new Error('Failed to generate PNG from map view.')
+
+      // ── Build GeoTIFF via backend watermark service ───────────────────────
+      const extent = view.calculateExtent(mapInstance.getSize() ?? [800, 600])
+      const [ul_x, ul_y, lr_x, lr_y] = [extent[0], extent[3], extent[2], extent[1]]
+
+      const formData = new FormData()
+      formData.append('file', blob, `rakshagis_map_${dateStr}.png`)
+      formData.append('ul_x', String(ul_x))
+      formData.append('ul_y', String(ul_y))
+      formData.append('lr_x', String(lr_x))
+      formData.append('lr_y', String(lr_y))
+
+      const activeLayers = legend
+        ? legend.filter(l => l.type === 'raster' || selectedLayers.includes(l.name)).map(l => l.name)
+        : []
+      formData.append('layers', JSON.stringify(activeLayers))
+
+      const response = await api.post('/core/watermark-file/', formData, {
+        responseType: 'blob',
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+
+      restoreMap()
+      downloadBlob(response.data, `rakshagis_map_${dateStr}.tif`, 'image/tiff')
+      message.success('GeoTIFF downloaded — drag it straight into QGIS/ArcGIS.')
       onClose()
     } catch (error: any) {
-      const errorMsg =
-        error?.response?.data?.detail ||
-        error?.message ||
-        'Failed to export map'
+      const errorMsg = error?.response?.data?.detail || error?.message || 'Failed to export map'
       message.error(errorMsg)
-      console.error('Export error:', error)
 
-      if (error?.response?.status === 503) {
-        setMapnikAvailable(false)
-      }
+      // Always restore map state on error
+      try {
+        if (mapInstance) mapInstance.renderSync()
+      } catch { /* ignore */ }
     } finally {
       setLoading(false)
     }
@@ -225,17 +266,15 @@ export default function MapExportModal({ visible, onClose, mapInstance, mapState
     <Modal
       open={visible}
       title={
-        <Space>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <FileImageOutlined />
           <span>Export Map</span>
-        </Space>
+        </span>
       }
       onCancel={onClose}
-      width={520}
+      width={480}
       footer={[
-        <Button key="cancel" onClick={onClose}>
-          Cancel
-        </Button>,
+        <Button key="cancel" onClick={onClose}>Cancel</Button>,
         <Button
           key="export"
           type="primary"
@@ -244,13 +283,13 @@ export default function MapExportModal({ visible, onClose, mapInstance, mapState
           onClick={() => form.submit()}
           disabled={loading}
         >
-          Export as PNG
+          Export as TIFF
         </Button>,
       ]}
     >
       {loading && (
         <div style={{ textAlign: 'center', padding: '20px 0' }}>
-          <Spin tip="Rendering map and generating georeferencing World File..." />
+          <Spin tip="Loading high-resolution tiles and generating GeoTIFF…" />
         </div>
       )}
 
@@ -259,108 +298,44 @@ export default function MapExportModal({ visible, onClose, mapInstance, mapState
           form={form}
           layout="vertical"
           onFinish={handleExport}
-          initialValues={{
-            method: 'canvas',
-            dpi: '150',
-            width: 1200,
-            height: 800,
-            style: styles[0] || 'boundaries',
-          }}
+          initialValues={{ dpi: '150' }}
         >
-          <Form.Item label="Export Method" name="method">
-            <Radio.Group buttonStyle="solid" style={{ width: '100%' }}>
-              <Radio.Button value="canvas" style={{ width: '50%', textAlign: 'center' }}>
-                WYSIWYG Capture
-              </Radio.Button>
-              <Radio.Button value="mapnik" style={{ width: '50%', textAlign: 'center' }} disabled={!mapnikAvailable}>
-                Server Vector (Mapnik)
-              </Radio.Button>
+          {selectedCount === 0 ? (
+            <Alert
+              type="info"
+              showIcon
+              message="All Features Mode"
+              description={
+                <span>
+                  No selection active — exports <strong>all visible features</strong> from the current map view.
+                  To export specific features, close this dialog, use the <strong>SELECTION</strong> tools on the left toolbar, then reopen.
+                </span>
+              }
+              style={{ marginBottom: 16 }}
+            />
+          ) : (
+            <Alert
+              type="success"
+              showIcon
+              message={`Feature Selection Active — ${selectedCount} feature(s)`}
+              description={`${selectedCount} feature(s) across ${selectedLayers.length} layer(s) will be exported. Only the selected features are captured.`}
+              style={{ marginBottom: 16 }}
+            />
+          )}
+
+          <Form.Item label="Output Quality" name="dpi">
+            <Radio.Group buttonStyle="solid">
+              <Radio.Button value="72">Screen (72 DPI)</Radio.Button>
+              <Radio.Button value="150">Print (150 DPI)</Radio.Button>
+              <Radio.Button value="300">High (300 DPI)</Radio.Button>
             </Radio.Group>
           </Form.Item>
 
-          <Form.Item
-            noStyle
-            shouldUpdate={(prev, curr) => prev.method !== curr.method}
-          >
-            {({ getFieldValue }) => {
-              const method = getFieldValue('method')
-              if (method === 'canvas') {
-                return (
-                  <>
-                    <Form.Item label="Output Quality" name="dpi">
-                      <Radio.Group buttonStyle="solid">
-                        <Radio.Button value="72">Screen (72 DPI)</Radio.Button>
-                        <Radio.Button value="150">Print (150 DPI)</Radio.Button>
-                        <Radio.Button value="300">High (300 DPI)</Radio.Button>
-                      </Radio.Group>
-                    </Form.Item>
-                    <div style={{ color: '#888', fontSize: 12, marginTop: 12 }}>
-                      <p><strong>WYSIWYG Capture:</strong> Exports exactly what you see on the screen, including the active basemap (OSM/Satellite), survey areas, defence land parcels, external layers, and drawings/measurements.</p>
-                      <p><strong>Georeferencing:</strong> Automatically generates and downloads a matching `.pgw` World File, enabling direct drag-and-drop integration in QGIS/ArcGIS.</p>
-                      <p><strong>Watermarking:</strong> Output PNG includes invisible dual-layer cryptographic metadata watermark registered in the Provenance Trust Registry.</p>
-                    </div>
-                  </>
-                )
-              }
-              return (
-                <>
-                  {!mapnikAvailable && (
-                    <Alert
-                      type="warning"
-                      message="Mapnik not available"
-                      description="Mapnik server-side vector rendering requires the Mapnik library on host. Contact admin."
-                      style={{ marginBottom: 16 }}
-                      showIcon
-                    />
-                  )}
-                  <Form.Item
-                    label="Map Style"
-                    name="style"
-                    rules={[{ required: true, message: 'Please select a style' }]}
-                  >
-                    <Select
-                      placeholder="Select map style"
-                      options={styles.map((s) => ({
-                        label: s.charAt(0).toUpperCase() + s.slice(1),
-                        value: s,
-                      }))}
-                      disabled={!mapnikAvailable}
-                    />
-                  </Form.Item>
-
-                  <Form.Item
-                    label="Width (pixels)"
-                    name="width"
-                    rules={[
-                      { type: 'number', min: 400, max: 4000, message: 'Width must be 400-4000px' },
-                      { required: true },
-                    ]}
-                  >
-                    <InputNumber style={{ width: '100%' }} disabled={!mapnikAvailable} />
-                  </Form.Item>
-
-                  <Form.Item
-                    label="Height (pixels)"
-                    name="height"
-                    rules={[
-                      { type: 'number', min: 300, max: 3000, message: 'Height must be 300-3000px' },
-                      { required: true },
-                    ]}
-                  >
-                    <InputNumber style={{ width: '100%' }} disabled={!mapnikAvailable} />
-                  </Form.Item>
-                  <div style={{ color: '#888', fontSize: 12, marginTop: 12 }}>
-                    <p><strong>Server Vector (Mapnik):</strong> renders the selected PostGIS
-                    vector layers (parcels, features, boundaries) on a plain background —
-                    it does <strong>not</strong> include the OSM/satellite basemap. For a
-                    map with the basemap, use <strong>WYSIWYG Capture</strong>.</p>
-                    <p><strong>Georeferencing:</strong> downloads a matching <code>.pgw</code> world
-                    file and <code>.prj</code> (EPSG:3857) so QGIS/ArcGIS place it correctly.</p>
-                  </div>
-                </>
-              )
-            }}
-          </Form.Item>
+          <div style={{ color: '#888', fontSize: 12, marginTop: 4 }}>
+            <p><strong>Georeferencing:</strong> A matching <code>.pgw</code> World File is included — drag the TIFF straight into QGIS/ArcGIS.</p>
+            <p style={{ marginTop: 4 }}><strong>Watermarking:</strong> Output includes an invisible cryptographic provenance watermark.</p>
+            <p style={{ marginTop: 4 }}><strong>Note:</strong> At 150/300 DPI the export waits for all high-zoom tiles to fully load before capturing — this may take 5–15 seconds depending on network speed.</p>
+          </div>
         </Form>
       )}
     </Modal>

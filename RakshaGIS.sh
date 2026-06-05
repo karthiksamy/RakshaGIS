@@ -32,12 +32,17 @@ BOLD='\033[1m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[0;33m'; RED=
 
 # ── Load settings from .env ───────────────────────────────────────────────────
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
-  DATA_DIR=$(grep         "^DATA_DIR="           "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
-  AI_BACKEND_GPU=$(grep   "^AI_BACKEND_GPU="     "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
-  AI_BACKENDS=$(grep      "^AI_BACKENDS="        "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
+  DATA_DIR=$(grep         "^DATA_DIR="              "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
+  AI_BACKEND_GPU=$(grep   "^AI_BACKEND_GPU="        "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
+  AI_BACKENDS=$(grep      "^AI_BACKENDS="           "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
+  HOST_PORT=$(grep        "^RAKSHAGIS_HTTP_PORT="   "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
+  COMPOSE_PROJECT_NAME=$(grep "^COMPOSE_PROJECT_NAME=" "$SCRIPT_DIR/.env" | cut -d= -f2 | tr -d '\r')
 fi
 DATA_DIR="${DATA_DIR:-/RakshaGIS}"
 AI_BACKEND_GPU="${AI_BACKEND_GPU:-cpu}"
+HOST_PORT="${HOST_PORT:-80}"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-rakshagis}"
+export RAKSHAGIS_HTTP_PORT="$HOST_PORT"
 
 # GPU profile suffix: "" for CPU, "-gpu" for NVIDIA
 GPU_SUFFIX=""
@@ -55,11 +60,13 @@ MONITOR_SERVICES="prometheus grafana"
 # Priority: local binary/port → Docker running → Docker stopped → not present.
 _svc_running() {
   docker ps \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
     --filter "label=com.docker.compose.service=$1" \
     --format "{{.ID}}" 2>/dev/null | grep -q .
 }
 _svc_exists() {
   docker ps -a \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
     --filter "label=com.docker.compose.service=$1" \
     --format "{{.ID}}" 2>/dev/null | grep -q .
 }
@@ -175,13 +182,15 @@ do_status() {
     $COMPOSE $ALL_PROFILE_FLAGS ps
   echo ""
 
+  _ACCESS_URL="http://localhost"
+  [[ "$HOST_PORT" != "80" ]] && _ACCESS_URL="http://localhost:${HOST_PORT}"
   WEB_STATUS=$($COMPOSE ps web --format "{{.Status}}" 2>/dev/null | head -1)
   if echo "$WEB_STATUS" | grep -q "Up"; then
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/ 2>/dev/null || echo "000")
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${_ACCESS_URL}/" 2>/dev/null || echo "000")
     if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" ]]; then
-      echo -e "  ${GREEN}✓ Web: Responding at http://localhost (HTTP $HTTP_CODE)${RESET}"
+      echo -e "  ${GREEN}✓ Web: Responding at ${_ACCESS_URL} (HTTP $HTTP_CODE)${RESET}"
     else
-      echo -e "  ${YELLOW}⚠ Web: HTTP $HTTP_CODE at http://localhost${RESET}"
+      echo -e "  ${YELLOW}⚠ Web: HTTP $HTTP_CODE at ${_ACCESS_URL}${RESET}"
     fi
   fi
   echo ""
@@ -224,12 +233,15 @@ do_start() {
   # it starts accepting requests.  Poll until we get an HTTP response so the
   # operator isn't greeted with a "login failed" screen.
   echo ""
+  _DO_START_URL="http://localhost"
+  [[ "$HOST_PORT" != "80" ]] && _DO_START_URL="http://localhost:${HOST_PORT}"
+
   echo -n ">>> Waiting for web service"
   _WEB_ATTEMPTS=0
   _WEB_MAX=90   # 90 × 2 s = 3 minutes
   _WEB_OK=false
   while [[ "$_WEB_ATTEMPTS" -lt "$_WEB_MAX" ]]; do
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost/ 2>/dev/null || echo "000")
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "${_DO_START_URL}/" 2>/dev/null || echo "000")
     if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" || "$HTTP_CODE" == "301" ]]; then
       _WEB_OK=true
       break
@@ -249,13 +261,13 @@ do_start() {
   echo ""
 
   if [[ "$_WEB_OK" == "true" ]]; then
-    echo -e "  ${GREEN}✓ RakshaGIS is ready at http://localhost${RESET}"
+    echo -e "  ${GREEN}✓ RakshaGIS is ready at ${_DO_START_URL}${RESET}"
   else
     echo -e "  ${YELLOW}⚠  Web service is still starting up (migrations may still be running).${RESET}"
     echo "    Check status:  ./RakshaGIS.sh logs web"
-    echo "    Try again in a moment:  http://localhost"
+    echo "    Try again in a moment:  ${_DO_START_URL}"
   fi
-  echo "  Admin: http://localhost/admin/"
+  echo "  Admin: ${_DO_START_URL}/admin/"
   echo ""
   echo -e "  ${CYAN}Go to Settings → AI Config to activate an AI backend.${RESET}"
   echo ""

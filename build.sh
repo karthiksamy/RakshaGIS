@@ -453,8 +453,9 @@ detect_drive_type() {
 }
 
 # ── Step 1: Determine data directory ─────────────────────────────────────────
+DATA_DIR_IS_NEW=false
 if [[ -z "$DATA_DIR" ]]; then
-  # Check if already set in .env
+  # Check if already set in .env (existing install — skip interactive selection)
   if [[ -f "$SCRIPT_DIR/.env" ]]; then
     EXISTING=$(grep "^DATA_DIR=" "$SCRIPT_DIR/.env" | cut -d= -f2)
     if [[ -n "$EXISTING" ]]; then
@@ -464,33 +465,58 @@ if [[ -z "$DATA_DIR" ]]; then
   fi
 
   if [[ -z "$DATA_DIR" ]]; then
+    DATA_DIR_IS_NEW=true
     echo -e "${BOLD}>>> Configure Storage Location${RESET}"
-    echo "RakshaGIS needs to store persistent application data (database, media, AI models, maps) and Docker images."
-    echo "Scanning available storage drives..."
+    echo "  RakshaGIS stores ALL its data (database, media, AI models, map tiles,"
+    echo "  and Docker image archives) under ONE directory you choose now."
+    echo "  This does NOT change Docker's data-root — all other Docker applications"
+    echo "  on this host remain completely unaffected."
     echo ""
-    printf "  %-25s %-10s %-10s %-10s %-10s\n" "Mount Point" "Size" "Used" "Available" "Type"
-    printf "  %-25s %-10s %-10s %-10s %-10s\n" "-----------" "----" "----" "---------" "----"
-
-    # Read from df while filtering virtual / system filesystems
-    while IFS= read -r line; do
-      local dev
-      dev=$(echo "$line" | awk '{print $1}')
-      local size
-      size=$(echo "$line" | awk '{print $2}')
-      local used
-      used=$(echo "$line" | awk '{print $3}')
-      local avail
-      avail=$(echo "$line" | awk '{print $4}')
-      local mnt
-      mnt=$(echo "$line" | awk '{print $6}')
-      local drive_type
-      drive_type=$(detect_drive_type "$dev")
-      printf "  %-25s %-10s %-10s %-10s %-10s\n" "$mnt" "$size" "$used" "$avail" "$drive_type"
-    done < <(df -h 2>/dev/null | grep -E '^/dev/')
+    echo "  Scanning available drives..."
     echo ""
 
-    read -r -p "Enter path to store RakshaGIS data (e.g. /mnt/ssd/RakshaGIS) [$DEFAULT_DATA_DIR]: " USER_INPUT
-    DATA_DIR="${USER_INPUT:-$DEFAULT_DATA_DIR}"
+    # Build numbered list of physical partitions, sorted by free space (largest first)
+    declare -a _MNT_LIST=()
+    _IDX=1
+    printf "  %-4s %-30s %-6s %-9s %-9s %-9s\n" "No." "Mount Point" "Type" "Total" "Used" "Free"
+    printf "  %-4s %-30s %-6s %-9s %-9s %-9s\n" "---" "-----------" "----" "-----" "----" "----"
+    while IFS= read -r _dfline; do
+      _dev=$(echo "$_dfline"  | awk '{print $1}')
+      _sz=$(echo "$_dfline"   | awk '{print $2}')
+      _used=$(echo "$_dfline" | awk '{print $3}')
+      _avail=$(echo "$_dfline"| awk '{print $4}')
+      _mnt=$(echo "$_dfline"  | awk '{print $6}')
+      _type=$(detect_drive_type "$_dev")
+      _MNT_LIST+=("$_mnt")
+      printf "  [%-2s] %-30s %-6s %-9s %-9s %-9s\n" \
+        "$_IDX" "$_mnt" "$_type" "$_sz" "$_used" "$_avail"
+      _IDX=$((_IDX + 1))
+    done < <(df -h 2>/dev/null | grep -E '^/dev/' | sort -k4 -rh)
+    _CUSTOM_IDX="$_IDX"
+    printf "  [%-2s] Enter a custom path\n" "$_CUSTOM_IDX"
+    echo ""
+    echo -e "  ${CYAN}RakshaGIS will create a 'RakshaGIS' subfolder on the selected drive.${RESET}"
+    echo ""
+
+    while true; do
+      read -rp "  Select storage drive [1]: " _CHOICE
+      _CHOICE="${_CHOICE:-1}"
+      if [[ "$_CHOICE" =~ ^[0-9]+$ ]]; then
+        if [[ "$_CHOICE" -ge 1 && "$_CHOICE" -le "${#_MNT_LIST[@]}" ]]; then
+          _BASE="${_MNT_LIST[$((_CHOICE - 1))]}"
+          _BASE="${_BASE%/}"        # strip trailing slash from root "/"
+          DATA_DIR="${_BASE}/RakshaGIS"
+          echo -e "\n  ${GREEN}✓ RakshaGIS data will be stored at: ${BOLD}${DATA_DIR}${RESET}\n"
+          break
+        elif [[ "$_CHOICE" -eq "$_CUSTOM_IDX" ]]; then
+          read -rp "  Enter full path (e.g. /mnt/data/RakshaGIS): " _CUSTOM
+          DATA_DIR="${_CUSTOM:-$DEFAULT_DATA_DIR}"
+          echo -e "\n  ${GREEN}✓ RakshaGIS data will be stored at: ${BOLD}${DATA_DIR}${RESET}\n"
+          break
+        fi
+      fi
+      echo -e "  ${RED}Invalid — enter a number between 1 and ${_CUSTOM_IDX}.${RESET}"
+    done
   fi
 fi
 
@@ -503,6 +529,26 @@ if [[ "$DATA_DIR" != /* ]]; then
 fi
 
 echo "Data directory: $DATA_DIR"
+
+# ── Portable deployment prompt (only on a fresh install) ─────────────────────
+# Ask once whether to archive Docker images under DATA_DIR/images/ so the whole
+# deployment can be transferred to another system without internet access.
+if [[ "$DATA_DIR_IS_NEW" == true && "$SAVE_IMAGES" == false ]]; then
+  echo ""
+  echo -e "  ${CYAN}Portable / offline deployment${RESET}"
+  echo "  Saving Docker images as .tar archives under ${DATA_DIR}/images/ lets"
+  echo "  you copy this entire directory to another system and install offline"
+  echo "  (no internet pull required on the target machine)."
+  echo "  Recommended when the target environment is air-gapped or has slow internet."
+  read -rp "  Save Docker images for portable deployment? [Y/n]: " _PORTABLE
+  if [[ "${_PORTABLE,,}" != "n" ]]; then
+    SAVE_IMAGES=true
+    echo -e "  ${GREEN}✓ Docker images will be archived to ${DATA_DIR}/images/${RESET}"
+  else
+    echo "  (Skipping — re-run with --save-images later to add portability)"
+  fi
+  echo ""
+fi
 
 # ── Step 2: Create data directory structure ───────────────────────────────────
 echo ""
@@ -518,6 +564,25 @@ for sub in postgres redis staticfiles media logs prometheus grafana backups imag
 done
 
 echo "    ✓ Data directories created"
+
+# ── Auto-detect pre-saved image archives (new-system deployment) ──────────────
+# If someone copied DATA_DIR from another machine, offer to load the saved images
+# instead of pulling from the internet — useful for offline / air-gapped systems.
+if [[ -z "$LOAD_IMAGES_DIR" ]] && [[ -d "$DATA_DIR/images" ]]; then
+  _TAR_COUNT=$(find "$DATA_DIR/images" -maxdepth 1 -name "*.tar" 2>/dev/null | wc -l)
+  if [[ "$_TAR_COUNT" -gt 0 ]]; then
+    echo ""
+    echo -e "  ${CYAN}Found ${_TAR_COUNT} Docker image archive(s) in ${DATA_DIR}/images/${RESET}"
+    echo "  These appear to be from a previous or source installation."
+    echo "  Loading them avoids pulling from the internet."
+    read -rp "  Load pre-saved images now? [Y/n]: " _LOAD_CHOICE
+    if [[ "${_LOAD_CHOICE,,}" != "n" ]]; then
+      LOAD_IMAGES_DIR="$DATA_DIR/images"
+      echo -e "  ${GREEN}✓ Will load images from ${LOAD_IMAGES_DIR}${RESET}"
+    fi
+    echo ""
+  fi
+fi
 
 # ── Step 3: Generate / update .env ──────────────────────────────────────────
 ENV_FILE="$SCRIPT_DIR/.env"

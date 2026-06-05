@@ -72,6 +72,20 @@ _svc_exists() {
 }
 _port_up() { curl -sf --connect-timeout 2 "$1" &>/dev/null; }
 
+# Returns 0 if port is free or already held by our nginx, 1 if blocked by another process
+_port_owner() {
+  docker ps --format '{{.Ports}}\t{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | grep "0\.0\.0\.0:${1}->" | awk '{print $2}' | head -1
+}
+_port_in_use() {
+  ss -tlnp 2>/dev/null | grep -q ":${1} " || \
+  netstat -tlnp 2>/dev/null | grep -q ":${1} "
+}
+_port_free_for_raksha() {
+  if ! _port_in_use "$1"; then return 0; fi
+  [[ "$(_port_owner "$1")" == "rakshagis" ]]
+}
+
 DOCKER_PROFILES=""   # --profile flags for ALL Docker-managed backends
 START_PROFILES=""    # --profile flags for backends that need `docker compose up`
 
@@ -203,6 +217,27 @@ do_start() {
   echo "  LocalAI      : $LOCALAI_STATUS"
   echo "  LlamaCpp     : $LLAMACPP_STATUS"
   echo "  AnythingLLM  : $ANYTHINGLLM_STATUS"
+  echo ""
+
+  # ── Pre-flight port check ────────────────────────────────────────────────────
+  if ! _port_free_for_raksha "$HOST_PORT"; then
+    BLOCKER="$(_port_owner "$HOST_PORT")"
+    echo -e "  ${RED}✗ Cannot start — port ${HOST_PORT} is already allocated${RESET}"
+    echo "    Occupied by: ${BLOCKER:-another process (not Docker)}"
+    echo ""
+    echo "  Options:"
+    echo "  1. Free the port: stop the process using port ${HOST_PORT},"
+    echo "     then re-run:  ./RakshaGIS.sh start"
+    echo "  2. Use a different port: edit .env and change"
+    echo "       RAKSHAGIS_HTTP_PORT=${HOST_PORT}"
+    echo "     to a free port, then re-run:  ./RakshaGIS.sh start"
+    echo "  3. Reconfigure from scratch:"
+    echo "       ./build.sh --port <free-port>"
+    echo ""
+    echo "  To find free ports:  ss -tlnp | grep LISTEN"
+    return 1
+  fi
+  echo -e "  ${GREEN}✓ Port ${HOST_PORT} is available.${RESET}"
   echo ""
 
   echo ">>> Starting core services (db · redis · web · celery · nginx · pg_tileserv)…"

@@ -161,31 +161,56 @@ else
   echo -e "  ${GREEN}✓ No other Compose projects currently running.${RESET}"
 fi
 
+# ── Port helper ───────────────────────────────────────────────────────────────
+# Returns 0 if the port is free (or already held by our own nginx), 1 if blocked.
+_port_owner() {
+  local port="$1"
+  docker ps --format '{{.Ports}}\t{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | grep "0\.0\.0\.0:${port}->" | awk '{print $2}' | head -1
+}
+_port_in_use() {
+  local port="$1"
+  ss -tlnp 2>/dev/null | grep -q ":${port} " || \
+  netstat -tlnp 2>/dev/null | grep -q ":${port} "
+}
+_port_free_for_raksha() {
+  local port="$1"
+  if ! _port_in_use "$port"; then return 0; fi          # nobody on this port
+  [[ "$(_port_owner "$port")" == "rakshagis" ]]          # or it's already ours
+}
+
 # ── Port conflict check ───────────────────────────────────────────────────────
-# If the operator did not pass --port, auto-detect whether port 80 is free.
-# If it is occupied by a different project, prompt for an alternative port.
 if [[ -z "$HOST_PORT" ]]; then
-  if ss -tlnp 2>/dev/null | grep -q ':80 ' || \
-     netstat -tlnp 2>/dev/null | grep -q ':80 '; then
-    # Port 80 in use — find out who by checking if it is our own nginx
-    NGINX_OWNER=$(docker ps --format '{{.Ports}}\t{{.Label "com.docker.compose.project"}}' 2>/dev/null \
-      | grep "0.0.0.0:80->" | awk '{print $2}' | head -1)
-    if [[ "$NGINX_OWNER" == "rakshagis" ]]; then
-      HOST_PORT=80
+  if _port_free_for_raksha 80; then
+    HOST_PORT=80
+    if _port_in_use 80; then
       echo -e "  ${GREEN}✓ Port 80 already held by RakshaGIS nginx — OK.${RESET}"
     else
-      echo ""
-      echo -e "  ${YELLOW}⚠  Port 80 is already in use${RESET} (by: ${NGINX_OWNER:-unknown process})."
-      echo "  RakshaGIS nginx cannot bind to port 80 without displacing it."
-      echo "  Enter a different host port for the RakshaGIS web UI (e.g. 8080, 8090, 9080),"
-      echo "  or press Enter to use 8080:"
-      read -rp "  Host port [8080]: " PORT_CHOICE
-      HOST_PORT="${PORT_CHOICE:-8080}"
-      echo -e "  ${CYAN}✓ Using port ${HOST_PORT} for RakshaGIS.${RESET}"
+      echo -e "  ${GREEN}✓ Port 80 is free.${RESET}"
     fi
   else
-    HOST_PORT=80
-    echo -e "  ${GREEN}✓ Port 80 is free.${RESET}"
+    echo ""
+    echo -e "  ${YELLOW}⚠  Port 80 is already in use${RESET} (by: $(_port_owner 80 || echo 'another process'))."
+    echo "  Enter a free port for the RakshaGIS web UI."
+    echo "  Tip: common free ports — 8090, 9080, 7080, 8888"
+    echo ""
+    # Loop until the user picks a port that is actually free
+    while true; do
+      read -rp "  Host port [8090]: " PORT_CHOICE
+      HOST_PORT="${PORT_CHOICE:-8090}"
+      if ! [[ "$HOST_PORT" =~ ^[0-9]+$ ]] || \
+         [[ "$HOST_PORT" -lt 1 || "$HOST_PORT" -gt 65535 ]]; then
+        echo -e "  ${RED}✗ '$HOST_PORT' is not a valid port number (1-65535). Try again.${RESET}"
+        continue
+      fi
+      if _port_free_for_raksha "$HOST_PORT"; then
+        echo -e "  ${GREEN}✓ Port ${HOST_PORT} is free — using it for RakshaGIS.${RESET}"
+        break
+      fi
+      BLOCKER="$(_port_owner "$HOST_PORT")"
+      echo -e "  ${RED}✗ Port ${HOST_PORT} is also occupied${RESET} (by: ${BLOCKER:-another process})."
+      echo "  Please choose a different port."
+    done
   fi
 fi
 

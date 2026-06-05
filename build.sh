@@ -1188,12 +1188,12 @@ if command -v node &> /dev/null && [[ -d "$SCRIPT_DIR/frontend" ]]; then
     if [[ "$CESIUM_CACHED" == true ]]; then
       echo "    Cesium assets cached (v${CESIUM_VER}) — skipping copy"
       SKIP_CESIUM_COPY=1 node_modules/.bin/vite build
-      node deploy.cjs
+      DATA_DIR="$DATA_DIR" node deploy.cjs
       # Restore cached cesium into the freshly emptied staticfiles/
       cp -r "$CESIUM_CACHE/cesium" "$SCRIPT_DIR/staticfiles/cesium"
     else
       echo "    Cesium version changed or not cached — full build"
-      npm run build
+      DATA_DIR="$DATA_DIR" npm run build
       # Save cesium assets to persistent cache for next build
       mkdir -p "$CESIUM_CACHE"
       rm -rf "$CESIUM_CACHE/cesium"
@@ -1202,11 +1202,47 @@ if command -v node &> /dev/null && [[ -d "$SCRIPT_DIR/frontend" ]]; then
     fi
 
     cd "$SCRIPT_DIR"
+    # Sync Vite output directly to DATA_DIR/staticfiles/ so nginx can serve
+    # /static/assets/*.js correctly.  deploy.cjs targets ../data/staticfiles/
+    # which only works when DATA_DIR equals $SCRIPT_DIR/data; for any other
+    # drive selection that silent copy fails and assets never reach nginx.
+    if [[ "$SCRIPT_DIR/staticfiles" != "$DATA_DIR/staticfiles" ]]; then
+      echo "    Syncing built assets → ${DATA_DIR}/staticfiles/ ..."
+      mkdir -p "$DATA_DIR/staticfiles"
+      if command -v rsync &>/dev/null; then
+        rsync -a "$SCRIPT_DIR/staticfiles/" "$DATA_DIR/staticfiles/"
+      else
+        cp -rp "$SCRIPT_DIR/staticfiles/." "$DATA_DIR/staticfiles/"
+      fi
+    fi
     docker compose run --rm web python manage.py collectstatic --no-input
     echo "$FE_HASH" > "$FE_HASH_FILE"
     echo "    ✓ Frontend built and static files collected"
   else
     echo "    ✓ Frontend source unchanged — skipping build"
+    # If DATA_DIR/staticfiles/assets is empty (new machine or changed DATA_DIR)
+    # the Vite JS chunks are not reachable by nginx → MIME-type errors in browser.
+    # Sync from project staticfiles and run collectstatic without rebuilding.
+    if [[ ! -d "$DATA_DIR/staticfiles/assets" ]] || \
+       [[ -z "$(ls -A "$DATA_DIR/staticfiles/assets" 2>/dev/null)" ]]; then
+      if [[ -d "$SCRIPT_DIR/staticfiles/assets" ]]; then
+        echo "    ${DATA_DIR}/staticfiles/assets/ is empty — syncing cached build ..."
+        mkdir -p "$DATA_DIR/staticfiles"
+        if command -v rsync &>/dev/null; then
+          rsync -a "$SCRIPT_DIR/staticfiles/" "$DATA_DIR/staticfiles/"
+        else
+          cp -rp "$SCRIPT_DIR/staticfiles/." "$DATA_DIR/staticfiles/"
+        fi
+        cd "$SCRIPT_DIR"
+        docker compose run --rm web python manage.py collectstatic --no-input
+        echo "    ✓ Static assets synced to ${DATA_DIR}/staticfiles/"
+      else
+        echo ""
+        echo -e "  ${YELLOW}⚠  No built frontend assets found and ${DATA_DIR}/staticfiles/assets/ is empty.${RESET}"
+        echo "     Force a full frontend rebuild:"
+        echo "     rm '${FE_HASH_FILE}'"
+      fi
+    fi
     echo "      (Delete .frontend-hash or modify src/ to force a rebuild)"
   fi
 else

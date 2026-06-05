@@ -584,96 +584,132 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
   _hd=$(_load_opt RAKSHA_OPT_HTTPS_DOMAIN); [[ -n "$_hd" ]] && OPT_HTTPS_DOMAIN="$_hd"
 fi
 
-if [[ "$DATA_DIR_IS_NEW" == true ]]; then
-  echo -e "${BOLD}>>> Optional Components${RESET}"
-  echo "  Select which optional components to enable."
-  echo "  All require a one-time internet download; fully offline after setup."
-  echo "  Each can be added later by re-running build.sh."
-  echo ""
+echo -e "${BOLD}>>> Optional Components${RESET}"
+echo "  Enable or disable optional components."
+echo "  Current selections (from previous run) are shown as defaults — press Enter to keep."
+echo "  All require a one-time internet download; fully offline after setup."
+echo ""
 
-  # ── [1] OSM Offline Tiles ───────────────────────────────────────────────────
-  echo -e "  ${BOLD}[1] India OSM Offline Tile Server${RESET}"
-  echo "      Serves India base maps entirely from local storage after import."
-  echo "      Download : ~800 MB  |  Import : 2-4 hours  |  Disk : ~20 GB"
-  if [[ -d "$DATA_DIR/tiles/osm-data" ]] && \
-     [[ -n "$(ls -A "$DATA_DIR/tiles/osm-data" 2>/dev/null)" ]]; then
-    echo -e "      ${GREEN}✓ OSM data already present — tile server will be started.${RESET}"
-    OPT_OSM=true
-  else
-    read -rp "      Enable OSM offline tile server? [y/N]: " _r
-    if [[ "${_r,,}" == "y" ]]; then
-      OPT_OSM=true; IMPORT_OSM=true
-      echo -e "      ${GREEN}✓ Selected — will download & import after build.${RESET}"
-    fi
-  fi
-  echo ""
-
-  # ── [2] Terrain Elevation Server ────────────────────────────────────────────
-  echo -e "  ${BOLD}[2] India Terrain Elevation Server (Cesium 3D)${RESET}"
-  echo "      SRTM elevation → quantized-mesh tiles for 3D terrain in Cesium."
-  echo "      Download : ~2-6 GB  |  Convert : 30-60 min  |  Disk : ~10 GB"
-  if [[ -n "$(find "$DATA_DIR/terrain/tilesets/terrain" -name "*.terrain" 2>/dev/null | head -1)" ]]; then
-    echo -e "      ${GREEN}✓ Terrain tiles already present — terrain server will be started.${RESET}"
-    OPT_TERRAIN=true; OPT_TERRAIN_SKIP_DOWNLOAD=true
-  else
-    read -rp "      Enable terrain elevation server? [y/N]: " _r
-    if [[ "${_r,,}" == "y" ]]; then
-      OPT_TERRAIN=true
-      echo "      Setup mode:"
-      echo "      [1] Download + convert SRTM now  (needs internet, ~60-90 min)"
-      echo "      [2] Data already copied — start server only"
-      read -rp "      Choice [1]: " _tm
-      [[ "${_tm}" == "2" ]] && OPT_TERRAIN_SKIP_DOWNLOAD=true
-      echo -e "      ${GREEN}✓ Terrain server selected.${RESET}"
-    fi
-  fi
-  echo ""
-
-  # ── [3] Monitoring ──────────────────────────────────────────────────────────
-  echo -e "  ${BOLD}[3] Monitoring — Prometheus + Grafana${RESET}"
-  echo "      Dashboards for service health, DB performance, resource usage."
-  echo "      Image pull : ~200 MB  |  Startup : <1 min"
-  read -rp "      Enable monitoring? [y/N]: " _r
-  [[ "${_r,,}" == "y" ]] && OPT_MONITORING=true && \
-    echo -e "      ${GREEN}✓ Monitoring selected.${RESET}"
-  echo ""
-
-  # ── [4] OnlyOffice Document Server ─────────────────────────────────────────
-  echo -e "  ${BOLD}[4] OnlyOffice Document Server${RESET}"
-  echo "      In-browser editing of Word/Excel/PowerPoint files in survey records."
-  echo "      Image pull : ~1.5 GB  |  Startup : ~2 min"
-  echo "      Skip if in-browser document editing is not required."
-  read -rp "      Enable OnlyOffice? [y/N]: " _r
-  [[ "${_r,,}" == "y" ]] && OPT_ONLYOFFICE=true && \
-    echo -e "      ${GREEN}✓ OnlyOffice selected.${RESET}"
-  echo ""
-
-  # ── [5] HTTPS / SSL (Certbot / Let's Encrypt) ───────────────────────────────
-  echo -e "  ${BOLD}[5] HTTPS / SSL — Let's Encrypt via Certbot${RESET}"
-  echo "      Secures the web UI with a free SSL certificate."
-  echo "      Requires : a public domain + ports 80 & 443 reachable from the internet."
-  echo -e "      ${YELLOW}NOT suitable for private/intranet-only deployments.${RESET}"
-  read -rp "      Enable HTTPS? [y/N]: " _r
+# ── [1] OSM Offline Tiles ─────────────────────────────────────────────────────
+echo -e "  ${BOLD}[1] India OSM Offline Tile Server${RESET}"
+echo "      Serves India base maps entirely from local storage after import."
+echo "      Download : ~800 MB  |  Import : 2-4 hours  |  Disk : ~20 GB"
+if [[ -d "$DATA_DIR/tiles/osm-data" ]] && \
+   [[ -n "$(ls -A "$DATA_DIR/tiles/osm-data" 2>/dev/null)" ]]; then
+  echo -e "      ${GREEN}✓ OSM data already present — tile server will be started.${RESET}"
+  OPT_OSM=true
+else
+  _def=$([[ "$OPT_OSM" == true ]] && echo "Y/n" || echo "y/N")
+  _defval=$([[ "$OPT_OSM" == true ]] && echo "y" || echo "n")
+  read -rp "      Enable OSM offline tile server? [${_def}]: " _r
+  _r="${_r:-$_defval}"
   if [[ "${_r,,}" == "y" ]]; then
-    read -rp "      Enter your domain (e.g. gis.example.com): " _domain
-    if [[ -n "$_domain" ]]; then
-      OPT_HTTPS=true; OPT_HTTPS_DOMAIN="$_domain"
-      echo -e "      ${GREEN}✓ HTTPS selected — domain: ${_domain}${RESET}"
-    else
-      echo -e "      ${YELLOW}⚠  No domain entered — skipping HTTPS.${RESET}"
-    fi
+    OPT_OSM=true; IMPORT_OSM=true
+    echo -e "      ${GREEN}✓ Selected — will download & import after build.${RESET}"
+  else
+    OPT_OSM=false
+    echo "      Skipped."
   fi
-  echo ""
-
-  # ── Selection summary ────────────────────────────────────────────────────────
-  echo -e "  ${BOLD}── Component selection summary ─────────────────────────────────${RESET}"
-  [[ "$OPT_OSM" == true ]]        && echo -e "  ${GREEN}✓${RESET} OSM Offline Tile Server"           || echo "  ✗ OSM Offline Tile Server       (skipped)"
-  [[ "$OPT_TERRAIN" == true ]]    && echo -e "  ${GREEN}✓${RESET} Terrain Elevation Server"          || echo "  ✗ Terrain Elevation Server      (skipped)"
-  [[ "$OPT_MONITORING" == true ]] && echo -e "  ${GREEN}✓${RESET} Monitoring (Prometheus+Grafana)"   || echo "  ✗ Monitoring                    (skipped)"
-  [[ "$OPT_ONLYOFFICE" == true ]] && echo -e "  ${GREEN}✓${RESET} OnlyOffice Document Server"        || echo "  ✗ OnlyOffice Document Server    (skipped)"
-  [[ "$OPT_HTTPS" == true ]]      && echo -e "  ${GREEN}✓${RESET} HTTPS (${OPT_HTTPS_DOMAIN})"       || echo "  ✗ HTTPS / SSL                   (skipped)"
-  echo ""
 fi
+echo ""
+
+# ── [2] Terrain Elevation Server ──────────────────────────────────────────────
+echo -e "  ${BOLD}[2] India Terrain Elevation Server (Cesium 3D)${RESET}"
+echo "      SRTM elevation → quantized-mesh tiles for 3D terrain in Cesium."
+echo "      Download : ~2-6 GB  |  Convert : 30-60 min  |  Disk : ~10 GB"
+if [[ -n "$(find "$DATA_DIR/terrain/tilesets/terrain" -name "*.terrain" 2>/dev/null | head -1)" ]]; then
+  echo -e "      ${GREEN}✓ Terrain tiles already present — terrain server will be started.${RESET}"
+  OPT_TERRAIN=true; OPT_TERRAIN_SKIP_DOWNLOAD=true
+else
+  _def=$([[ "$OPT_TERRAIN" == true ]] && echo "Y/n" || echo "y/N")
+  _defval=$([[ "$OPT_TERRAIN" == true ]] && echo "y" || echo "n")
+  read -rp "      Enable terrain elevation server? [${_def}]: " _r
+  _r="${_r:-$_defval}"
+  if [[ "${_r,,}" == "y" ]]; then
+    OPT_TERRAIN=true
+    echo "      Setup mode:"
+    echo "      [1] Download + convert SRTM now  (needs internet, ~60-90 min)"
+    echo "      [2] Data already copied — start server only"
+    read -rp "      Choice [1]: " _tm
+    [[ "${_tm}" == "2" ]] && OPT_TERRAIN_SKIP_DOWNLOAD=true
+    echo -e "      ${GREEN}✓ Terrain server selected.${RESET}"
+  else
+    OPT_TERRAIN=false; OPT_TERRAIN_SKIP_DOWNLOAD=false
+    echo "      Skipped."
+  fi
+fi
+echo ""
+
+# ── [3] Monitoring ────────────────────────────────────────────────────────────
+echo -e "  ${BOLD}[3] Monitoring — Prometheus + Grafana${RESET}"
+echo "      Dashboards for service health, DB performance, resource usage."
+echo "      Image pull : ~200 MB  |  Startup : <1 min"
+_def=$([[ "$OPT_MONITORING" == true ]] && echo "Y/n" || echo "y/N")
+_defval=$([[ "$OPT_MONITORING" == true ]] && echo "y" || echo "n")
+read -rp "      Enable monitoring? [${_def}]: " _r
+_r="${_r:-$_defval}"
+if [[ "${_r,,}" == "y" ]]; then
+  OPT_MONITORING=true
+  echo -e "      ${GREEN}✓ Monitoring selected.${RESET}"
+else
+  OPT_MONITORING=false
+  echo "      Skipped."
+fi
+echo ""
+
+# ── [4] OnlyOffice Document Server ───────────────────────────────────────────
+echo -e "  ${BOLD}[4] OnlyOffice Document Server${RESET}"
+echo "      In-browser editing of Word/Excel/PowerPoint files in survey records."
+echo "      Image pull : ~1.5 GB  |  Startup : ~2 min"
+echo "      Skip if in-browser document editing is not required."
+_def=$([[ "$OPT_ONLYOFFICE" == true ]] && echo "Y/n" || echo "y/N")
+_defval=$([[ "$OPT_ONLYOFFICE" == true ]] && echo "y" || echo "n")
+read -rp "      Enable OnlyOffice? [${_def}]: " _r
+_r="${_r:-$_defval}"
+if [[ "${_r,,}" == "y" ]]; then
+  OPT_ONLYOFFICE=true
+  echo -e "      ${GREEN}✓ OnlyOffice selected.${RESET}"
+else
+  OPT_ONLYOFFICE=false
+  echo "      Skipped."
+fi
+echo ""
+
+# ── [5] HTTPS / SSL (Certbot / Let's Encrypt) ─────────────────────────────────
+echo -e "  ${BOLD}[5] HTTPS / SSL — Let's Encrypt via Certbot${RESET}"
+echo "      Secures the web UI with a free SSL certificate."
+echo "      Requires : a public domain + ports 80 & 443 reachable from the internet."
+echo -e "      ${YELLOW}NOT suitable for private/intranet-only deployments.${RESET}"
+_def=$([[ "$OPT_HTTPS" == true ]] && echo "Y/n" || echo "y/N")
+_defval=$([[ "$OPT_HTTPS" == true ]] && echo "y" || echo "n")
+read -rp "      Enable HTTPS? [${_def}]: " _r
+_r="${_r:-$_defval}"
+if [[ "${_r,,}" == "y" ]]; then
+  _defdom="${OPT_HTTPS_DOMAIN:-}"
+  _defdom_hint=$([[ -n "$_defdom" ]] && echo " [${_defdom}]" || echo " (e.g. gis.example.com)")
+  read -rp "      Enter your domain${_defdom_hint}: " _domain
+  _domain="${_domain:-$_defdom}"
+  if [[ -n "$_domain" ]]; then
+    OPT_HTTPS=true; OPT_HTTPS_DOMAIN="$_domain"
+    echo -e "      ${GREEN}✓ HTTPS selected — domain: ${_domain}${RESET}"
+  else
+    OPT_HTTPS=false
+    echo -e "      ${YELLOW}⚠  No domain entered — skipping HTTPS.${RESET}"
+  fi
+else
+  OPT_HTTPS=false; OPT_HTTPS_DOMAIN=""
+  echo "      Skipped."
+fi
+echo ""
+
+# ── Selection summary ──────────────────────────────────────────────────────────
+echo -e "  ${BOLD}── Component selection summary ─────────────────────────────────${RESET}"
+[[ "$OPT_OSM" == true ]]        && echo -e "  ${GREEN}✓${RESET} OSM Offline Tile Server"           || echo "  ✗ OSM Offline Tile Server       (skipped)"
+[[ "$OPT_TERRAIN" == true ]]    && echo -e "  ${GREEN}✓${RESET} Terrain Elevation Server"          || echo "  ✗ Terrain Elevation Server      (skipped)"
+[[ "$OPT_MONITORING" == true ]] && echo -e "  ${GREEN}✓${RESET} Monitoring (Prometheus+Grafana)"   || echo "  ✗ Monitoring                    (skipped)"
+[[ "$OPT_ONLYOFFICE" == true ]] && echo -e "  ${GREEN}✓${RESET} OnlyOffice Document Server"        || echo "  ✗ OnlyOffice Document Server    (skipped)"
+[[ "$OPT_HTTPS" == true ]]      && echo -e "  ${GREEN}✓${RESET} HTTPS (${OPT_HTTPS_DOMAIN})"       || echo "  ✗ HTTPS / SSL                   (skipped)"
+echo ""
 
 # Build OPTIONAL_PROFILES string used by docker compose commands throughout this script
 OPTIONAL_PROFILES=""

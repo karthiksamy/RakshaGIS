@@ -82,7 +82,8 @@ usage() {
   echo "Options:"
   echo "  --dev               Run development setup (delegates to setup-dev.sh)"
   echo "  --data-dir  DIR     Set data directory (default: $DEFAULT_DATA_DIR)"
-  echo "  --save-images       Save all Docker images as tarballs in data-dir/images/"
+  echo "  --save-images       Force re-save ALL images (base + app) even if already archived"
+  echo "  --no-save-images    Skip image archiving entirely"
   echo "  --load-images DIR   Load Docker images from tarballs in DIR"
   echo "  --no-build          Skip Docker image build (use existing images)"
   echo "  --import-osm        Download India OSM data and import into local tile server"
@@ -95,12 +96,14 @@ usage() {
 
 # Parse arguments
 DATA_DIR=""
-SAVE_IMAGES=false
+SAVE_IMAGES=true      # always save by default; --no-save-images to opt out
+NO_SAVE_IMAGES=false
 LOAD_IMAGES_DIR=""
 NO_BUILD=false
 FORCE_BUILD=false
 IMPORT_OSM=false
 HOST_PORT=""      # override for nginx host port (default 80)
+APP_REBUILT=false # set true when the app image is actually rebuilt this run
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -112,6 +115,8 @@ while [[ $# -gt 0 ]]; do
       DATA_DIR="$2"; shift 2 ;;
     --save-images)
       SAVE_IMAGES=true; shift ;;
+    --no-save-images)
+      NO_SAVE_IMAGES=true; SAVE_IMAGES=false; shift ;;
     --load-images)
       LOAD_IMAGES_DIR="$2"; shift 2 ;;
     --no-build)
@@ -555,19 +560,8 @@ fi
 
 echo "Data directory: $DATA_DIR"
 
-# ── Image archiving: always save to selected location on fresh install ────────
-# All Docker images — base services, AI backends, and the built RakshaGIS app
-# image — are archived as .tar files under DATA_DIR/images/.  This means the
-# entire deployment (data + images) lives under the single selected storage path
-# and can be copied to any other machine for fully offline installation.
-# Override with --save-images (force on) on any subsequent run.
-if [[ "$DATA_DIR_IS_NEW" == true && "$SAVE_IMAGES" == false ]]; then
-  SAVE_IMAGES=true
-  echo -e "  ${GREEN}✓ All Docker images (including built app image) will be archived${RESET}"
-  echo "    to ${DATA_DIR}/images/ — copy this directory to any machine"
-  echo "    and run  ./build.sh --data-dir <path>  for a fully offline install."
-  echo ""
-fi
+# Images are always saved to DATA_DIR/images/ (see Step 7).
+# Pass --no-save-images to skip if disk space is a concern.
 
 # ── Prerequisites: Optional Component Selection ───────────────────────────────
 # Defaults — loaded from .env on re-run, or selected interactively on fresh install
@@ -898,6 +892,7 @@ if [[ "$NO_BUILD" == false ]]; then
     [[ "$IS_WSL" == true ]] && echo "    (WSL2 detected — using legacy builder)"
     _docker_build
     echo "$CURRENT_HASH" > "$BUILD_HASH_FILE"
+    APP_REBUILT=true
     echo "    ✓ Image built"
   else
     echo ""
@@ -952,14 +947,20 @@ else
   echo "    ✓ Skipping image pull (using loaded images from $LOAD_IMAGES_DIR)"
 fi
 
-# ── Step 7: Save Docker images to data dir (for offline deployment) ──────────
-if [[ "$SAVE_IMAGES" == true ]]; then
+# ── Step 7: Save Docker images to selected storage location ──────────────────
+# Images are ALWAYS saved so that DATA_DIR contains everything needed to move
+# this deployment to another machine.  Base images are skipped when their .tar
+# already exists (fast re-runs).  The app image is re-saved whenever the image
+# was rebuilt this run (Dockerfile/requirements changed) or when its tar is missing.
+# Skip entirely only when the user passed --no-save-images.
+if [[ "$NO_SAVE_IMAGES" == false ]]; then
   IMAGES_DIR="$DATA_DIR/images"
   echo ""
+  echo ">>> Saving Docker images to ${IMAGES_DIR}/"
   mkdir_p_safe "$IMAGES_DIR"
   chmod_safe 777 "$IMAGES_DIR"
 
-  # Always save core images; conditionally save optional ones
+  # Collect images to consider (core + selected optional + AI)
   IMAGES=(
     "postgis/postgis:16-3.4"
     "redis:7-alpine"
@@ -971,23 +972,49 @@ if [[ "$SAVE_IMAGES" == true ]]; then
   [[ "$OPT_MONITORING" == true ]] && IMAGES+=("prom/prometheus:v2.55.1" "grafana/grafana:11.4.2")
   [[ "$OLLAMA_BASE_URL_VAL" == "http://ollama:11434" ]] && IMAGES+=("ollama/ollama:latest")
 
+  _IMG_SAVED=0; _IMG_SKIPPED=0
   for img in "${IMAGES[@]}"; do
     safe_name=$(echo "$img" | tr '/:' '_')
-    echo "    Saving: $img"
-    docker save "$img" -o "$IMAGES_DIR/${safe_name}.tar" 2>/dev/null && echo "      ✓ Saved" || echo "      ⚠ Skipped (image not pulled)"
+    tarfile="$IMAGES_DIR/${safe_name}.tar"
+    # Skip base images whose tar already exists (unless --save-images forces refresh)
+    if [[ -f "$tarfile" && "$SAVE_IMAGES" != true ]]; then
+      echo "    ✓ $(basename "$tarfile") — already archived, skipping"
+      _IMG_SKIPPED=$((_IMG_SKIPPED + 1))
+      continue
+    fi
+    printf "    Saving %-45s " "${img}..."
+    if docker image inspect "$img" &>/dev/null; then
+      docker save "$img" -o "$tarfile"
+      echo "✓"
+      _IMG_SAVED=$((_IMG_SAVED + 1))
+    else
+      echo "⚠  not present locally — skipped"
+    fi
   done
 
-  # Save app image (explicitly named rakshagis:web in docker-compose.yml)
-  APP_IMG_NAME="rakshagis:web"
-  if docker inspect "$APP_IMG_NAME" &>/dev/null; then
-    echo "    Saving app image: $APP_IMG_NAME"
-    docker save "$APP_IMG_NAME" -o "$IMAGES_DIR/rakshagis_app.tar"
-    echo "      ✓ Saved"
+  # ── App image (rakshagis:web) ─────────────────────────────────────────────
+  # Re-save whenever: image was rebuilt this run | tar is missing | --save-images
+  APP_IMG="rakshagis:web"
+  APP_TAR="$IMAGES_DIR/rakshagis_app.tar"
+  if docker image inspect "$APP_IMG" &>/dev/null; then
+    if [[ "$APP_REBUILT" == true || ! -f "$APP_TAR" || "$SAVE_IMAGES" == true ]]; then
+      printf "    Saving %-45s " "${APP_IMG} (app)..."
+      docker save "$APP_IMG" -o "$APP_TAR"
+      echo "✓"
+      _IMG_SAVED=$((_IMG_SAVED + 1))
+    else
+      echo "    ✓ rakshagis_app.tar — image unchanged, skipping"
+      _IMG_SKIPPED=$((_IMG_SKIPPED + 1))
+    fi
   else
-    echo "      ⚠ App image not found (hasn't been built yet)"
+    echo "    ⚠  rakshagis:web not found — run without --no-build to create it"
   fi
 
-  echo "    ✓ All images saved to $IMAGES_DIR"
+  echo ""
+  echo "    ✓ ${_IMG_SAVED} image(s) saved, ${_IMG_SKIPPED} already up-to-date"
+  echo "      Location: ${IMAGES_DIR}/"
+  echo "      To reinstall on another machine:"
+  echo "        ./build.sh --data-dir ${DATA_DIR} --load-images ${IMAGES_DIR}"
 fi
 
 # ── Step 8: Initialize database and seed data ────────────────────────────────

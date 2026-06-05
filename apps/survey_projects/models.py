@@ -270,6 +270,16 @@ class GISFeature(models.Model):
             models.Index(fields=['project', 'deo_visible', 'is_deleted']),
         ]
 
+    def save(self, *args, **kwargs):
+        # Auto-assign Land_Parcel_ID (eNLI) if not already present
+        if self.geometry is not None and not (self.attributes or {}).get('Land_Parcel_ID'):
+            try:
+                from apps.survey_projects.enli_utils import ensure_land_parcel_id
+                self.attributes = ensure_land_parcel_id(self.attributes or {}, self.geometry)
+            except Exception:
+                pass
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.layer_name} [{self.geometry_type}] — {self.project.project_number}"
 
@@ -733,3 +743,74 @@ class TemporaryLayer(models.Model):
         if self.land_rights_type == self.LR_OTHER:
             return self.land_rights_other
         return dict(self.LAND_RIGHTS_CHOICES).get(self.land_rights_type, '')
+
+
+# ── Review Annotations (Redline Markup) ──────────────────────────────────────
+
+class ReviewAnnotation(models.Model):
+    """
+    Reviewer-drawn markup overlaid on a survey area during Checker/Approver review.
+    Stored separately from GIS features — cleared when the area is approved.
+    """
+    TYPE_REDLINE  = 'redline'
+    TYPE_COMMENT  = 'comment'
+    TYPE_HIGHLIGHT = 'highlight'
+
+    TYPE_CHOICES = [
+        (TYPE_REDLINE,   'Redline'),
+        (TYPE_COMMENT,   'Comment Pin'),
+        (TYPE_HIGHLIGHT, 'Highlight'),
+    ]
+
+    survey_area    = models.ForeignKey(
+        SurveyArea, on_delete=models.CASCADE, related_name='annotations'
+    )
+    created_by     = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, related_name='review_annotations'
+    )
+    annotation_type = models.CharField(max_length=12, choices=TYPE_CHOICES, default=TYPE_REDLINE)
+    geometry        = gis_models.GeometryField(srid=4326)
+    comment         = models.TextField(blank=True)
+    color           = models.CharField(max_length=7, default='#ff4444')
+    is_resolved     = models.BooleanField(default=False)
+    created_at      = models.DateTimeField(auto_now_add=True)
+    updated_at      = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.get_annotation_type_display()} on {self.survey_area} by {self.created_by}"
+
+
+class TopologyRule(models.Model):
+    MUST_NOT_OVERLAP      = 'MUST_NOT_OVERLAP'
+    MUST_BE_INSIDE        = 'MUST_BE_INSIDE'
+    MUST_NOT_HAVE_GAPS    = 'MUST_NOT_HAVE_GAPS'
+    MUST_NOT_DANGLE       = 'MUST_NOT_DANGLE'
+    MUST_COVER_EACH_OTHER = 'MUST_COVER_EACH_OTHER'
+
+    RULE_CHOICES = [
+        (MUST_NOT_OVERLAP,      'Polygons must not overlap'),
+        (MUST_BE_INSIDE,        'Features must be inside another layer'),
+        (MUST_NOT_HAVE_GAPS,    'Polygons must not have gaps'),
+        (MUST_NOT_DANGLE,       'Lines must not have dangling ends'),
+        (MUST_COVER_EACH_OTHER, 'Layers must cover each other'),
+    ]
+
+    project     = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='topology_rules')
+    rule_type   = models.CharField(max_length=30, choices=RULE_CHOICES)
+    layer_a     = models.CharField(max_length=64, help_text='Primary layer name')
+    layer_b     = models.CharField(max_length=64, blank=True, help_text='Secondary layer (for MUST_BE_INSIDE, etc.)')
+    tolerance   = models.FloatField(default=0.00001, help_text='Geometric tolerance in degrees')
+    description = models.CharField(max_length=200, blank=True)
+    is_active   = models.BooleanField(default=True)
+    created_by  = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['project', 'rule_type', 'layer_a']
+
+    def __str__(self):
+        return f"{self.project.project_number} / {self.rule_type} on {self.layer_a}"

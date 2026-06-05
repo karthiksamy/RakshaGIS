@@ -4,11 +4,12 @@ from .views import (
     SurveyProjectViewSet, SurveyAreaViewSet, GISFeatureViewSet, DefenceParcelViewSet,
     AttributeTemplateViewSet, ShapefileImportViewSet,
     ProjectLayerFolderViewSet, ProjectShareViewSet, GeoTiffLayerViewSet,
-    BufferAnalysisView, TopologyCheckView,
+    BufferAnalysisView, TopologyCheckView, TopologyRuleViewSet,
     FeatureAttachmentViewSet, CSVImportView, EncroachmentView,
     FeatureMergeView, FeatureSplitView, ProjectMilestoneViewSet,
     QGISUploadLogViewSet, TemporaryLayerViewSet,
-    SurveyAreaAccessRequestViewSet,
+    SurveyAreaAccessRequestViewSet, ReviewAnnotationViewSet,
+    georeference_image,
 )
 
 router = DefaultRouter()
@@ -26,6 +27,8 @@ router.register('attachments', FeatureAttachmentViewSet, basename='feature-attac
 router.register('milestones', ProjectMilestoneViewSet, basename='project-milestone')
 router.register('qgis-uploads', QGISUploadLogViewSet, basename='qgis-upload-log')
 router.register('temp-layers', TemporaryLayerViewSet, basename='temp-layer')
+router.register('annotations', ReviewAnnotationViewSet, basename='review-annotation')
+router.register('topology-rules', TopologyRuleViewSet, basename='topology-rule')
 
 urlpatterns = router.urls + [
     path('buffer/', BufferAnalysisView.as_view(), name='buffer-analysis'),
@@ -34,4 +37,5 @@ urlpatterns = router.urls + [
     path('<int:pk>/encroachments/', EncroachmentView.as_view(), name='encroachments'),
     path('features/merge/', FeatureMergeView.as_view(), name='feature-merge'),
     path('features/<int:pk>/split/', FeatureSplitView.as_view(), name='feature-split'),
+    path('georeference/', georeference_image, name='georeference-image'),
 ]

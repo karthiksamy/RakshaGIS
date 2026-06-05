@@ -79,6 +79,10 @@ def import_shapefile(self, job_id: int):
                     else:
                         attrs = raw_props
 
+                    # Assign Land_Parcel_ID (eNLI) — bulk_create bypasses model.save()
+                    from apps.survey_projects.enli_utils import ensure_land_parcel_id
+                    attrs = ensure_land_parcel_id(attrs, geos_geom)
+
                     features_to_create.append(GISFeature(
                         project=job.project,
                         layer_name=job.layer_name,

@@ -1347,3 +1347,78 @@ def extract_polygons_ai_pipeline(self, job_id: int):
             'raw_response', 'error_log', 'completed_at',
         ])
 
+
+@shared_task(name='ai_assistant.process_photo_ocr')
+def process_photo_ocr(attachment_id: int):
+    import re
+    import os
+    from django.conf import settings
+    from apps.survey_projects.models import FeatureAttachment, GISFeature
+
+    try:
+        attachment = FeatureAttachment.objects.select_related('feature').get(id=attachment_id)
+        if attachment.file_type != 'image' or not attachment.file:
+            return
+
+        from PIL import Image
+        import numpy as np
+        img_path = attachment.file.path
+        img = Image.open(img_path).convert('RGB')
+        img_np = np.array(img)
+
+        from apps.ai_assistant.tasks import _get_paddle_ocr
+        ocr = _get_paddle_ocr()
+        if not ocr:
+            try:
+                import pytesseract
+                text = pytesseract.image_to_string(img)
+                results = [[(None, (text, 0.95))]]
+            except Exception:
+                return
+        else:
+            results = ocr.ocr(img_np, cls=True)
+
+        if not results or not results[0]:
+            return
+
+        extracted_text = []
+        for line in results[0]:
+            try:
+                txt = line[1][0]
+                extracted_text.append(txt)
+            except Exception:
+                pass
+
+        full_text = '\n'.join(extracted_text)
+
+        attrs = dict(attachment.feature.attributes or {})
+
+        pillar_match = re.search(r'(?i)(?:BP|pillar|boundary pillar)\s*#?\s*([a-z0-9\-]+)', full_text)
+        survey_match = re.search(r'(?i)(?:survey no|sy no|khasra)\s*#?\s*([a-z0-9\/]+)', full_text)
+        date_match = re.search(r'\b\d{2}[\/\-]\d{2}[\/\-]\d{4}\b', full_text)
+
+        proposals = {}
+        if pillar_match:
+            val = pillar_match.group(1)
+            proposals['proposed_pillar_id'] = val
+            attrs['pillar_id'] = val
+        if survey_match:
+            val = survey_match.group(1)
+            proposals['proposed_survey_number'] = val
+            attrs['survey_number'] = val
+        if date_match:
+            val = date_match.group(0)
+            proposals['proposed_survey_date'] = val
+            attrs['survey_date'] = val
+
+        if proposals:
+            attachment.feature.attributes = attrs
+            attachment.feature.save(update_fields=['attributes'])
+
+            suggestion_str = ", ".join(f"{k}: {v}" for k, v in proposals.items())
+            original_caption = attachment.caption or ""
+            attachment.caption = f"Suggested attributes ({suggestion_str}). {original_caption}".strip()
+            attachment.save(update_fields=['caption'])
+    except Exception as exc:
+        print(f"Error in process_photo_ocr: {exc}")
+

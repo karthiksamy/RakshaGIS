@@ -181,6 +181,7 @@ export interface MapBookmark {
   name: string
   center: [number, number]
   zoom: number
+  thumbnail?: string
 }
 
 export interface TopoIssue {

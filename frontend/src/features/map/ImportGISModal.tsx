@@ -9,7 +9,7 @@
 import { useRef, useState } from 'react'
 import {
   Modal, Form, Input, Upload, Button, Space, Typography,
-  Tag, Alert, Collapse, message,
+  Tag, Alert, Collapse, message, Select,
 } from 'antd'
 import {
   InboxOutlined, FileZipOutlined, GlobalOutlined,
@@ -49,6 +49,8 @@ const EXT_META: Record<string, { label: string; color: string }> = {
   '.json':    { label: 'GeoJSON',       color: 'green'  },
   '.kml':     { label: 'KML',           color: 'orange' },
   '.gpkg':    { label: 'GeoPackage',    color: 'purple' },
+  '.gpx':     { label: 'GPX GPS track', color: 'cyan'   },
+  '.csv':     { label: 'CSV coords',    color: 'magenta' },
 }
 const ACCEPTED = Object.keys(EXT_META).join(',')
 
@@ -93,7 +95,7 @@ export default function ImportGISModal({
       message.error('No Shape Files folder found for this area. Select the area on the map first.')
       return
     }
-    let values: { layer_name: string; name_field?: string }
+    let values: { layer_name: string; name_field?: string; geom_type?: string }
     try {
       values = await form.validateFields()
     } catch {
@@ -104,6 +106,7 @@ export default function ImportGISModal({
     fd.append('file', fileRef.current)
     fd.append('layer_name', values.layer_name.trim())
     if (values.name_field?.trim()) fd.append('name_field', values.name_field.trim())
+    if (values.geom_type) fd.append('geom_type', values.geom_type)
 
     setLoading(true)
     setResult(null)
@@ -243,7 +246,7 @@ export default function ImportGISModal({
               beforeUpload={(file) => {
                 const ext = getExt(file.name)
                 if (!EXT_META[ext]) {
-                  message.error(`Unsupported format "${ext}". Accepted: .zip .geojson .json .kml .gpkg`)
+                  message.error(`Unsupported format "${ext}". Accepted: .zip .geojson .json .kml .gpkg .gpx .csv`)
                   return Upload.LIST_IGNORE
                 }
                 fileRef.current = file
@@ -280,7 +283,7 @@ export default function ImportGISModal({
                   <InboxOutlined style={{ fontSize: 28, color: '#4fc3f7' }} />
                   <Text style={{ color: '#aaa' }}>Click or drag file here</Text>
                   <Text type="secondary" style={{ fontSize: 11 }}>
-                    .zip (Shapefile) · .geojson · .kml · .gpkg
+                    .zip (Shapefile) · .geojson · .kml · .gpkg · .gpx · .csv
                   </Text>
                 </Space>
               )}
@@ -296,6 +299,25 @@ export default function ImportGISModal({
           >
             <Input placeholder="e.g. Survey Boundary, Phase 1 Roads" />
           </Form.Item>
+
+          {/* Target Geometry Type (only for GPX or CSV) */}
+          {(fileExt === '.gpx' || fileExt === '.csv') && (
+            <Form.Item
+              label="Target Geometry Type"
+              name="geom_type"
+              initialValue="auto"
+              tooltip="Choose how coordinate datasets should be imported and rendered on the map"
+            >
+              <Select
+                options={[
+                  { value: 'auto', label: 'Auto (Waypoints/Rows -> Points, Tracks -> Lines)' },
+                  { value: 'point', label: 'Points (Individual locations)' },
+                  { value: 'line', label: 'Line (Single path)' },
+                  { value: 'polygon', label: 'Polygon (Closed boundary)' },
+                ]}
+              />
+            </Form.Item>
+          )}
 
           {/* Name field */}
           <Form.Item

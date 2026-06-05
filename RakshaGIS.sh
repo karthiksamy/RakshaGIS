@@ -3,6 +3,28 @@
 # Usage: ./RakshaGIS.sh [start|stop|restart|status|logs|backup|update|info]
 set -e
 
+# ── Dynamic sudo wrapping for Docker ─────────────────────────────────────────
+DOCKER_NEED_SUDO=false
+if command -v docker &>/dev/null; then
+  if ! docker ps &>/dev/null; then
+    if sudo docker ps &>/dev/null; then
+      DOCKER_NEED_SUDO=true
+    fi
+  fi
+fi
+
+docker() {
+  if [[ "$1" == "--version" ]] || [[ "$1" == "version" ]]; then
+    command docker "$@"
+    return
+  fi
+  if [[ "$DOCKER_NEED_SUDO" == true ]]; then
+    sudo docker "$@"
+  else
+    command docker "$@"
+  fi
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -269,15 +291,31 @@ do_backup() {
   TIMESTAMP=$(date +%Y%m%d_%H%M%S)
   BACKUP_FILE="$BACKUP_DIR/rakshagis_backup_${TIMESTAMP}.sql.gz"
 
-  mkdir -p "$BACKUP_DIR"
+  if [[ ! -d "$BACKUP_DIR" ]]; then
+    if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
+      sudo mkdir -p "$BACKUP_DIR"
+      sudo chmod 777 "$BACKUP_DIR"
+    fi
+  fi
   echo ">>> Creating database backup…"
 
   DB_NAME=$($COMPOSE exec -T web sh -c 'echo $DB_NAME' 2>/dev/null || echo "rakshagis")
   DB_USER=$($COMPOSE exec -T web sh -c 'echo $DB_USER' 2>/dev/null || echo "raksha")
 
-  $COMPOSE exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$BACKUP_FILE"
+  if ! touch "$BACKUP_FILE" 2>/dev/null; then
+    local temp_backup="/tmp/$(basename "$BACKUP_FILE")"
+    $COMPOSE exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$temp_backup"
+    sudo mv "$temp_backup" "$BACKUP_FILE"
+    sudo chmod 644 "$BACKUP_FILE"
+  else
+    $COMPOSE exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$BACKUP_FILE"
+  fi
   echo -e "  ${GREEN}✓ Backup saved: $BACKUP_FILE${RESET}"
-  echo "    Size: $(du -sh "$BACKUP_FILE" | cut -f1)"
+  if [[ -f "$BACKUP_FILE" ]]; then
+    echo "    Size: $(du -sh "$BACKUP_FILE" 2>/dev/null | cut -f1 || echo "unknown")"
+  else
+    echo "    Size: $(sudo du -sh "$BACKUP_FILE" 2>/dev/null | cut -f1 || echo "unknown")"
+  fi
 }
 
 do_update() {

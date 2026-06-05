@@ -4,7 +4,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from rest_framework import viewsets, permissions, status
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, permission_classes as drf_permission_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -20,13 +20,15 @@ from apps.accounts.permissions import (
 from .models import (
     SurveyProject, SurveyArea, GISFeature, DefenceParcel, AttributeTemplate,
     ShapefileImport, ProjectLayerFolder, ProjectShare, GeoTiffLayer,
-    FeatureAttachment, ProjectMilestone, SurveyAreaAccessRequest,
+    FeatureAttachment, ProjectMilestone, SurveyAreaAccessRequest, ReviewAnnotation,
+    TopologyRule,
 )
 from .serializers import (
     SurveyProjectSerializer, SurveyAreaSerializer, GISFeatureSerializer, DefenceParcelSerializer,
     AttributeTemplateSerializer, ShapefileImportSerializer,
     ProjectLayerFolderSerializer, ProjectShareSerializer, GeoTiffLayerSerializer,
     BufferParcelSerializer, FeatureAttachmentSerializer, ProjectMilestoneSerializer,
+    ReviewAnnotationSerializer, TopologyRuleSerializer,
 )
 
 
@@ -441,6 +443,136 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         instance.is_deleted = True
         instance.save(update_fields=['is_deleted'])
+
+    @action(detail=False, methods=['get'], url_path='enli-search',
+            permission_classes=[permissions.IsAuthenticated])
+    def enli_search(self, request):
+        """
+        GET /api/survey_projects/features/enli-search/?q=<eNLI_code>
+
+        Search internal GISFeature attributes for a matching Land_Parcel_ID.
+        Returns GeoJSON-compatible results suitable for flyToSearchResult().
+        """
+        from django.contrib.gis.serializers.geojson import Serializer as GeoJSONSerializer
+        import json
+
+        q = (request.query_params.get('q') or '').strip()
+        if len(q) < 2:
+            return Response({'detail': 'Enter at least 2 characters.', 'results': []}, status=400)
+
+        qs = self.get_queryset().filter(
+            attributes__Land_Parcel_ID__icontains=q
+        ).exclude(geometry=None)[:20]
+
+        results = []
+        for feat in qs:
+            parcel_id = feat.attributes.get('Land_Parcel_ID', '')
+            try:
+                geom_json = json.loads(feat.geometry.geojson)
+            except Exception:
+                continue
+            results.append({
+                'id': feat.id,
+                'layer_id': None,
+                'layer_name': feat.layer_name,
+                'match_field': 'Land_Parcel_ID',
+                'match_value': parcel_id,
+                'label': f'{parcel_id} ({feat.layer_name})',
+                'geometry': geom_json,
+                'attributes': feat.attributes,
+            })
+
+        return Response({'query': q, 'count': len(results), 'results': results})
+
+    @action(detail=False, methods=['post'], url_path='atlas',
+            permission_classes=[permissions.IsAuthenticated])
+    def atlas(self, request):
+        """
+        POST /api/survey_projects/features/atlas/
+
+        Generate a multi-page PDF Atlas — one page per feature in the given layer.
+
+        Body:
+            project      (int)   project id
+            layer_name   (str)   layer to iterate over
+            title_field  (str, optional) attribute to use as page title
+            padding      (float, default 0.001) degrees of padding around each feature
+            width        (int, default 1200) render width px
+            height       (int, default 800)  render height px
+            dpi          (int, default 150)  output DPI
+        """
+        import io
+        from django.http import HttpResponse as DjResponse
+
+        project_id  = request.data.get('project')
+        layer_name  = (request.data.get('layer_name') or '').strip()
+        title_field = (request.data.get('title_field') or '').strip()
+        padding     = float(request.data.get('padding', 0.001))
+        width       = min(int(request.data.get('width', 1200)), 4000)
+        height      = min(int(request.data.get('height', 800)), 3000)
+        dpi         = min(int(request.data.get('dpi', 150)), 300)
+
+        if not project_id or not layer_name:
+            return Response({'detail': 'project and layer_name are required.'}, status=400)
+
+        features = self.get_queryset().filter(
+            project_id=project_id, layer_name=layer_name, is_deleted=False,
+        ).exclude(geometry=None)[:200]
+
+        if not features:
+            return Response({'detail': f'No features found in layer "{layer_name}".'}, status=404)
+
+        try:
+            from apps.core.services.mapnik_service import get_mapnik_service
+            from PIL import Image, ImageDraw, ImageFont
+            import math
+        except ImportError as exc:
+            return Response({'detail': f'Required library not available: {exc}'}, status=500)
+
+        svc = get_mapnik_service()
+        pages: list[Image.Image] = []
+
+        for feat in features:
+            geom = feat.geometry
+            try:
+                env = geom.envelope  # bounding box as polygon
+                minx = geom.extent[0] - padding
+                miny = geom.extent[1] - padding
+                maxx = geom.extent[2] + padding
+                maxy = geom.extent[3] + padding
+
+                # Ensure minimum extent to avoid zero-size box
+                if (maxx - minx) < 0.0001: minx -= 0.0005; maxx += 0.0005
+                if (maxy - miny) < 0.0001: miny -= 0.0005; maxy += 0.0005
+
+                svc.set_bbox((minx, miny, maxx, maxy))
+                png_bytes = svc.render_png(width=width, height=height)
+                page = Image.open(io.BytesIO(png_bytes)).convert('RGB')
+
+                # Title bar overlay
+                title_text = str(feat.attributes.get(title_field, '') if title_field else '') or f'Feature #{feat.id}'
+                draw = ImageDraw.Draw(page)
+                bar_h = 32
+                draw.rectangle([(0, 0), (width, bar_h)], fill=(10, 20, 40, 220))
+                draw.text((8, 6), f'{layer_name}  ·  {title_text}', fill=(200, 220, 255))
+
+                # ID watermark bottom-right
+                draw.text((width - 120, height - 20), f'ID {feat.id}  |  eNLI: {feat.attributes.get("Land_Parcel_ID", "—")}',
+                          fill=(120, 120, 120))
+                pages.append(page)
+            except Exception:
+                continue
+
+        if not pages:
+            return Response({'detail': 'Could not render any atlas pages.'}, status=500)
+
+        out = io.BytesIO()
+        pages[0].save(out, format='PDF', save_all=True, append_images=pages[1:],
+                      resolution=dpi, title=f'{layer_name} Atlas')
+        out.seek(0)
+        response = DjResponse(out.read(), content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{layer_name}_atlas.pdf"'
+        return response
 
     @action(detail=False, methods=['post'], url_path='rename-layer',
             permission_classes=[CanEditProject])
@@ -891,6 +1023,53 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
                     count += 1
         return Response({'detail': f'Replaced in {count} feature(s).', 'count': count})
 
+    @action(detail=False, methods=['post'], url_path='sql-view', permission_classes=[permissions.IsAuthenticated])
+    def sql_view(self, request):
+        """
+        POST /api/survey_projects/features/sql-view/
+        Execute a safe read-only SQL query and return results as GeoJSON.
+        Only SELECT statements allowed. Must reference survey_projects_gisfeature table.
+        """
+        from django.db import connection
+        import json
+
+        query = (request.data.get('query') or '').strip()
+        if not query:
+            return Response({'detail': 'query is required.'}, status=400)
+
+        # Safety: only allow SELECT statements, block destructive SQL
+        ql = query.lower()
+        if not ql.lstrip().startswith('select'):
+            return Response({'detail': 'Only SELECT statements are allowed.'}, status=400)
+        for forbidden in ('insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create', 'grant', 'pg_'):
+            if forbidden in ql:
+                return Response({'detail': f'Forbidden keyword: {forbidden}'}, status=400)
+
+        try:
+            with connection.cursor() as cur:
+                cur.execute(query)
+                cols = [d[0] for d in cur.description]
+                rows = cur.fetchall()[:500]  # cap at 500 rows
+        except Exception as exc:
+            return Response({'detail': f'SQL error: {exc}'}, status=400)
+
+        features = []
+        for row in rows:
+            row_dict = dict(zip(cols, row))
+            geom = None
+            # Look for a geom/geometry/geojson column
+            for g_col in ('geom', 'geometry', 'geojson', 'st_asgeojson'):
+                if g_col in row_dict and row_dict[g_col]:
+                    try:
+                        geom = json.loads(row_dict.pop(g_col))
+                    except Exception:
+                        row_dict.pop(g_col, None)
+                    break
+            if geom:
+                features.append({'type': 'Feature', 'geometry': geom, 'properties': {k: str(v) for k, v in row_dict.items()}})
+
+        return Response({'type': 'FeatureCollection', 'features': features, 'count': len(features)})
+
 
 class AttributeTemplateViewSet(viewsets.ModelViewSet):
     """
@@ -1204,6 +1383,371 @@ def _import_geojson_file(folder, uploaded, layer_name, name_field, user, deo_vis
 
     return Response({
         'detail': f'Imported {created} feature(s) from GeoJSON.',
+        'created': created,
+        'errors': errors[:10],
+        'type': 'vector',
+    }, status=201)
+
+
+def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='auto', deo_visible=True):
+    """Parse a GPX file and import waypoints and tracks as GISFeatures."""
+    import xml.etree.ElementTree as ET
+    from django.contrib.gis.geos import Point, LineString, Polygon
+    from rest_framework.response import Response
+    from .models import GISFeature
+
+    try:
+        xml_data = uploaded.read()
+        try:
+            decoded = xml_data.decode('utf-8')
+        except UnicodeDecodeError:
+            decoded = xml_data.decode('latin1')
+        root = ET.fromstring(decoded)
+    except Exception as exc:
+        return Response({'detail': f'Invalid GPX XML: {exc}'}, status=400)
+
+    # GPX namespaces
+    ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
+    root_tag = root.tag
+    if '}' in root_tag:
+        ns_url = root_tag.split('}')[0].strip('{')
+        ns = {'gpx': ns_url}
+    else:
+        ns = {}
+
+    created = 0
+    errors = []
+    project = folder.project
+
+    wpt_tag = './/gpx:wpt' if 'gpx' in ns else './/wpt'
+    name_tag = 'gpx:name' if 'gpx' in ns else 'name'
+    time_tag = 'gpx:time' if 'gpx' in ns else 'time'
+    desc_tag = 'gpx:desc' if 'gpx' in ns else 'desc'
+
+    # Gather waypoints coordinates & metadata
+    wpt_coords = []
+    wpt_names = []
+    for wpt in root.findall(wpt_tag, ns):
+        try:
+            lat = float(wpt.attrib['lat'])
+            lon = float(wpt.attrib['lon'])
+            name_el = wpt.find(name_tag, ns)
+            name = name_el.text if name_el is not None else 'GPS Waypoint'
+            wpt_coords.append((lon, lat))
+            wpt_names.append(name)
+        except Exception as exc:
+            errors.append(f"Waypoint parse error: {exc}")
+
+    # Process Waypoints according to geom_type
+    if geom_type == 'polygon':
+        if len(wpt_coords) >= 3:
+            try:
+                if wpt_coords[0] != wpt_coords[-1]:
+                    wpt_coords.append(wpt_coords[0])
+                if len(wpt_coords) >= 4:
+                    geom = Polygon(wpt_coords, srid=4326)
+                    fid = wpt_names[0] if name_field and wpt_names else ''
+                    GISFeature.objects.create(
+                        project=project,
+                        folder=folder,
+                        layer_name=layer_name,
+                        geometry_type=GISFeature.POLYGON,
+                        geometry=geom,
+                        feature_id=fid,
+                        attributes={'name': f"{layer_name} Waypoints Polygon", 'description': 'Constructed from waypoints'},
+                        deo_visible=deo_visible,
+                        created_by=user,
+                    )
+                    created += 1
+            except Exception as exc:
+                errors.append(f"Waypoints Polygon construction error: {exc}")
+    elif geom_type == 'line':
+        if len(wpt_coords) >= 2:
+            try:
+                geom = LineString(wpt_coords, srid=4326)
+                fid = wpt_names[0] if name_field and wpt_names else ''
+                GISFeature.objects.create(
+                    project=project,
+                    folder=folder,
+                    layer_name=layer_name,
+                    geometry_type=GISFeature.LINE,
+                    geometry=geom,
+                    feature_id=fid,
+                    attributes={'name': f"{layer_name} Waypoints Line", 'description': 'Constructed from waypoints'},
+                    deo_visible=deo_visible,
+                    created_by=user,
+                )
+                created += 1
+            except Exception as exc:
+                errors.append(f"Waypoints Line construction error: {exc}")
+    else:  # 'auto' or 'point'
+        # Import waypoints as Points
+        for i, pt in enumerate(wpt_coords):
+            try:
+                geom = Point(pt[0], pt[1], srid=4326)
+                name = wpt_names[i] if i < len(wpt_names) else 'GPS Waypoint'
+                fid = name if name_field else ''
+                GISFeature.objects.create(
+                    project=project,
+                    folder=folder,
+                    layer_name=layer_name,
+                    geometry_type=GISFeature.POINT,
+                    geometry=geom,
+                    feature_id=fid,
+                    attributes={'name': name},
+                    deo_visible=deo_visible,
+                    created_by=user,
+                )
+                created += 1
+            except Exception as exc:
+                errors.append(f"Waypoint creation error: {exc}")
+
+    # Parse Tracks
+    trk_tag = './/gpx:trk' if 'gpx' in ns else './/trk'
+    trkseg_tag = 'gpx:trkseg' if 'gpx' in ns else 'trkseg'
+    trkpt_tag = 'gpx:trkpt' if 'gpx' in ns else 'trkpt'
+
+    for trk in root.findall(trk_tag, ns):
+        try:
+            name_el = trk.find(name_tag, ns)
+            name = name_el.text if name_el is not None else 'GPS Track'
+            desc_el = trk.find(desc_tag, ns)
+            desc = desc_el.text if desc_el is not None else ''
+
+            for trkseg in trk.findall(trkseg_tag, ns):
+                pts = []
+                for trkpt in trkseg.findall(trkpt_tag, ns):
+                    lat = float(trkpt.attrib['lat'])
+                    lon = float(trkpt.attrib['lon'])
+                    pts.append((lon, lat))
+                
+                if not pts:
+                    continue
+
+                if geom_type == 'point':
+                    # Import each track point as a POINT feature
+                    for i, pt in enumerate(pts):
+                        geom = Point(pt[0], pt[1], srid=4326)
+                        fid = f"{name} pt {i+1}" if name_field else ''
+                        GISFeature.objects.create(
+                            project=project,
+                            folder=folder,
+                            layer_name=layer_name,
+                            geometry_type=GISFeature.POINT,
+                            geometry=geom,
+                            feature_id=fid,
+                            attributes={'name': f"{name} Point {i+1}", 'description': desc},
+                            deo_visible=deo_visible,
+                            created_by=user,
+                        )
+                        created += 1
+                elif geom_type == 'polygon':
+                    # Import track as closed Polygon
+                    if len(pts) >= 3:
+                        if pts[0] != pts[-1]:
+                            pts.append(pts[0])
+                        if len(pts) >= 4:
+                            geom = Polygon(pts, srid=4326)
+                            fid = name if name_field else ''
+                            GISFeature.objects.create(
+                                project=project,
+                                folder=folder,
+                                layer_name=layer_name,
+                                geometry_type=GISFeature.POLYGON,
+                                geometry=geom,
+                                feature_id=fid,
+                                attributes={'name': name, 'description': desc},
+                                deo_visible=deo_visible,
+                                created_by=user,
+                            )
+                            created += 1
+                else:  # 'auto' or 'line'
+                    # Import track as LineString
+                    if len(pts) >= 2:
+                        geom = LineString(pts, srid=4326)
+                        fid = name if name_field else ''
+                        GISFeature.objects.create(
+                            project=project,
+                            folder=folder,
+                            layer_name=layer_name,
+                            geometry_type=GISFeature.LINE,
+                            geometry=geom,
+                            feature_id=fid,
+                            attributes={'name': name, 'description': desc},
+                            deo_visible=deo_visible,
+                            created_by=user,
+                        )
+                        created += 1
+        except Exception as exc:
+            errors.append(f"Track error: {exc}")
+
+    return Response({
+        'detail': f'Imported {created} feature(s) from GPX.',
+        'created': created,
+        'errors': errors[:10],
+        'type': 'vector',
+    }, status=201)
+
+
+def _import_csv_file(folder, uploaded, layer_name, name_field, user, geom_type='auto', deo_visible=True):
+    """Parse a CSV file and import coordinates as GISFeatures."""
+    import csv
+    import io
+    from django.contrib.gis.geos import Point, LineString, Polygon
+    from rest_framework.response import Response
+    from .models import GISFeature
+
+    try:
+        csv_data = uploaded.read()
+        try:
+            decoded = csv_data.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            decoded = csv_data.decode('latin1')
+        reader = csv.DictReader(io.StringIO(decoded))
+        headers = reader.fieldnames or []
+    except Exception as exc:
+        return Response({'detail': f'Invalid CSV: {exc}'}, status=400)
+
+    # Try to identify lat/lon fields
+    lat_col = None
+    lon_col = None
+    name_col = None
+
+    lat_candidates = ['lat', 'latitude', 'y', 'lat_dec', 'lat_dd', 'north', 'northing']
+    lon_candidates = ['lon', 'longitude', 'x', 'lon_dec', 'lon_dd', 'lng', 'east', 'easting']
+    name_candidates = ['name', 'label', 'id', 'title', 'waypoint', 'point_id']
+
+    for h in headers:
+        hl = h.lower().strip()
+        if hl in lat_candidates:
+            lat_col = h
+        elif hl in lon_candidates:
+            lon_col = h
+        elif hl in name_candidates:
+            name_col = h
+
+    # If not found, look for headings starting with lat/lon
+    if not lat_col:
+        for h in headers:
+            if h.lower().strip().startswith('lat'):
+                lat_col = h
+                break
+    if not lon_col:
+        for h in headers:
+            if h.lower().strip().startswith('lon') or h.lower().strip().startswith('lng'):
+                lon_col = h
+                break
+    if not name_col:
+        for h in headers:
+            if h.lower().strip().startswith('name'):
+                name_col = h
+                break
+
+    if not lat_col or not lon_col:
+        return Response({
+            'detail': "Could not auto-detect latitude and longitude columns in CSV. Expected columns like: lat, lon, latitude, longitude, etc."
+        }, status=400)
+
+    created = 0
+    errors = []
+    project = folder.project
+
+    # Gather all coordinates and properties from CSV
+    pts = []
+    rows_attrs = []
+    first_row_name = None
+
+    for row in reader:
+        try:
+            lat_str = row.get(lat_col)
+            lon_str = row.get(lon_col)
+            if not lat_str or not lon_str:
+                continue
+            lat = float(lat_str.strip())
+            lon = float(lon_str.strip())
+
+            name = row.get(name_col, '').strip() if name_col else f"Point {reader.line_num}"
+            if first_row_name is None:
+                first_row_name = name
+
+            attrs = {k: v.strip() for k, v in row.items() if k not in (lat_col, lon_col)}
+            attrs['name'] = name
+
+            pts.append((lon, lat))
+            rows_attrs.append(attrs)
+        except Exception as exc:
+            errors.append(f"Row {reader.line_num} parse error: {exc}")
+
+    # Now create geometries based on geom_type
+    if geom_type == 'polygon':
+        if len(pts) >= 3:
+            try:
+                if pts[0] != pts[-1]:
+                    pts.append(pts[0])
+                if len(pts) >= 4:
+                    geom = Polygon(pts, srid=4326)
+                    fid = first_row_name if name_field and first_row_name else ''
+                    GISFeature.objects.create(
+                        project=project,
+                        folder=folder,
+                        layer_name=layer_name,
+                        geometry_type=GISFeature.POLYGON,
+                        geometry=geom,
+                        feature_id=fid,
+                        attributes={'name': f"{layer_name} CSV Polygon", 'description': 'Imported from CSV list'},
+                        deo_visible=deo_visible,
+                        created_by=user,
+                    )
+                    created += 1
+            except Exception as exc:
+                errors.append(f"CSV Polygon creation error: {exc}")
+        else:
+            errors.append("Need at least 3 points to construct a polygon.")
+    elif geom_type == 'line':
+        if len(pts) >= 2:
+            try:
+                geom = LineString(pts, srid=4326)
+                fid = first_row_name if name_field and first_row_name else ''
+                GISFeature.objects.create(
+                    project=project,
+                    folder=folder,
+                    layer_name=layer_name,
+                    geometry_type=GISFeature.LINE,
+                    geometry=geom,
+                    feature_id=fid,
+                    attributes={'name': f"{layer_name} CSV Line", 'description': 'Imported from CSV list'},
+                    deo_visible=deo_visible,
+                    created_by=user,
+                )
+                created += 1
+            except Exception as exc:
+                errors.append(f"CSV Line creation error: {exc}")
+        else:
+            errors.append("Need at least 2 points to construct a line.")
+    else:  # 'auto' or 'point' (meaning import each point individually)
+        for i, pt in enumerate(pts):
+            try:
+                geom = Point(pt[0], pt[1], srid=4326)
+                attrs = rows_attrs[i]
+                name = attrs.get('name', f"Point {i+1}")
+                fid = name if name_field else ''
+                GISFeature.objects.create(
+                    project=project,
+                    folder=folder,
+                    layer_name=layer_name,
+                    geometry_type=GISFeature.POINT,
+                    geometry=geom,
+                    feature_id=fid,
+                    attributes=attrs,
+                    deo_visible=deo_visible,
+                    created_by=user,
+                )
+                created += 1
+            except Exception as exc:
+                errors.append(f"Point creation error: {exc}")
+
+    return Response({
+        'detail': f'Imported {created} feature(s) from CSV.',
         'created': created,
         'errors': errors[:10],
         'type': 'vector',
@@ -1648,9 +2192,89 @@ def _build_survey_report(area, user, include_features=True, include_photos=True,
                 ).paragraph_format.space_after = Pt(6)
             doc.add_paragraph()
 
-    # ── 5. Photographs ────────────────────────────────────────────────────────
+    # ── Encroachment / Overlap details ────────────────────────────────────────
+    from apps.external_data.models import ExternalLayer
+    from apps.external_data.db_utils import layer_geojson
+    from django.contrib.gis.geos import GEOSGeometry
+
+    encroachments = []
+    survey_geoms = [f.geometry for f in features_qs if f.geometry]
+    if survey_geoms:
+        try:
+            # Union of geometries
+            union_geom = survey_geoms[0]
+            for g in survey_geoms[1:]:
+                union_geom = union_geom.union(g)
+
+            xmin, ymin, xmax, ymax = union_geom.extent
+            search_bbox = [xmin, ymin, xmax, ymax]
+
+            active_layers = ExternalLayer.objects.filter(is_active=True, database__is_active=True).select_related('database')
+            for ext_layer in active_layers:
+                # Query the layer for features in this bbox
+                fc = layer_geojson(ext_layer, limit=1000, user=user, bbox=search_bbox)
+                for feat in fc.get('features', []):
+                    geom_json = feat.get('geometry')
+                    if not geom_json:
+                        continue
+                    try:
+                        ext_geom = GEOSGeometry(json.dumps(geom_json), srid=4326)
+                    except Exception:
+                        continue
+
+                    # Check intersection
+                    if union_geom.intersects(ext_geom):
+                        overlap_area_ha = 0
+                        intersection = union_geom.intersection(ext_geom)
+                        if intersection and intersection.geom_type in ('Polygon', 'MultiPolygon'):
+                            try:
+                                overlap_area_ha = round(intersection.transform(32643, clone=True).area / 10000.0, 4)
+                            except Exception:
+                                overlap_area_ha = round(intersection.area * (111320 ** 2) / 10000.0, 4)
+
+                        props = feat.get('properties') or {}
+                        label_col = ext_layer.label_column
+                        label = str(props.get(label_col, '')) if label_col else ext_layer.display_name
+
+                        encroachments.append({
+                            'layer_name': ext_layer.display_name,
+                            'db_name': ext_layer.database.name,
+                            'feature_id': label,
+                            'overlap_area_ha': overlap_area_ha,
+                            'details': {k: str(v) for k, v in list(props.items())[:3]}
+                        })
+        except Exception as exc:
+            logger.error("Encroachment check failed: %s", exc)
+
+    # Add Section 5: ENCROACHMENT / OVERLAP ANALYSIS
+    _add_section_heading('5. ENCROACHMENT / OVERLAP ANALYSIS')
+    if encroachments:
+        enc_tbl = doc.add_table(rows=1 + len(encroachments), cols=5)
+        enc_tbl.style = 'Table Grid'
+        headers = ['External Layer', 'External Database', 'External Feature ID', 'Overlap Area (ha)', 'Details']
+        for ci, h in enumerate(headers):
+            run = enc_tbl.rows[0].cells[ci].paragraphs[0].add_run(h)
+            run.bold = True
+            run.font.size = Pt(10)
+        for ri, enc in enumerate(encroachments, start=1):
+            row = enc_tbl.rows[ri]
+            row.cells[0].paragraphs[0].add_run(enc['layer_name']).font.size = Pt(9)
+            row.cells[1].paragraphs[0].add_run(enc['db_name']).font.size = Pt(9)
+            row.cells[2].paragraphs[0].add_run(enc['feature_id']).font.size = Pt(9)
+            row.cells[3].paragraphs[0].add_run(f"{enc['overlap_area_ha']} ha" if enc['overlap_area_ha'] > 0 else '—').font.size = Pt(9)
+            
+            # Details string
+            details_str = ", ".join(f"{k}: {v}" for k, v in enc['details'].items())
+            row.cells[4].paragraphs[0].add_run(details_str).font.size = Pt(8)
+            
+        _set_col_widths(enc_tbl, [3.5, 3.5, 3.5, 2.5, 3.0])
+    else:
+        doc.add_paragraph('No encroachment or overlap with external database layers detected.')
+    doc.add_paragraph()
+
+    # ── 6. Photographs ────────────────────────────────────────────────────────
     if include_photos and photos:
-        _add_section_heading('5. PHOTOGRAPHS')
+        _add_section_heading('6. PHOTOGRAPHS')
         for photo in photos:
             try:
                 img_path = photo.file.path
@@ -1666,9 +2290,9 @@ def _build_survey_report(area, user, include_features=True, include_photos=True,
                 pass
         doc.add_paragraph()
 
-    # ── 6. Workflow History ───────────────────────────────────────────────────
+    # ── 7. Workflow History ───────────────────────────────────────────────────
     if include_workflow:
-        _add_section_heading(f'{"6" if include_photos and photos else "5"}. WORKFLOW HISTORY')
+        _add_section_heading(f'{"7" if include_photos and photos else "6"}. WORKFLOW HISTORY')
         if workflow_steps:
             wf_tbl = doc.add_table(rows=1 + len(workflow_steps), cols=4)
             wf_tbl.style = 'Table Grid'
@@ -1899,6 +2523,58 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
                 props.update(f.attributes)
             feats.append({'type': 'Feature', 'geometry': geom, 'properties': props})
         return Response({'type': 'FeatureCollection', 'features': feats})
+
+    @action(detail=True, methods=['get'], url_path='summary',
+            permission_classes=[permissions.IsAuthenticated])
+    def summary(self, request, pk=None):
+        """
+        GET /api/projects/survey-areas/{id}/summary/
+        Return live summary statistics (total area in hectares, feature counts, last edited by, etc.).
+        """
+        area = self.get_object()
+        from django.db.models import Count
+        from apps.survey_projects.models import GISFeature, ProjectLayerFolder
+        from apps.survey_projects.views import _get_subtree_folder_ids
+
+        folder_ids = []
+        if area.folder_id:
+            folder_ids = _get_subtree_folder_ids(area.folder_id)
+
+        features = GISFeature.objects.filter(folder_id__in=folder_ids, is_deleted=False)
+
+        counts = features.values('geometry_type').annotate(count=Count('id'))
+        count_map = {'POINT': 0, 'LINE': 0, 'POLYGON': 0}
+        for c in counts:
+            gt = c['geometry_type']
+            count_map[gt] = c['count']
+
+        total_sqm = 0
+        polygons = features.filter(geometry_type='POLYGON')
+        for f in polygons:
+            if f.geometry:
+                try:
+                    total_sqm += f.geometry.transform(32643, clone=True).area
+                except Exception:
+                    try:
+                        total_sqm += f.geometry.area * (111320 ** 2)
+                    except Exception:
+                        pass
+        total_ha = round(total_sqm / 10000.0, 3)
+
+        last_feat = features.order_by('-updated_at').select_related('created_by').first()
+        last_edited_by = last_feat.created_by.get_full_name() or last_feat.created_by.username if last_feat and last_feat.created_by else '—'
+        last_edited_at = last_feat.updated_at.isoformat() if last_feat else None
+
+        is_locked = area.status not in ('DRAFT', 'RETURNED')
+
+        return Response({
+            'total_area_ha': total_ha,
+            'features_count': count_map,
+            'last_edited_by': last_edited_by,
+            'last_edited_at': last_edited_at,
+            'is_locked': is_locked,
+            'status': area.status,
+        })
 
     @action(detail=True, methods=['post'], url_path='ensure-folder',
             permission_classes=[permissions.IsAuthenticated])
@@ -2596,6 +3272,13 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
         name_field = request.data.get('name_field', '').strip()
         # Default Yes; only sub-DEO uploaders send this explicitly.
         deo_visible = str(request.data.get('deo_visible', 'true')).lower() not in ('false', '0', 'no')
+        geom_type = request.data.get('geom_type', 'auto').strip().lower()
+
+        if geom_type not in ('auto', 'point', 'line', 'polygon'):
+            return Response(
+                {'detail': f'Invalid geom_type "{geom_type}". Expected one of: auto, point, line, polygon'},
+                status=400
+            )
 
         if ext in ('.tif', '.tiff'):
             return _import_geotiff(folder, uploaded, layer_name, request.user, deo_visible=deo_visible)
@@ -2605,8 +3288,12 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
             return _import_geojson_file(folder, uploaded, layer_name, name_field, request.user, deo_visible=deo_visible)
         if ext in ('.kml', '.gpkg'):
             return _import_via_gdal(folder, uploaded, layer_name, name_field, request.user, ext.lstrip('.'), deo_visible=deo_visible)
+        if ext == '.gpx':
+            return _import_gpx_file(folder, uploaded, layer_name, name_field, request.user, geom_type=geom_type, deo_visible=deo_visible)
+        if ext == '.csv':
+            return _import_csv_file(folder, uploaded, layer_name, name_field, request.user, geom_type=geom_type, deo_visible=deo_visible)
         return Response(
-            {'detail': f'Unsupported format "{ext}". Accepted: .zip, .geojson, .json, .kml, .gpkg, .tif, .tiff'},
+            {'detail': f'Unsupported format "{ext}". Accepted: .zip, .geojson, .json, .kml, .gpkg, .gpx, .csv, .tif, .tiff'},
             status=400
         )
 
@@ -2819,6 +3506,76 @@ class GeoTiffLayerViewSet(viewsets.ModelViewSet):
         layer = serializer.save(created_by=self.request.user)
         convert_geotiff_to_cog.delay(layer.id)
 
+    @action(detail=True, methods=['post'], url_path='terrain-analysis', permission_classes=[permissions.IsAuthenticated])
+    def terrain_analysis(self, request, pk=None):
+        """
+        POST /api/survey_projects/geotiffs/{id}/terrain-analysis/
+
+        Run GDAL terrain analysis on a GeoTiff DEM layer.
+        Body: { operation: 'hillshade'|'slope'|'aspect'|'contour', z_factor: 1.0, contour_interval: 10 }
+        Returns: saves result as new GeoTiffLayer and returns its id + COG path for display.
+        """
+        import os, subprocess, tempfile
+        from django.conf import settings as django_settings
+
+        layer = self.get_object()
+        operation = request.data.get('operation', 'hillshade')
+        z_factor = float(request.data.get('z_factor', 1.0))
+        contour_interval = float(request.data.get('contour_interval', 10.0))
+
+        if not layer.cog_file:
+            return Response({'detail': 'DEM has not been processed yet (no COG file).'}, status=400)
+
+        src_path = os.path.join(django_settings.MEDIA_ROOT, str(layer.cog_file))
+        if not os.path.exists(src_path):
+            return Response({'detail': 'DEM file not found.'}, status=404)
+
+        out_rel = str(layer.cog_file).rsplit('.', 1)[0] + f'_{operation}.tif'
+        out_path = os.path.join(django_settings.MEDIA_ROOT, out_rel)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+        try:
+            if operation == 'contour':
+                with tempfile.NamedTemporaryFile(suffix='.geojson', delete=False) as tmp:
+                    tmp_path = tmp.name
+                subprocess.run(
+                    ['gdal_contour', '-a', 'elev', '-i', str(contour_interval), src_path, tmp_path, '-f', 'GeoJSON'],
+                    check=True, capture_output=True,
+                )
+                import json as _json
+                with open(tmp_path) as f:
+                    data = _json.load(f)
+                os.unlink(tmp_path)
+                return Response({'type': 'contour', 'geojson': data, 'interval': contour_interval})
+
+            elif operation in ('hillshade', 'slope', 'aspect'):
+                cmd = ['gdaldem', operation, src_path, out_path, '-of', 'COG', '-co', 'COMPRESS=DEFLATE']
+                if operation == 'hillshade':
+                    cmd += ['-z', str(z_factor)]
+                subprocess.run(cmd, check=True, capture_output=True)
+
+                result_layer = GeoTiffLayer.objects.create(
+                    project=layer.project,
+                    folder=layer.folder,
+                    name=f'{layer.name}_{operation}',
+                    file=out_rel,
+                    cog_file=out_rel,
+                    status=GeoTiffLayer.DONE,
+                    created_by=request.user,
+                )
+                return Response({
+                    'type': operation,
+                    'layer_id': result_layer.id,
+                    'cog_url': f'/media/{out_rel}',
+                    'layer_name': result_layer.name,
+                })
+            else:
+                return Response({'detail': f'Unknown operation: {operation}'}, status=400)
+        except subprocess.CalledProcessError as exc:
+            return Response({'detail': f'GDAL error: {(exc.stderr or b"").decode()[:300]}'}, status=500)
+        except Exception as exc:
+            return Response({'detail': str(exc)}, status=500)
+
 
 class TopologyCheckView(APIView):
     """GET /api/projects/topology/ — check DefenceParcel geometries for errors."""
@@ -2873,6 +3630,114 @@ class TopologyCheckView(APIView):
 
         issues = invalid_list + overlaps
         return Response({'issues': issues, 'total': len(issues)})
+
+
+class TopologyRuleViewSet(viewsets.ModelViewSet):
+    """CRUD + check endpoint for project-level topology rules."""
+    serializer_class = TopologyRuleSerializer
+
+    def get_queryset(self):
+        from .models import TopologyRule
+        user = self.request.user
+        return TopologyRule.objects.filter(project__organisation=user.organisation)
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    @action(detail=False, methods=['post'], url_path='check', permission_classes=[permissions.IsAuthenticated])
+    def check(self, request):
+        """Run all active topology rules for a project and return violations as GeoJSON."""
+        from django.db import connection
+        import json
+        from .models import TopologyRule
+
+        project_id = request.data.get('project')
+        if not project_id:
+            return Response({'detail': 'project required.'}, status=400)
+
+        rules = TopologyRule.objects.filter(project_id=project_id, is_active=True)
+        violations = []
+
+        for rule in rules:
+            try:
+                with connection.cursor() as cur:
+                    if rule.rule_type == 'MUST_NOT_OVERLAP':
+                        cur.execute("""
+                            SELECT a.id, b.id,
+                                   ST_AsGeoJSON(ST_Intersection(a.geometry, b.geometry)) as geom,
+                                   ST_Area(ST_Intersection(a.geometry::geography, b.geometry::geography)) as area
+                            FROM survey_projects_gisfeature a, survey_projects_gisfeature b
+                            WHERE a.project_id = %s AND b.project_id = %s
+                              AND a.layer_name = %s AND b.layer_name = %s
+                              AND a.id < b.id
+                              AND a.is_deleted = false AND b.is_deleted = false
+                              AND ST_Overlaps(a.geometry, b.geometry)
+                        """, [project_id, project_id, rule.layer_a, rule.layer_a])
+                        for r in cur.fetchall():
+                            geom = json.loads(r[2]) if r[2] else None
+                            if geom:
+                                violations.append({
+                                    'rule_id': rule.id, 'rule_type': rule.rule_type,
+                                    'layer': rule.layer_a, 'feature_a_id': r[0], 'feature_b_id': r[1],
+                                    'description': f'{rule.layer_a}: features #{r[0]} and #{r[1]} overlap ({r[3]:.1f} m²)',
+                                    'geometry': geom,
+                                })
+
+                    elif rule.rule_type == 'MUST_BE_INSIDE' and rule.layer_b:
+                        cur.execute("""
+                            SELECT a.id, ST_AsGeoJSON(a.geometry) as geom
+                            FROM survey_projects_gisfeature a
+                            WHERE a.project_id = %s AND a.layer_name = %s AND a.is_deleted = false
+                              AND NOT EXISTS (
+                                SELECT 1 FROM survey_projects_gisfeature b
+                                WHERE b.project_id = %s AND b.layer_name = %s AND b.is_deleted = false
+                                  AND ST_Within(a.geometry, b.geometry)
+                              )
+                        """, [project_id, rule.layer_a, project_id, rule.layer_b])
+                        for r in cur.fetchall():
+                            geom = json.loads(r[1]) if r[1] else None
+                            if geom:
+                                violations.append({
+                                    'rule_id': rule.id, 'rule_type': rule.rule_type,
+                                    'layer': rule.layer_a, 'feature_a_id': r[0],
+                                    'description': f'{rule.layer_a} #{r[0]}: not inside any {rule.layer_b} feature',
+                                    'geometry': geom,
+                                })
+
+                    elif rule.rule_type == 'MUST_NOT_DANGLE':
+                        cur.execute("""
+                            SELECT a.id, ST_AsGeoJSON(ST_StartPoint(a.geometry::geometry)) as geom
+                            FROM survey_projects_gisfeature a
+                            WHERE a.project_id = %s AND a.layer_name = %s
+                              AND a.geometry_type = 'LINE' AND a.is_deleted = false
+                              AND NOT EXISTS (
+                                SELECT 1 FROM survey_projects_gisfeature b
+                                WHERE b.project_id = %s AND b.layer_name = %s AND b.id <> a.id AND b.is_deleted = false
+                                  AND (ST_DWithin(ST_StartPoint(a.geometry::geometry), ST_StartPoint(b.geometry::geometry), %s)
+                                    OR ST_DWithin(ST_StartPoint(a.geometry::geometry), ST_EndPoint(b.geometry::geometry), %s))
+                              )
+                        """, [project_id, rule.layer_a, project_id, rule.layer_a, rule.tolerance, rule.tolerance])
+                        for r in cur.fetchall():
+                            geom = json.loads(r[1]) if r[1] else None
+                            if geom:
+                                violations.append({
+                                    'rule_id': rule.id, 'rule_type': rule.rule_type,
+                                    'layer': rule.layer_a, 'feature_a_id': r[0],
+                                    'description': f'{rule.layer_a} #{r[0]}: dangling start point',
+                                    'geometry': geom,
+                                })
+            except Exception as exc:
+                violations.append({'rule_id': rule.id, 'rule_type': rule.rule_type, 'error': str(exc)})
+
+        geojson_features = [
+            {'type': 'Feature', 'geometry': v.pop('geometry', None), 'properties': v}
+            for v in violations if 'geometry' in v
+        ]
+        return Response({
+            'type': 'FeatureCollection', 'features': geojson_features,
+            'violation_count': len(geojson_features),
+            'rules_checked': len(rules),
+        })
 
 
 class BufferAnalysisView(APIView):
@@ -3101,6 +3966,14 @@ class FeatureAttachmentViewSet(viewsets.ModelViewSet):
             caption=request.data.get('caption', ''),
             uploaded_by=request.user,
         )
+        if file_type == 'image':
+            from apps.ai_assistant.tasks import process_photo_ocr
+            try:
+                process_photo_ocr.delay(attachment.id)
+            except Exception:
+                import threading
+                threading.Thread(target=process_photo_ocr, args=(attachment.id,)).start()
+
         return Response(
             FeatureAttachmentSerializer(attachment, context={'request': request}).data,
             status=201,
@@ -3822,3 +4695,157 @@ class TemporaryLayerViewSet(viewsets.ModelViewSet):
         return pdf_resp
 
     http_method_names = ['get', 'post', 'delete', 'head', 'options']
+
+
+class ReviewAnnotationViewSet(viewsets.ModelViewSet):
+    serializer_class = ReviewAnnotationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    pagination_class = None
+
+    def get_queryset(self):
+        from django.db.models import Q
+        user = self.request.user
+        
+        base_qs = SurveyArea.objects.select_related('project__organisation')
+        shared_project_ids = get_shared_project_ids(user)
+        approved_area_ids  = get_approved_area_ids(user)
+        deo_sub_ids = deo_subordinate_org_ids(user)
+
+        q = Q(project__organisation=user.organisation) if user.organisation else Q()
+        if shared_project_ids:
+            q |= Q(project_id__in=shared_project_ids)
+        if approved_area_ids:
+            q |= Q(id__in=approved_area_ids)
+        if deo_sub_ids:
+            q |= Q(project__organisation_id__in=deo_sub_ids)
+
+        if user.is_superadmin:
+            accessible_areas = SurveyArea.objects.all()
+        else:
+            accessible_areas = SurveyArea.objects.filter(q).distinct()
+
+        qs = ReviewAnnotation.objects.filter(survey_area__in=accessible_areas).select_related('created_by', 'survey_area')
+
+        sa_id = self.request.query_params.get('survey_area')
+        if sa_id:
+            qs = qs.filter(survey_area_id=sa_id)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if not (user.can_check or user.can_approve or user.is_superadmin):
+            raise PermissionDenied("Only checkers, approvers, or superadmins can create review annotations.")
+        serializer.save(created_by=user)
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not (user.can_check or user.can_approve or user.is_superadmin):
+            raise PermissionDenied("Only checkers, approvers, or superadmins can update review annotations.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not (user.can_check or user.can_approve or user.is_superadmin):
+            raise PermissionDenied("Only checkers, approvers, or superadmins can delete review annotations.")
+        instance.delete()
+
+
+@api_view(['POST'])
+@drf_permission_classes([permissions.IsAuthenticated])
+def georeference_image(request):
+    """
+    POST /api/survey_projects/georeference/
+
+    Warp a scanned image using user-provided GCPs and save as a GeoTiff layer.
+
+    Multipart body:
+        image        — uploaded image file (JPG/PNG)
+        gcps         — JSON string: [{"px": x, "py": y, "lon": lon, "lat": lat}, ...]
+        project      — project ID
+        layer_name   — name for the result layer
+        folder       — folder ID (optional)
+    """
+    import json as _json
+    import os
+    import subprocess
+    import tempfile
+    from django.conf import settings as django_settings
+
+    image_file = request.FILES.get('image')
+    gcps_json  = request.data.get('gcps', '[]')
+    project_id = request.data.get('project')
+    layer_name = (request.data.get('layer_name') or 'georeferenced_scan').strip()
+    folder_id  = request.data.get('folder')
+
+    if not image_file or not project_id:
+        return Response({'detail': 'image and project are required.'}, status=400)
+
+    try:
+        gcps = _json.loads(gcps_json)
+    except Exception:
+        return Response({'detail': 'Invalid GCPs JSON.'}, status=400)
+
+    if len(gcps) < 3:
+        return Response({'detail': 'At least 3 GCP pairs are required for warping.'}, status=400)
+
+    project = SurveyProject.objects.get(id=project_id)
+    folder  = ProjectLayerFolder.objects.get(id=folder_id) if folder_id else None
+
+    ext = os.path.splitext(image_file.name)[1] or '.jpg'
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_in:
+        for chunk in image_file.chunks():
+            tmp_in.write(chunk)
+        tmp_in_path = tmp_in.name
+
+    with tempfile.NamedTemporaryFile(suffix='_gcps.tif', delete=False) as tmp_gcps:
+        tmp_gcps_path = tmp_gcps.name
+
+    safe_name = layer_name.replace(' ', '_').replace('/', '_')
+    out_rel = f'survey_projects/{project_id}/georeference/{safe_name}.tif'
+    out_path = os.path.join(django_settings.MEDIA_ROOT, out_rel)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    try:
+        gcp_args = []
+        for gcp in gcps:
+            gcp_args += ['-gcp', str(gcp['px']), str(gcp['py']), str(gcp['lon']), str(gcp['lat'])]
+
+        subprocess.run(
+            ['gdal_translate', '-a_srs', 'EPSG:4326'] + gcp_args + [tmp_in_path, tmp_gcps_path],
+            check=True, capture_output=True,
+        )
+
+        subprocess.run(
+            ['gdalwarp', '-s_srs', 'EPSG:4326', '-t_srs', 'EPSG:3857',
+             '-r', 'bilinear', '-of', 'COG', '-co', 'COMPRESS=DEFLATE',
+             tmp_gcps_path, out_path],
+            check=True, capture_output=True,
+        )
+
+        result_layer = GeoTiffLayer.objects.create(
+            project=project,
+            folder=folder,
+            name=layer_name,
+            file=out_rel,
+            cog_file=out_rel,
+            status=GeoTiffLayer.DONE,
+            created_by=request.user,
+        )
+
+        return Response({
+            'id': result_layer.id,
+            'layer_name': result_layer.name,
+            'cog_url': f'/media/{out_rel}',
+        })
+
+    except subprocess.CalledProcessError as exc:
+        return Response({'detail': f'GDAL warping failed: {(exc.stderr or b"").decode()[:400]}'}, status=500)
+    except Exception as exc:
+        return Response({'detail': str(exc)}, status=500)
+    finally:
+        for p in [tmp_in_path, tmp_gcps_path]:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+

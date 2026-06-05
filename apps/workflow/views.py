@@ -313,6 +313,8 @@ class WorkflowStepViewSet(viewsets.ReadOnlyModelViewSet):
 
         if transition_name == 'approve':
             _create_final_folder(area.project, request.user)
+            from apps.survey_projects.models import ReviewAnnotation
+            ReviewAnnotation.objects.filter(survey_area=area).delete()
 
         # Notify org users about the area status change
         label = TRANSITION_LABELS.get(transition_name, transition_name)

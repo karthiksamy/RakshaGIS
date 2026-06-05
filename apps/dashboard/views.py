@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Max
 from django.db.models.functions import TruncMonth
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
@@ -96,6 +96,39 @@ class DashboardStatsView(APIView):
                 'timestamp': ws.timestamp.isoformat(),
             }
 
+        # ── Survey-area progress stats ─────────────────────────────────────────
+        areas = SurveyArea.objects.filter(project__in=projects)
+        area_stats = areas.aggregate(
+            total=Count('id'),
+            draft=Count('id', filter=Q(status='DRAFT')),
+            submitted=Count('id', filter=Q(status='SUBMITTED')),
+            under_review=Count('id', filter=Q(status='UNDER_REVIEW')),
+            approved=Count('id', filter=Q(status='APPROVED')),
+            published=Count('id', filter=Q(status='PUBLISHED')),
+            returned=Count('id', filter=Q(status='RETURNED')),
+        )
+
+        # Overdue: submitted/under_review for > 5 days with no workflow action
+        overdue_threshold = timezone.now() - timedelta(days=5)
+        overdue_areas = (
+            areas.filter(status__in=['SUBMITTED', 'UNDER_REVIEW'])
+            .annotate(last_action=Max('workflow_steps__timestamp'))
+            .filter(Q(last_action__lt=overdue_threshold) | Q(last_action__isnull=True))
+            .select_related('project')
+            .order_by('last_action')[:10]
+        )
+
+        # Pending work per role
+        pending_checker = areas.filter(status='SUBMITTED').count()
+        pending_approver = areas.filter(status='UNDER_REVIEW').count()
+
+        # Top 5 most-active projects (by area count)
+        top_projects = (
+            areas.values('project__id', 'project__project_number', 'project__name')
+            .annotate(area_count=Count('id'), published=Count('id', filter=Q(status='PUBLISHED')))
+            .order_by('-area_count')[:5]
+        )
+
         return Response({
             'projects': project_stats,
             'feature_count': feature_count,
@@ -116,7 +149,66 @@ class DashboardStatsView(APIView):
                 for m in monthly
             ],
             'recent_activity': [_activity_item(ws) for ws in recent_actions],
+            'survey_areas': area_stats,
+            'pending_checker': pending_checker,
+            'pending_approver': pending_approver,
+            'overdue_areas': [
+                {
+                    'id': a.id,
+                    'name': a.name,
+                    'status': a.status,
+                    'project_number': a.project.project_number,
+                    'project_id': a.project.id,
+                    'days_stuck': (timezone.now() - (a.last_action or a.updated_at)).days,
+                }
+                for a in overdue_areas
+            ],
+            'top_projects': [
+                {
+                    'id': tp['project__id'],
+                    'project_number': tp['project__project_number'],
+                    'name': tp['project__name'],
+                    'area_count': tp['area_count'],
+                    'published': tp['published'],
+                }
+                for tp in top_projects
+            ],
         })
+
+
+class SurveyAreaProgressView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        project_id = request.query_params.get('project')
+
+        if user.is_superadmin:
+            projects = SurveyProject.objects.all()
+        elif user.organisation:
+            org_ids = user.organisation.get_subtree_ids()
+            projects = SurveyProject.objects.filter(
+                Q(organisation_id__in=org_ids) | Q(shares__granted_to_id__in=org_ids)
+            ).distinct()
+        else:
+            projects = SurveyProject.objects.none()
+
+        if project_id:
+            projects = projects.filter(id=project_id)
+
+        areas = SurveyArea.objects.filter(project__in=projects)
+
+        area_stats = areas.aggregate(
+            total=Count('id'),
+            draft=Count('id', filter=Q(status='DRAFT')),
+            submitted=Count('id', filter=Q(status='SUBMITTED')),
+            under_review=Count('id', filter=Q(status='UNDER_REVIEW')),
+            approved=Count('id', filter=Q(status='APPROVED')),
+            published=Count('id', filter=Q(status='PUBLISHED')),
+            returned=Count('id', filter=Q(status='RETURNED')),
+        )
+
+        return Response(area_stats)
 
 
 class GlobalSearchView(APIView):

@@ -47,7 +47,7 @@ import {
   PlusOutlined, DeleteOutlined, CloseOutlined,
   UndoOutlined, PrinterOutlined, TableOutlined,
   EnvironmentOutlined, BookOutlined, CheckCircleOutlined,
-  SelectOutlined, FontColorsOutlined, WarningOutlined,
+  SelectOutlined, FontColorsOutlined,
   ApartmentOutlined, ScissorOutlined, HeatMapOutlined, ApiOutlined,
   CopyOutlined, LockOutlined, UnlockOutlined, FilterOutlined,
   CalculatorOutlined, FullscreenOutlined, SwapOutlined,
@@ -56,34 +56,58 @@ import {
   HistoryOutlined, RetweetOutlined,
   SearchOutlined, NodeIndexOutlined, FunctionOutlined, SisternodeOutlined,
   RadiusUprightOutlined, MinusCircleOutlined, FileAddOutlined, UploadOutlined,
-  CloudServerOutlined, BankOutlined,
+  CloudServerOutlined, BankOutlined, HighlightOutlined, CommentOutlined, CheckOutlined, BarChartOutlined,
+  WifiOutlined, SyncOutlined, MenuOutlined,
+  CodeOutlined, ToolOutlined, ScanOutlined, LineChartOutlined,
 } from '@ant-design/icons'
 import TileWMS from 'ol/source/TileWMS'
 import HeatmapLayer from 'ol/layer/Heatmap'
 import GeoJSON from 'ol/format/GeoJSON'
 import { useAppStore } from '@/app/store'
 import api from '@/services/api'
+import dayjs from 'dayjs'
+import relativeTime from 'dayjs/plugin/relativeTime'
+dayjs.extend(relativeTime)
 import { qk } from '@/services/queryKeys'
 import type {
   BasemapConfig, SurveyProject, GeoTiffLayer, BufferRingResult,
-  ProjectLayerFolder, GISFeature, MapBookmark, TopoIssue,
+  ProjectLayerFolder, GISFeature, MapBookmark,
 } from '@/types'
 import BufferAnalysisModal, { BUFFER_COLORS } from './BufferAnalysisModal'
 import AttributeTablePanel from './AttributeTablePanel'
 import PrintLayoutModal, { type LayerLegendItem } from './PrintLayoutModal'
 import MapExportModal from './MapExportModal'
+import MapAtlasModal from './MapAtlasModal'
 import TempLayersPanel, { getTempLayerColor } from './TempLayersPanel'
 import ExternalLayersPanel from './ExternalLayersPanel'
+import FeaturePhotoPanel from './FeaturePhotoPanel'
 import { makePatternFill } from './fillPatterns'
 import { resolveExtStyle, type ExtStyleResolved } from './extStyle'
 import DraggableModal from '@/components/DraggableModal'
 import NewLayerModal from './NewLayerModal'
 import ImportGISModal from './ImportGISModal'
 import FieldOfficeBrowserModal from './FieldOfficeBrowserModal'
+import ProcessingToolboxPanel from './ProcessingToolboxPanel'
+import TopologyRulesModal from './TopologyRulesModal'
+import TerrainAnalysisModal from './TerrainAnalysisModal'
+import GeoreferencerModal from './GeoreferencerModal'
+import {
+  saveCachedFeatures, getCachedFeatures, clearCachedFeatures,
+  queueOfflineFeature, getOfflineQueue, clearOfflineQueueItem,
+  saveMetadata, getMetadata
+} from '@/utils/offlineDb'
 import 'ol/ol.css'
 
 const INDIA_CENTER = fromLonLat([78.9629, 22.5937])
 const DRAW_ROLES = ['SDO', 'SURVEYOR']
+const STATUS_COLOR: Record<string, string> = {
+  DRAFT: 'default',
+  SUBMITTED: 'blue',
+  UNDER_REVIEW: 'orange',
+  APPROVED: 'green',
+  PUBLISHED: 'cyan',
+  RETURNED: 'red',
+}
 const BOOKMARKS_KEY = 'raksha_map_bookmarks'
 const DEFAULT_LAYER_COLOR = '#00bcd4'
 
@@ -192,6 +216,7 @@ function getLayerStyle(styles: Record<string, LayerStyle>, ln: string): LayerSty
 const PRIMARY_TOOLS = [
   { key: 'pan',      icon: <DragOutlined />,    label: 'Pan / Navigate',   desc: 'Drag to pan the map' },
   { key: 'identify', icon: <InfoCircleOutlined />, label: 'Identify Feature (Info)', desc: 'Click a feature to view its attributes' },
+  { key: 'enli_search', icon: <SearchOutlined />, label: 'Search eNLI Code', desc: 'Zoom to land parcel by eNLI Code' },
 ]
 
 const SELECT_TOOLS = [
@@ -395,6 +420,38 @@ function makeExtLegend(layer?: ExtLayerConfig): ExtClassLegend | null {
   return { title: layer?.display_name || 'Layer', field, entries }
 }
 
+// Snap Tracing utilities
+function _dist2D(a: number[], b: number[]): number {
+  return Math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+}
+function _projectOnSegment(pt: number[], p1: number[], p2: number[]): number[] {
+  const dx = p2[0] - p1[0], dy = p2[1] - p1[1]
+  const len2 = dx * dx + dy * dy
+  if (len2 === 0) return [...p1]
+  const t = Math.max(0, Math.min(1, ((pt[0] - p1[0]) * dx + (pt[1] - p1[1]) * dy) / len2))
+  return [p1[0] + t * dx, p1[1] + t * dy]
+}
+function _geomSegments(geom: any): [number[], number[]][] {
+  const segs: [number[], number[]][] = []
+  const addCoords = (coords: number[][]) => {
+    for (let i = 0; i < coords.length - 1; i++) segs.push([coords[i], coords[i + 1]])
+  }
+  const t = geom.getType?.() ?? ''
+  if (t === 'Polygon') (geom as any).getCoordinates().forEach(addCoords)
+  else if (t === 'LineString') addCoords((geom as any).getCoordinates())
+  else if (t === 'MultiPolygon') (geom as any).getCoordinates().forEach((p: any) => p.forEach(addCoords))
+  else if (t === 'MultiLineString') (geom as any).getCoordinates().forEach(addCoords)
+  return segs
+}
+function _geomFlatCoords(geom: any): number[][] {
+  const t = geom.getType?.() ?? ''
+  if (t === 'Polygon') return (geom as any).getCoordinates().flat()
+  if (t === 'LineString') return (geom as any).getCoordinates()
+  if (t === 'MultiPolygon') return (geom as any).getCoordinates().flat(2)
+  if (t === 'MultiLineString') return (geom as any).getCoordinates().flat()
+  return []
+}
+
 export default function MapPage() {
   const mapRef = useRef<HTMLDivElement>(null)
   const mapInstance = useRef<Map | null>(null)
@@ -408,6 +465,8 @@ export default function MapPage() {
   const drawInteraction = useRef<Draw | null>(null)
   const modifyInteraction = useRef<Modify | null>(null)
   const snapInteraction = useRef<Snap | null>(null)
+  const midpointSnapSource = useRef<VectorSource | null>(null)
+  const perpIndicatorLayer = useRef<VectorLayer<VectorSource> | null>(null)
   const dragBoxInteraction = useRef<DragBox | null>(null)
   const cogLayers = useRef<Record<number, WebGLTileLayer>>({})
   const heatmapLayerRef = useRef<HeatmapLayer | null>(null)
@@ -494,7 +553,7 @@ export default function MapPage() {
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [featureInfo, setFeatureInfo] = useState<Record<string, unknown> | null>(null)
-  const [featureModalMeta, setFeatureModalMeta] = useState<{ layerLabel: string; layerType: string } | null>(null)
+  const [featureModalMeta, setFeatureModalMeta] = useState<{ layerLabel: string; layerType: string; featureId?: number } | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [layerPanelOpen, setLayerPanelOpen] = useState(false)
   const [measureResult, setMeasureResult] = useState<string | null>(null)
@@ -533,6 +592,145 @@ export default function MapPage() {
   // When set, drawn features skip the "choose layer" modal and go straight to this layer
   const [activeDrawLayer, setActiveDrawLayer] = useState<{ name: string; folderId: number } | null>(null)
   const activeDrawLayerRef = useRef<{ name: string; folderId: number } | null>(null)
+  
+  // Review Annotation States
+  const [annotations, setAnnotations] = useState<any[]>([])
+  const annotationLayer = useRef<VectorLayer<VectorSource> | null>(null)
+  const [annotationDrawModal, setAnnotationDrawModal] = useState(false)
+  const [annotationComment, setAnnotationComment] = useState('')
+  const [annotationColor, setAnnotationColor] = useState('#ff4444')
+  const [annotationType, setAnnotationType] = useState<'redline' | 'comment' | 'highlight'>('redline')
+  const pendingAnnotationGeom = useRef<any>(null)
+  const [showResolvedAnnotations, setShowResolvedAnnotations] = useState(false)
+  const isReviewer = user?.role === 'CHECKER' || user?.role === 'APPROVER' || user?.role === 'SUPERADMIN'
+
+  const fetchAnnotations = () => {
+    if (!selectedSurveyAreaId) {
+      setAnnotations([])
+      annotationLayer.current?.getSource()?.clear()
+      return
+    }
+    api.get(`/projects/annotations/?survey_area=${selectedSurveyAreaId}`)
+      .then(r => {
+        const data = r.data.results ?? r.data
+        const features = data.features ?? []
+        setAnnotations(features)
+        
+        const src = annotationLayer.current?.getSource()
+        if (src) {
+          src.clear()
+          const fmt = new GeoJSON()
+          const olFeats = fmt.readFeatures(data, { featureProjection: 'EPSG:3857' })
+          src.addFeatures(olFeats)
+        }
+      })
+      .catch(() => {})
+  }
+
+  useEffect(() => {
+    fetchAnnotations()
+  }, [selectedSurveyAreaId])
+
+
+  const startDrawingAnnotation = (type: 'redline' | 'comment' | 'highlight') => {
+    const map = mapInstance.current
+    if (!map) return
+
+    if (drawInteraction.current) {
+      map.removeInteraction(drawInteraction.current)
+      drawInteraction.current = null
+    }
+
+    setMapTool('pan')
+    setAnnotationType(type)
+
+    const olType = type === 'comment' ? 'Point' : type === 'redline' ? 'LineString' : 'Polygon'
+    const draw = new Draw({
+      source: annotationLayer.current?.getSource() ?? undefined,
+      type: olType as any
+    })
+
+    draw.on('drawend', (e) => {
+      pendingAnnotationGeom.current = e.feature.getGeometry()
+      map.removeInteraction(draw)
+      drawInteraction.current = null
+      setMapTool('pan')
+      setAnnotationComment('')
+      setAnnotationDrawModal(true)
+    })
+
+    map.addInteraction(draw)
+    drawInteraction.current = draw
+    message.info(`Click/draw on the map to add a review ${type}`)
+  }
+
+  const saveAnnotation = async () => {
+    if (!selectedSurveyAreaId) return
+    if (!pendingAnnotationGeom.current) return
+
+    const fmt = new GeoJSON()
+    const geomGeoJSON = JSON.parse(fmt.writeGeometry(pendingAnnotationGeom.current, {
+      dataProjection: 'EPSG:4326',
+      featureProjection: 'EPSG:3857'
+    }))
+
+    try {
+      await api.post('/projects/annotations/', {
+        survey_area: selectedSurveyAreaId,
+        annotation_type: annotationType,
+        geometry: geomGeoJSON,
+        comment: annotationComment.trim(),
+        color: annotationColor,
+        is_resolved: false
+      })
+      message.success('Review annotation saved.')
+      setAnnotationDrawModal(false)
+      pendingAnnotationGeom.current = null
+      fetchAnnotations()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to save annotation.')
+    }
+  }
+
+  const toggleResolveAnnotation = async (id: number, currentResolved: boolean) => {
+    try {
+      await api.patch(`/projects/annotations/${id}/`, {
+        is_resolved: !currentResolved
+      })
+      message.success(currentResolved ? 'Annotation unresolved.' : 'Annotation resolved.')
+      fetchAnnotations()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to update annotation.')
+    }
+  }
+
+  const deleteAnnotation = async (id: number) => {
+    try {
+      await api.delete(`/projects/annotations/${id}/`)
+      message.success('Annotation deleted.')
+      fetchAnnotations()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to delete annotation.')
+    }
+  }
+
+  const zoomToAnnotation = (geomGeoJSON: any) => {
+    const map = mapInstance.current
+    if (!map || !geomGeoJSON) return
+    const fmt = new GeoJSON()
+    const geom = fmt.readGeometry(geomGeoJSON, {
+      dataProjection: 'EPSG:4326',
+      featureProjection: 'EPSG:3857'
+    })
+    const extent = geom.getExtent()
+    if (geom.getType() === 'Point') {
+      const point = geom as OLPoint
+      map.getView().animate({ center: point.getCoordinates(), zoom: 16, duration: 600 })
+    } else {
+      map.getView().fit(extent, { size: map.getSize(), maxZoom: 16, padding: [50, 50, 50, 50], duration: 600 })
+    }
+  }
+
   const [newLayerModalOpen, setNewLayerModalOpen] = useState(false)
   const [importGISModalOpen, setImportGISModalOpen] = useState(false)
 
@@ -551,14 +749,17 @@ export default function MapPage() {
   const [attrTableOpen, setAttrTableOpen] = useState(false)
   const [printOpen, setPrintOpen] = useState(false)
   const [mapExportOpen, setMapExportOpen] = useState(false)
+  const [atlasOpen, setAtlasOpen] = useState(false)
   const [gotoOpen, setGotoOpen] = useState(false)
   const [gotoLat, setGotoLat] = useState('')
   const [gotoLon, setGotoLon] = useState('')
   const [bookmarks, setBookmarks] = useState<MapBookmark[]>(loadBookmarks)
   const [bookmarkName, setBookmarkName] = useState('')
-  const [topoIssues, setTopoIssues] = useState<TopoIssue[]>([])
-  const [topoLoading, setTopoLoading] = useState(false)
-  const [topoOpen, setTopoOpen] = useState(false)
+  const [coordinateJumpInput, setCoordinateJumpInput] = useState('')
+  const [enliModalOpen, setEnliModalOpen] = useState(false)
+  const [enliCode, setEnliCode] = useState('')
+  const [enliSearching, setEnliSearching] = useState(false)
+  const [toolbarVisible, setToolbarVisible] = useState(false)
 
   // Coordinate picker
   const [coordModalOpen, setCoordModalOpen] = useState(false)
@@ -583,6 +784,8 @@ export default function MapPage() {
   const [snapVertex, setSnapVertex] = useState(true)
   const [snapEdge, setSnapEdge] = useState(false)
   const [snapMidpoint, setSnapMidpoint] = useState(false)
+  const [snapPerpendicular, setSnapPerpendicular] = useState(false)
+  const [snapTrace, setSnapTrace] = useState(false)
 
   // Extent history
   const extentHistory = useRef<{center: number[]; zoom: number}[]>([])
@@ -603,11 +806,21 @@ export default function MapPage() {
   // Graduated / unique-value renderer
   const [graduatedModal, setGraduatedModal] = useState<{ln: string} | null>(null)
   const [gradField, setGradField] = useState('')
-  const [gradMode, setGradMode] = useState<'graduated' | 'unique'>('unique')
+  const [gradMode, setGradMode] = useState<'rules' | 'unique' | 'graduated'>('rules')
   const [gradBreaks, setGradBreaks] = useState(5)
   const [graduatedRules, setGraduatedRules] = useState<Record<string, Record<string, string[]>>>({})
   const graduatedRulesRef = useRef<Record<string, Record<string, string[]>>>({})
   const graduatedFieldRef = useRef<Record<string, string>>({})
+  // Rule-based symbology
+  type FeatureRule = {
+    id: string; label: string; field: string
+    op: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'startswith' | '*'
+    value: string; fill: string; stroke: string; width: number
+  }
+  const [layerRules, setLayerRules] = useState<Record<string, FeatureRule[]>>({})
+  const layerRulesRef = useRef<Record<string, FeatureRule[]>>({})
+  const [ruleRows, setRuleRows] = useState<FeatureRule[]>([])
+  const RULE_PALETTE = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#e91e63','#00bcd4','#ff5722']
 
   // Editing operation modals
   const [rotateModalOpen, setRotateModalOpen]         = useState(false)
@@ -620,14 +833,8 @@ export default function MapPage() {
   const [offsetDistance, setOffsetDistance]           = useState(10)   // metres
   const [toolGroupsCollapsed, setToolGroupsCollapsed] = useState<Set<string>>(new Set())
 
-  // Analysis modals
-  const [dissolveModal, setDissolveModal] = useState(false)
-  const [spatialJoinModal, setSpatialJoinModal] = useState(false)
-  const [clipModal, setClipModal] = useState(false)
+  // Analysis modals (summary stats kept — unique, not in Processing Toolbox)
   const [summaryModal, setSummaryModal] = useState(false)
-  const [nearModal, setNearModal] = useState(false)
-  const [hullModal, setHullModal] = useState(false)
-  const [centroidModal, setCentroidModal] = useState(false)
   const [findReplaceModal, setFindReplaceModal] = useState<{ln: string} | null>(null)
   const [analysisLayer, setAnalysisLayer] = useState('')
   const [analysisLayer2, setAnalysisLayer2] = useState('')
@@ -640,6 +847,31 @@ export default function MapPage() {
 
   // Select by location draw ref
   const selectLocationDraw = useRef<Draw | null>(null)
+
+  // Feature 11: SQL View
+  const [sqlViewOpen, setSqlViewOpen] = useState(false)
+  const [sqlViewQuery, setSqlViewQuery] = useState('')
+  const [sqlViewLoading, setSqlViewLoading] = useState(false)
+  const [sqlViewLayers, setSqlViewLayers] = useState<{id: string, name: string}[]>([])
+  const sqlViewLayerRefs = useRef<Record<string, VectorLayer<VectorSource>>>({})
+
+  // Feature 9: Smart Form
+  const [smartFormOpen, setSmartFormOpen] = useState(false)
+  const [smartFormValues, setSmartFormValues] = useState<Record<string, string>>({})
+  const [smartFormLayer, setSmartFormLayer] = useState('')
+  const [smartFormTemplate, setSmartFormTemplate] = useState<any>(null)
+
+  // Feature 5: Processing Toolbox
+  const [processingToolboxOpen, setProcessingToolboxOpen] = useState(false)
+
+  // Feature 6: Topology Rule Engine
+  const [topologyRulesOpen, setTopologyRulesOpen] = useState(false)
+
+  // Feature 7: Terrain Analysis
+  const [terrainAnalysisOpen, setTerrainAnalysisOpen] = useState(false)
+
+  // Feature 3: Georeferencer
+  const [georeferencerOpen, setGeoreferencerOpen] = useState(false)
 
   const { data: basemaps } = useQuery<BasemapConfig[]>({
     queryKey: qk.basemaps(),
@@ -796,11 +1028,22 @@ export default function MapPage() {
     enabled: !!selectedProjectId,
   })
 
+  const { data: attributeTemplates = [] } = useQuery<any[]>({
+    queryKey: qk.attributeTemplates(),
+    queryFn: () => api.get('/projects/attribute-templates/?page_size=200').then((r) => r.data.results ?? r.data),
+  })
+
   const { data: mapFeatures = [] } = useQuery<GISFeature[]>({
     queryKey: ['map-features', showFieldBrowser
       ? `org:${officeFilter}:area:${selectedFieldArea?.id ?? ''}`
       : selectedProjectId],
-    queryFn: () => {
+    queryFn: async () => {
+      if (!navigator.onLine && selectedProjectId) {
+        const cached = await getCachedFeatures(selectedProjectId)
+        if (cached.length > 0) {
+          return cached
+        }
+      }
       // DGDE/PDDE/SUPERADMIN: load the picked office's PUBLISHED features.
       if (showFieldBrowser) {
         if (!officeFilter) return Promise.resolve([])
@@ -814,6 +1057,394 @@ export default function MapPage() {
     },
     enabled: showFieldBrowser ? !!officeFilter : !!selectedProjectId,
   })
+
+  const [areaSummary, setAreaSummary] = useState<any | null>(null)
+  const [areaSummaryCollapsed, setAreaSummaryCollapsed] = useState(false)
+
+  useEffect(() => {
+    if (!selectedSurveyAreaId) {
+      setAreaSummary(null)
+      return
+    }
+    api.get(`/projects/survey-areas/${selectedSurveyAreaId}/summary/`)
+      .then(r => setAreaSummary(r.data))
+      .catch(err => console.error('Failed to load survey area summary', err))
+  }, [selectedSurveyAreaId, mapFeatures])
+
+  // ── Offline PWA & GPS State Variables ─────────────────────────────────────
+  const [isOnline, setIsOnline] = useState(navigator.onLine)
+  const [offlineQueueCount, setOfflineQueueCount] = useState(0)
+  const [offlineDownloading, setOfflineDownloading] = useState(false)
+  const [gpsActive, setGpsActive] = useState(false)
+  const [gpsAutoTrack, setGpsAutoTrack] = useState(false)
+  const [gpsCoords, setGpsCoords] = useState<[number, number] | null>(null)
+  const gpsWatchId = useRef<number | null>(null)
+  const gpsMarkerFeature = useRef<any>(null)
+  const gpsSourceRef = useRef<VectorSource | null>(null)
+
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true)
+      message.success('Internet connection restored!')
+    }
+    const handleOffline = () => {
+      setIsOnline(false)
+      message.warning('Connection lost. Switching to offline mode.')
+    }
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+
+    getOfflineQueue().then(queue => setOfflineQueueCount(queue.length)).catch(() => {})
+
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [])
+
+  // Geolocation watch effect
+  useEffect(() => {
+    if (gpsActive) {
+      if (!navigator.geolocation) {
+        message.error('Geolocation is not supported by your browser')
+        setGpsActive(false)
+        return
+      }
+
+      const options = {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 0,
+      }
+
+      const success = (position: GeolocationPosition) => {
+        const { latitude, longitude } = position.coords
+        const coords: [number, number] = [longitude, latitude]
+        setGpsCoords(coords)
+
+        const mapCoords = fromLonLat(coords)
+
+        // Plot or update marker on map
+        if (gpsSourceRef.current) {
+          if (!gpsMarkerFeature.current) {
+            const f = new Feature({
+              geometry: new OLPoint(mapCoords),
+            })
+            gpsMarkerFeature.current = f
+            gpsSourceRef.current.addFeature(f)
+          } else {
+            gpsMarkerFeature.current.setGeometry(new OLPoint(mapCoords))
+          }
+        }
+
+        // Auto center map if selected
+        if (gpsAutoTrack && mapInstance.current) {
+          mapInstance.current.getView().animate({
+            center: mapCoords,
+            duration: 400,
+          })
+        }
+      }
+
+      const error = (err: GeolocationPositionError) => {
+        console.warn(`ERROR(${err.code}): ${err.message}`)
+        message.error(`GPS Error: ${err.message}`)
+      }
+
+      gpsWatchId.current = navigator.geolocation.watchPosition(success, error, options)
+    } else {
+      if (gpsWatchId.current !== null) {
+        navigator.geolocation.clearWatch(gpsWatchId.current)
+        gpsWatchId.current = null
+      }
+      if (gpsSourceRef.current && gpsMarkerFeature.current) {
+        gpsSourceRef.current.removeFeature(gpsMarkerFeature.current)
+        gpsMarkerFeature.current = null
+      }
+      setGpsCoords(null)
+    }
+
+    return () => {
+      if (gpsWatchId.current !== null) {
+        navigator.geolocation.clearWatch(gpsWatchId.current)
+      }
+    }
+  }, [gpsActive, gpsAutoTrack])
+
+  // Center/pan map on current location
+  const panToGpsLocation = useCallback(() => {
+    if (!navigator.geolocation) {
+      message.error('Geolocation is not supported by your browser')
+      return
+    }
+    setGpsActive(true) // Turn on tracking if not already active
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const { latitude, longitude } = position.coords
+        const coords: [number, number] = [longitude, latitude]
+        setGpsCoords(coords)
+        const mapCoords = fromLonLat(coords)
+        
+        const map = mapInstance.current
+        if (map) {
+          map.getView().animate({
+            center: mapCoords,
+            zoom: 16,
+            duration: 600,
+          })
+        }
+        
+        if (gpsSourceRef.current) {
+          if (!gpsMarkerFeature.current) {
+            const f = new Feature({
+              geometry: new OLPoint(mapCoords),
+            })
+            gpsMarkerFeature.current = f
+            gpsSourceRef.current.addFeature(f)
+          } else {
+            gpsMarkerFeature.current.setGeometry(new OLPoint(mapCoords))
+          }
+        }
+        message.success('Centered map on GPS location')
+      },
+      (err) => {
+        message.error(`GPS Error: ${err.message}`)
+      },
+      { enableHighAccuracy: true, timeout: 10000 }
+    )
+  }, [])
+
+  // Manual vertex capture at GPS position
+  const addVertexAtGps = useCallback(() => {
+    if (!gpsCoords) {
+      message.warning('GPS coordinates not available. Make sure GPS tracking is enabled.')
+      return
+    }
+    const mapCoords = fromLonLat(gpsCoords)
+    const draw = drawInteraction.current
+    if (!draw) {
+      message.warning('No active drawing interaction. Select a drawing tool first.')
+      return
+    }
+    const activeDrawType =
+      mapTool === 'draw_point' ? 'Point'
+      : mapTool === 'draw_line' ? 'LineString'
+      : mapTool === 'draw_polygon' ? 'Polygon'
+      : null
+    try {
+      (draw as any).appendCoordinates([mapCoords])
+      if (activeDrawType === 'Point' && typeof (draw as any).finishDrawing === 'function') {
+        (draw as any).finishDrawing()
+      }
+      message.success('Vertex added at GPS location')
+    } catch (err) {
+      console.error('Failed to append GPS coordinate to drawing:', err)
+      message.error('Failed to add GPS vertex to drawing')
+    }
+  }, [gpsCoords, mapTool])
+
+  // Download offline tiles and metadata
+  const downloadOfflineTilesAndData = async () => {
+    if (!selectedProjectId) {
+      message.warning('Please select a project first.')
+      return
+    }
+    const map = mapInstance.current
+    if (!map) return
+
+    setOfflineDownloading(true)
+    try {
+      let extent: any = null
+      const src = projectSource.current
+      if (src && src.getFeatures().length > 0) {
+        extent = src.getExtent()
+      } else {
+        extent = map.getView().calculateExtent(map.getSize())
+      }
+
+      if (!extent) {
+        message.error('Could not determine bounding box for download.')
+        setOfflineDownloading(false)
+        return
+      }
+
+      const extent4326 = transformExtent(extent, 'EPSG:3857', 'EPSG:4326')
+      const [minLon, minLat, maxLon, maxLat] = extent4326
+
+      const zoomLevels = [13, 14, 15, 16]
+      const baseTemp = activeBasemap?.url_template || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+      const urlsToCache: string[] = []
+
+      const lonLatToTile = (lon: number, lat: number, zoom: number) => {
+        const latRad = (lat * Math.PI) / 180
+        const n = Math.pow(2, zoom)
+        const x = Math.floor(((lon + 180) / 360) * n)
+        const y = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n)
+        return { x, y }
+      }
+
+      // Calculate tile count first to avoid freezing the browser on very large extents
+      let totalTilesCount = 0
+      for (const z of zoomLevels) {
+        const pMin = lonLatToTile(minLon, maxLat, z)
+        const pMax = lonLatToTile(maxLon, minLat, z)
+        const xMin = Math.max(0, Math.min(pMin.x, pMax.x))
+        const xMax = Math.max(0, Math.max(pMin.x, pMax.x))
+        const yMin = Math.max(0, Math.min(pMin.y, pMax.y))
+        const yMax = Math.max(0, Math.max(pMin.y, pMax.y))
+        totalTilesCount += (xMax - xMin + 1) * (yMax - yMin + 1)
+      }
+
+      if (totalTilesCount > 1000) {
+        message.warning(`The download area is too large (requires ${totalTilesCount} tiles). Offline cache downloads are restricted to a maximum of 1000 tiles. Please zoom in or select a smaller area.`)
+        setOfflineDownloading(false)
+        return
+      }
+
+      for (const z of zoomLevels) {
+        const pMin = lonLatToTile(minLon, maxLat, z)
+        const pMax = lonLatToTile(maxLon, minLat, z)
+        const xMin = Math.max(0, Math.min(pMin.x, pMax.x))
+        const xMax = Math.max(0, Math.max(pMin.x, pMax.x))
+        const yMin = Math.max(0, Math.min(pMin.y, pMax.y))
+        const yMax = Math.max(0, Math.max(pMin.y, pMax.y))
+
+        for (let x = xMin; x <= xMax; x++) {
+          for (let y = yMin; y <= yMax; y++) {
+            const tileUrl = baseTemp
+              .replace('{z}', String(z))
+              .replace('{x}', String(x))
+              .replace('{y}', String(y))
+            urlsToCache.push(tileUrl)
+          }
+        }
+      }
+
+      if (urlsToCache.length > 600) {
+        message.warning(`The download area is too large (${urlsToCache.length} tiles). Caching is capped at 600 tiles. Caching only zoom levels 13-14.`)
+        urlsToCache.length = 0
+        const fallbackZooms = [13, 14]
+        for (const z of fallbackZooms) {
+          const pMin = lonLatToTile(minLon, maxLat, z)
+          const pMax = lonLatToTile(maxLon, minLat, z)
+          const xMin = Math.max(0, Math.min(pMin.x, pMax.x))
+          const xMax = Math.max(0, Math.max(pMin.x, pMax.x))
+          const yMin = Math.max(0, Math.min(pMin.y, pMax.y))
+          const yMax = Math.max(0, Math.max(pMin.y, pMax.y))
+
+          for (let x = xMin; x <= xMax; x++) {
+            for (let y = yMin; y <= yMax; y++) {
+              const tileUrl = baseTemp
+                .replace('{z}', String(z))
+                .replace('{x}', String(x))
+                .replace('{y}', String(y))
+              urlsToCache.push(tileUrl)
+            }
+          }
+        }
+      }
+
+      message.loading({ content: `Downloading offline tiles (0/${urlsToCache.length})...`, key: 'offline-download' })
+
+      const cache = await window.caches.open('map-tiles-offline')
+      const batchSize = 15
+      let cachedCount = 0
+
+      for (let i = 0; i < urlsToCache.length; i += batchSize) {
+        const batch = urlsToCache.slice(i, i + batchSize)
+        await Promise.all(
+          batch.map(async (url) => {
+            try {
+              const res = await fetch(url, { mode: 'cors', credentials: 'omit' }).catch(() => fetch(url, { mode: 'no-cors' }))
+              if (res && (res.status === 200 || res.type === 'opaque')) {
+                await cache.put(url, res)
+                cachedCount++
+              }
+            } catch (err) {
+              console.warn('Failed to cache tile:', url, err)
+            }
+          })
+        )
+        message.loading({
+          content: `Downloading offline tiles (${Math.min(i + batch.length, urlsToCache.length)}/${urlsToCache.length})...`,
+          key: 'offline-download',
+        })
+      }
+
+      await saveCachedFeatures(mapFeatures)
+      
+      if (projects?.results) {
+        const activeProject = projects.results.find(p => p.id === selectedProjectId)
+        if (activeProject) {
+          await saveMetadata(`project-details:${selectedProjectId}`, activeProject)
+        }
+      }
+      if (flatFolders) {
+        await saveMetadata(`folders:${selectedProjectId}`, flatFolders)
+      }
+      if (surveyAreas) {
+        await saveMetadata(`survey-areas:${selectedProjectId}`, surveyAreas)
+      }
+      
+      message.success({ content: `Offline tiles and metadata cached successfully! (${cachedCount} tiles stored)`, key: 'offline-download', duration: 4 })
+    } catch (err) {
+      console.error('Offline download failed:', err)
+      message.error({ content: 'Failed to download offline tiles and data.', key: 'offline-download' })
+    } finally {
+      setOfflineDownloading(false)
+    }
+  }
+
+  // Sync offline edits to server
+  const syncOfflineEdits = async () => {
+    if (!isOnline) {
+      message.warning('Cannot sync edits while offline. Please connect to the internet first.')
+      return
+    }
+    const queue = await getOfflineQueue()
+    if (queue.length === 0) {
+      message.info('No pending offline edits to sync.')
+      return
+    }
+
+    message.loading({ content: `Syncing ${queue.length} offline edits...`, key: 'offline-sync' })
+    
+    let synced = 0
+    let failed = 0
+    
+    for (const item of queue) {
+      try {
+        await api.post('/projects/features/', {
+          project: item.project,
+          folder: item.folder,
+          layer_name: item.layer_name,
+          geometry_type: item.geometry_type,
+          geometry: item.geometry,
+          attributes: item.attributes || {},
+          deo_visible: item.deo_visible ?? true,
+        })
+        
+        await clearOfflineQueueItem(item.offline_id)
+        synced++
+      } catch (err) {
+        console.error('Failed to sync offline item:', item, err)
+        failed++
+      }
+    }
+
+    const updatedQueue = await getOfflineQueue()
+    setOfflineQueueCount(updatedQueue.length)
+
+    if (synced > 0) {
+      qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+    }
+
+    if (failed > 0) {
+      message.error({ content: `Sync completed with errors. Synced: ${synced}, Failed: ${failed}.`, key: 'offline-sync', duration: 4 })
+    } else {
+      message.success({ content: `Successfully synced ${synced} offline features!`, key: 'offline-sync', duration: 4 })
+    }
+  }
 
   const rawLayerNames = useMemo(
     () => [...new Set(mapFeatures.map((f) => f.layer_name))].filter(Boolean),
@@ -949,11 +1580,43 @@ export default function MapPage() {
       style: (feature) => {
         const ln = (feature.get('layer_name') as string) ?? ''
 
-        // Graduated/unique-value override
+        const attrs = feature.get('attributes') as Record<string, unknown> | undefined
+
+        // Rule-based symbology (highest priority)
+        const rules = (layerRulesRef.current || {})[ln]
+        if (rules && rules.length > 0) {
+          for (const rule of rules) {
+            let matched = false
+            if (rule.op === '*') {
+              matched = true
+            } else {
+              const fv = String(attrs?.[rule.field] ?? '')
+              const rv = rule.value
+              switch (rule.op) {
+                case '=':  matched = fv === rv; break
+                case '!=': matched = fv !== rv; break
+                case '>':  matched = parseFloat(fv) > parseFloat(rv); break
+                case '<':  matched = parseFloat(fv) < parseFloat(rv); break
+                case '>=': matched = parseFloat(fv) >= parseFloat(rv); break
+                case '<=': matched = parseFloat(fv) <= parseFloat(rv); break
+                case 'contains':   matched = fv.toLowerCase().includes(rv.toLowerCase()); break
+                case 'startswith': matched = fv.toLowerCase().startsWith(rv.toLowerCase()); break
+              }
+            }
+            if (matched) {
+              return [new Style({
+                fill:   new Fill({ color: rule.fill + '88' }),
+                stroke: new Stroke({ color: rule.stroke, width: rule.width || 2 }),
+                image:  new CircleStyle({ radius: 6, fill: new Fill({ color: rule.fill }), stroke: new Stroke({ color: rule.stroke, width: 1.5 }) }),
+              })]
+            }
+          }
+        }
+
+        // Graduated/unique-value override (legacy)
         const gradRules = (graduatedRulesRef.current || {})[ln]
         const gradFld   = (graduatedFieldRef.current || {})[ln]
         if (gradRules && gradFld) {
-          const attrs = feature.get('attributes') as Record<string, unknown> | undefined
           const val   = String(attrs?.[gradFld] ?? '')
           const colors = gradRules[val]
           if (colors) {
@@ -1096,15 +1759,76 @@ export default function MapPage() {
         }
 
         setFeatureInfo(displayProps)
-        setFeatureModalMeta({ layerLabel, layerType })
+        const fid = feature.getId()
+        const parsedFid = typeof fid === 'number' ? fid : (typeof fid === 'string' && !isNaN(Number(fid)) ? Number(fid) : undefined)
+        const featureId = parsedFid ?? (typeof props.id === 'number' ? props.id : (typeof props.id === 'string' && !isNaN(Number(props.id)) ? Number(props.id) : undefined))
+        setFeatureModalMeta({ layerLabel, layerType, featureId: layerType === 'project' ? featureId : undefined })
         setDrawerOpen(true)
         featureFound = true
       })
     }
 
+    const alSource = new VectorSource()
+    const al = new VectorLayer({
+      source: alSource,
+      style: (feature) => {
+        const type = feature.get('annotation_type') ?? 'redline'
+        const color = feature.get('color') ?? '#ff4444'
+        const isResolved = feature.get('is_resolved') === true
+
+        const strokeAlpha = isResolved ? '33' : 'ff'
+        const fillAlpha = isResolved ? '11' : '33'
+        const strokeColor = `${color}${strokeAlpha}`
+        const fillColor = `${color}${fillAlpha}`
+
+        if (type === 'comment') {
+          return new Style({
+            image: new CircleStyle({
+              radius: 8,
+              fill: new Fill({ color: strokeColor }),
+              stroke: new Stroke({ color: '#ffffff', width: 2 })
+            }),
+            text: new Text({
+              text: '💬',
+              offsetY: -1,
+              font: '12px Arial'
+            })
+          })
+        }
+
+        const strokeWidth = type === 'highlight' ? 2 : 4
+        const lineDash = isResolved ? [4, 4] : undefined
+
+        return new Style({
+          fill: new Fill({ color: fillColor }),
+          stroke: new Stroke({
+            color: strokeColor,
+            width: strokeWidth,
+            lineDash: lineDash
+          })
+        })
+      },
+      zIndex: 25
+    })
+    annotationLayer.current = al
+
+    const gpsSrc = new VectorSource()
+    gpsSourceRef.current = gpsSrc
+    const gpsLyr = new VectorLayer({
+      source: gpsSrc,
+      style: new Style({
+        image: new CircleStyle({
+          radius: 8,
+          fill: new Fill({ color: '#1565c0' }),
+          stroke: new Stroke({ color: '#ffffff', width: 2 }),
+        }),
+      }),
+      zIndex: 100,
+    })
+
     const map = new Map({
       target: mapRef.current,
-      layers: [bm, cogBm, boundaryLayer, vl, selLayer, ml, bl],
+      layers: [bm, cogBm, boundaryLayer, vl, selLayer, ml, bl, al, gpsLyr],
       view: new View({ center: INDIA_CENTER, zoom: 5 }),
       controls: defaultControls({ zoom: false }).extend([new ScaleLine({ units: 'metric' })]),
     })
@@ -1132,6 +1856,7 @@ export default function MapPage() {
     return () => {
       map.setTarget(undefined)
       mapInstance.current = null
+      gpsSourceRef.current = null
     }
   }, [])
 
@@ -2083,6 +2808,12 @@ export default function MapPage() {
     graduatedRulesRef.current = graduatedRules
   }, [graduatedRules])
 
+  // Sync layerRules state → ref
+  useEffect(() => {
+    layerRulesRef.current = layerRules
+    projectLayer.current?.getSource()?.changed()
+  }, [layerRules])
+
   // Graticule
   useEffect(() => {
     const map = mapInstance.current
@@ -2284,6 +3015,30 @@ export default function MapPage() {
     if (modifyInteraction.current) { map.removeInteraction(modifyInteraction.current); modifyInteraction.current = null }
     if (snapInteraction.current) { map.removeInteraction(snapInteraction.current); snapInteraction.current = null }
 
+    // Build snap: vertex + edge controlled by state; midpoint = synthetic points at segment midpoints
+    function buildSnap(featureSrc: VectorSource): Snap {
+      if (snapMidpoint) {
+        const mpSrc = new VectorSource()
+        midpointSnapSource.current = mpSrc
+        featureSrc.getFeatures().forEach(f => {
+          const geom = f.getGeometry()
+          if (!geom) return
+          const coords: number[][] = []
+          const type = geom.getType()
+          if (type === 'Polygon') coords.push(...(geom as any).getCoordinates().flat())
+          else if (type === 'LineString') coords.push(...(geom as any).getCoordinates())
+          else if (type === 'MultiPolygon') (geom as any).getCoordinates().flat(2).forEach((c: number[]) => coords.push(c))
+          for (let i = 0; i < coords.length - 1; i++) {
+            const mp = [(coords[i][0] + coords[i+1][0]) / 2, (coords[i][1] + coords[i+1][1]) / 2]
+            mpSrc.addFeature(new Feature(new OLPoint(mp)))
+          }
+        })
+        return new Snap({ source: featureSrc, vertex: snapVertex, edge: snapEdge, pixelTolerance: 12,
+          features: mpSrc.getFeaturesCollection() ?? undefined } as any)
+      }
+      return new Snap({ source: featureSrc, vertex: snapVertex, edge: snapEdge, pixelTolerance: 10 })
+    }
+
     const drawType =
       mapTool === 'draw_point' ? 'Point'
       : mapTool === 'draw_line' ? 'LineString'
@@ -2294,6 +3049,21 @@ export default function MapPage() {
       measureLayer.current.getSource()!.clear()
       setMeasureResult(null)
       const draw = new Draw({ source: measureLayer.current.getSource()!, type: 'LineString' })
+      draw.on('drawstart', (e) => {
+        e.feature.getGeometry()!.on('change', () => {
+          const geom = e.feature.getGeometry() as LineString
+          const coords = geom.getCoordinates()
+          const len = getLength(geom)
+          let bearingText = ''
+          if (coords.length >= 2) {
+            const p1 = toLonLat(coords[coords.length - 2])
+            const p2 = toLonLat(coords[coords.length - 1])
+            const bearing = calculateBearing(p1[0], p1[1], p2[0], p2[1])
+            bearingText = ` | Last Bearing: ${formatBearingDMS(bearing)}`
+          }
+          setMeasureResult(`Length: ${(len / 1000).toFixed(3)} km (${len.toFixed(0)} m)${bearingText}`)
+        })
+      })
       draw.on('drawend', (e) => {
         const geom = e.feature.getGeometry() as LineString
         const lengthM = getLength(geom)
@@ -2336,7 +3106,7 @@ export default function MapPage() {
       })
       map.addInteraction(modify)
       modifyInteraction.current = modify
-      const snap = new Snap({ source: src })
+      const snap = buildSnap(src)
       map.addInteraction(snap)
       snapInteraction.current = snap
       message.info('Vertex Tool active — drag vertices to edit, then click away to save', 2)
@@ -2416,19 +3186,53 @@ export default function MapPage() {
         const saved: GISFeature[] = []
         for (const f of e.features.getArray() as Feature[]) {
           const gf = fmt.writeFeatureObject(f, { dataProjection:'EPSG:4326', featureProjection:'EPSG:3857' })
-          await api.post('/projects/features/', {
-            project: selectedProjectId,
-            folder: copyFolderId,
-            layer_name: f.get('layer_name') ?? 'polygon_layer',
-            geometry_type: gf.geometry?.type?.toUpperCase() === 'POINT' ? 'POINT' : gf.geometry?.type?.toUpperCase() === 'LINESTRING' ? 'LINE' : 'POLYGON',
-            geometry: gf.geometry, attributes: {},
-            ...(isCantonmentUploader ? { deo_visible: deoVisibleRef.current } : {}),
-          }).then((r) => { f.setId(r.data.id); saved.push(r.data) }).catch(() => {})
+          const layerName = f.get('layer_name') ?? 'polygon_layer'
+          const geomType = gf.geometry?.type?.toUpperCase() === 'POINT' ? 'POINT' : gf.geometry?.type?.toUpperCase() === 'LINESTRING' ? 'LINE' : 'POLYGON'
+          
+          if (!isOnline) {
+            const tempId = -Date.now() - Math.floor(Math.random() * 1000)
+            const offlineFeature = {
+              project: selectedProjectId,
+              folder: copyFolderId,
+              layer_name: layerName,
+              geometry_type: geomType,
+              geometry: gf.geometry,
+              attributes: {},
+              deo_visible: isCantonmentUploader ? deoVisibleRef.current : true,
+            }
+            await queueOfflineFeature(offlineFeature).then(() => {
+              f.setId(tempId)
+              f.set('layer_name', layerName)
+              f.set('feature_id', `Offline-${Math.abs(tempId)}`)
+              f.set('folder', copyFolderId)
+              saved.push({
+                id: tempId,
+                project: selectedProjectId,
+                folder: copyFolderId,
+                layer_name: layerName,
+                geometry_type: geomType,
+                geometry: gf.geometry,
+                attributes: {},
+                feature_id: `Offline-${Math.abs(tempId)}`,
+                is_deleted: false,
+              } as any as GISFeature)
+            }).catch(() => {})
+          } else {
+            await api.post('/projects/features/', {
+              project: selectedProjectId,
+              folder: copyFolderId,
+              layer_name: layerName,
+              geometry_type: geomType,
+              geometry: gf.geometry, attributes: {},
+              ...(isCantonmentUploader ? { deo_visible: deoVisibleRef.current } : {}),
+            }).then((r) => { f.setId(r.data.id); saved.push(r.data) }).catch(() => {})
+          }
         }
         qc.setQueryData<GISFeature[]>(['map-features', selectedProjectId], (old) =>
           old ? [...old, ...saved] : saved
         )
-        message.success(`Copied & moved ${clones.length} feature(s)`)
+        getOfflineQueue().then(queue => setOfflineQueueCount(queue.length)).catch(() => {})
+        message.success(isOnline ? `Copied & moved ${clones.length} feature(s)` : `Copied & moved ${clones.length} feature(s) offline!`)
         setMapTool('pan')
       })
       map.addInteraction(translate)
@@ -2640,8 +3444,16 @@ export default function MapPage() {
         draw.on('drawstart', (e) => {
           e.feature.getGeometry()!.on('change', () => {
             const geom = e.feature.getGeometry() as LineString
+            const coords = geom.getCoordinates()
             const len = getLength(geom)
-            if (len > 0) setMeasureResult(`Length: ${(len / 1000).toFixed(3)} km`)
+            let bearingText = ''
+            if (coords.length >= 2) {
+              const p1 = toLonLat(coords[coords.length - 2])
+              const p2 = toLonLat(coords[coords.length - 1])
+              const bearing = calculateBearing(p1[0], p1[1], p2[0], p2[1])
+              bearingText = ` | Bearing: ${formatBearingDMS(bearing)}`
+            }
+            if (len > 0) setMeasureResult(`Length: ${(len / 1000).toFixed(3)} km${bearingText}`)
           })
         })
       }
@@ -2672,11 +3484,114 @@ export default function MapPage() {
       drawInteraction.current = draw
 
       // Snap to existing features when drawing
-      const snap = new Snap({ source: src })
+      const snap = buildSnap(src)
       map.addInteraction(snap)
       snapInteraction.current = snap
+
+      // Trace mode: post-process drawn geometry to follow existing feature edges
+      if (snapTrace) {
+        draw.on('drawend', (evt: any) => {
+          const drawnGeom = evt.feature.getGeometry()
+          if (!drawnGeom) return
+          const resolution = map.getView().getResolution() ?? 1
+          const tol = 12 * resolution  // 12-pixel tolerance in map units
+
+          const geomType = drawnGeom.getType()
+          let rawCoords: number[][] =
+            geomType === 'LineString' ? (drawnGeom as any).getCoordinates()
+            : geomType === 'Polygon'  ? (drawnGeom as any).getCoordinates()[0]
+            : []
+          if (rawCoords.length < 2) return
+
+          const newCoords: number[][] = [rawCoords[0]]
+          for (let i = 0; i < rawCoords.length - 1; i++) {
+            const from = rawCoords[i], to = rawCoords[i + 1]
+            let traced: number[][] | null = null
+            src.getFeatures().forEach((feat: Feature) => {
+              if (traced) return
+              const fGeom = feat.getGeometry()
+              if (!fGeom) return
+              const flatCoords = _geomFlatCoords(fGeom)
+              if (flatCoords.length < 2) return
+              let fromIdx = -1, toIdx = -1, fromD = Infinity, toD = Infinity
+              flatCoords.forEach((c, idx) => {
+                const df = _dist2D(from, c), dt = _dist2D(to, c)
+                if (df < fromD && df < tol) { fromD = df; fromIdx = idx }
+                if (dt < toD && dt < tol) { toD = dt; toIdx = idx }
+              })
+              if (fromIdx >= 0 && toIdx >= 0 && fromIdx !== toIdx && Math.abs(toIdx - fromIdx) > 1) {
+                traced = fromIdx < toIdx
+                  ? flatCoords.slice(fromIdx, toIdx + 1)
+                  : flatCoords.slice(toIdx, fromIdx + 1).reverse()
+              }
+            })
+            if (traced && traced.length > 2) {
+              newCoords.push(...(traced as number[][]).slice(1))
+            } else {
+              newCoords.push(to)
+            }
+          }
+
+          if (geomType === 'LineString') (drawnGeom as any).setCoordinates(newCoords)
+          else if (geomType === 'Polygon') (drawnGeom as any).setCoordinates([newCoords])
+        })
+      }
     }
-  }, [mapTool, selectedProjectId, selectedFolderId, isReadOnly])
+  }, [mapTool, selectedProjectId, selectedFolderId, isReadOnly, snapVertex, snapEdge, snapMidpoint, snapTrace])
+
+  // Perpendicular snap: show guide line from cursor to nearest edge foot-point
+  useEffect(() => {
+    const map = mapInstance.current
+    if (!map || !snapPerpendicular) return
+
+    const perpSrc = new VectorSource()
+    const perpLyr = new VectorLayer({
+      source: perpSrc,
+      zIndex: 98,
+      style: new Style({
+        stroke: new Stroke({ color: 'rgba(0,255,136,0.85)', width: 1.5, lineDash: [5, 4] }),
+        image: new CircleStyle({ radius: 5, stroke: new Stroke({ color: '#00ff88', width: 2 }), fill: new Fill({ color: 'rgba(0,255,136,0.2)' }) }),
+      }),
+    })
+    map.addLayer(perpLyr)
+    perpIndicatorLayer.current = perpLyr
+
+    const handleMove = (e: any) => {
+      const featSrc = projectLayer.current?.getSource()
+      if (!featSrc || !drawInteraction.current) { perpSrc.clear(); return }
+
+      const cursor: number[] = e.coordinate
+      const resolution = map.getView().getResolution() ?? 1
+      const snapDist = 30 * resolution
+
+      let minDist = Infinity
+      let bestFoot: number[] | null = null
+
+      featSrc.getFeatures().forEach((feat: Feature) => {
+        const geom = feat.getGeometry()
+        if (!geom) return
+        _geomSegments(geom).forEach(([p1, p2]) => {
+          const foot = _projectOnSegment(cursor, p1, p2)
+          const d = _dist2D(cursor, foot)
+          if (d < minDist && d < snapDist) { minDist = d; bestFoot = foot }
+        })
+      })
+
+      perpSrc.clear()
+      if (bestFoot) {
+        perpSrc.addFeature(new Feature(new LineString([cursor, bestFoot as number[]])))
+        perpSrc.addFeature(new Feature(new OLPoint(bestFoot as number[])))
+      }
+    }
+
+    map.on('pointermove', handleMove)
+    return () => {
+      map.un('pointermove', handleMove)
+      map.removeLayer(perpLyr)
+      perpSrc.clear()
+      perpIndicatorLayer.current = null
+    }
+  }, [snapPerpendicular])
 
   const handleZoom = useCallback((delta: number) => {
     const view = mapInstance.current?.getView()
@@ -2750,7 +3665,19 @@ export default function MapPage() {
     if (!view) return
     const center = toLonLat(view.getCenter() ?? INDIA_CENTER) as [number, number]
     const zoom = view.getZoom() ?? 5
-    const bm: MapBookmark = { id: Date.now().toString(), name: bookmarkName.trim(), center, zoom }
+    // Capture thumbnail
+    let thumbnail: string | undefined
+    try {
+      const canvas = mapRef.current?.querySelector('canvas') as HTMLCanvasElement | null
+      if (canvas) {
+        const t = document.createElement('canvas')
+        t.width = 120; t.height = 80
+        const ctx = t.getContext('2d')
+        ctx?.drawImage(canvas, 0, 0, 120, 80)
+        thumbnail = t.toDataURL('image/jpeg', 0.5)
+      }
+    } catch { /* cross-origin canvas */ }
+    const bm: MapBookmark = { id: Date.now().toString(), name: bookmarkName.trim(), center, zoom, thumbnail }
     const updated = [...bookmarks, bm]
     setBookmarks(updated)
     localStorage.setItem(BOOKMARKS_KEY, JSON.stringify(updated))
@@ -2758,7 +3685,7 @@ export default function MapPage() {
     message.success('Bookmark saved')
   }, [bookmarks, bookmarkName])
 
-  const saveDrawnFeature = useCallback((layerName: string, overrideFolderId?: number | null) => {
+  const saveDrawnFeature = useCallback((layerName: string, overrideFolderId?: number | null, extraAttrs?: Record<string, string>) => {
     const feat = pendingDrawFeatureRef.current
     const dt = pendingDrawTypeRef.current
     if (!feat || !selectedProjectId) return
@@ -2774,13 +3701,59 @@ export default function MapPage() {
     const gf = fmt.writeFeatureObject(feat, { dataProjection: 'EPSG:4326', featureProjection: 'EPSG:3857' })
     // Folder priority: active-draw-layer folder > URL override > selectedFolderId > survey area root
     const folderId = overrideFolderId ?? activeDrawLayer?.folderId ?? selectedFolderId ?? selectedSurveyArea?.folder ?? null
+    const geometryType = dt === 'Point' ? 'POINT' : dt === 'LineString' ? 'LINE' : 'POLYGON'
+
+    if (!isOnline) {
+      const tempId = -Date.now()
+      const offlineFeature = {
+        project: selectedProjectId,
+        folder: folderId,
+        layer_name: layerName,
+        geometry_type: geometryType,
+        geometry: gf.geometry,
+        attributes: {},
+        deo_visible: isCantonmentUploader ? deoVisibleRef.current : true,
+      }
+      queueOfflineFeature(offlineFeature)
+        .then(() => {
+          feat.setId(tempId)
+          feat.set('layer_name', layerName)
+          feat.set('feature_id', `Offline-${Math.abs(tempId)}`)
+          feat.set('folder', folderId)
+          
+          const mockSaved = {
+            id: tempId,
+            project: selectedProjectId,
+            folder: folderId,
+            layer_name: layerName,
+            geometry_type: geometryType,
+            geometry: gf.geometry,
+            attributes: {},
+            feature_id: `Offline-${Math.abs(tempId)}`,
+            is_deleted: false,
+          } as any as GISFeature
+          qc.setQueryData<GISFeature[]>(['map-features', selectedProjectId], (old) =>
+            old ? [...old, mockSaved] : [mockSaved]
+          )
+          getOfflineQueue().then(queue => setOfflineQueueCount(queue.length)).catch(() => {})
+          message.success('Feature saved offline! It will be synced when you reconnect.')
+          pendingDrawFeatureRef.current = null
+        })
+        .catch((err) => {
+          message.error('Failed to save feature offline: ' + err)
+          src?.removeFeature(feat)
+          pendingDrawFeatureRef.current = null
+        })
+      return
+    }
+
     api.post('/projects/features/', {
       project: selectedProjectId,
       folder: folderId,
       layer_name: layerName,
-      geometry_type: dt === 'Point' ? 'POINT' : dt === 'LineString' ? 'LINE' : 'POLYGON',
+      geometry_type: geometryType,
       geometry: gf.geometry,
-      attributes: {},
+      attributes: extraAttrs ?? {},
       ...(isCantonmentUploader ? { deo_visible: deoVisibleRef.current } : {}),
     }).then((r) => {
       const saved: GISFeature = r.data
@@ -2797,7 +3770,7 @@ export default function MapPage() {
       )
       pendingDrawFeatureRef.current = null
       // Broadcast to collaborators
-      wsSendCreated({ id: saved.id, geometry: gf.geometry, layer_name: layerName, attributes: {} })
+      wsSendCreated({ id: saved.id, geometry: gf.geometry, layer_name: layerName, attributes: extraAttrs ?? {} })
     }).catch((err) => {
       const data = err?.response?.data
       const msg = data?.detail
@@ -2809,7 +3782,8 @@ export default function MapPage() {
       src?.removeFeature(feat)
       pendingDrawFeatureRef.current = null
     })
-  }, [selectedProjectId, selectedFolderId, selectedSurveyArea, activeDrawLayer, wsSendCreated])
+  }, [selectedProjectId, selectedFolderId, selectedSurveyArea, activeDrawLayer, wsSendCreated, isOnline, qc])
+
 
   const handleGoToBookmark = useCallback((bm: MapBookmark) => {
     mapInstance.current?.getView().animate({
@@ -2824,20 +3798,6 @@ export default function MapPage() {
     setBookmarks(updated)
     localStorage.setItem(BOOKMARKS_KEY, JSON.stringify(updated))
   }, [bookmarks])
-
-  async function handleCheckTopology() {
-    if (!selectedProjectId) { message.warning('Select a project first'); return }
-    setTopoLoading(true)
-    try {
-      const r = await api.get(`/projects/topology/?project=${selectedProjectId}`)
-      setTopoIssues(r.data.issues ?? [])
-      setTopoOpen(true)
-    } catch {
-      message.error('Topology check failed')
-    } finally {
-      setTopoLoading(false)
-    }
-  }
 
   // ── Layer management helpers ────────────────────────────────────────────────
 
@@ -2922,20 +3882,59 @@ export default function MapPage() {
     if (!selectedProjectId) { message.warning('Select a project'); return }
     const fmt = new GeoJSON()
     let count = 0
+    const saved: GISFeature[] = []
     for (const f of clipboardRef.current) {
       try {
         const gf = fmt.writeFeatureObject(f, { dataProjection:'EPSG:4326', featureProjection:'EPSG:3857' })
-        await api.post('/projects/features/', {
-          project: selectedProjectId, folder: selectedFolderId ?? null,
-          layer_name: ln, geometry_type: gf.geometry?.type?.toUpperCase() === 'POINT' ? 'POINT' : gf.geometry?.type?.toUpperCase() === 'LINESTRING' ? 'LINE' : 'POLYGON',
-          geometry: gf.geometry, attributes: f.getProperties(),
-          ...(isCantonmentUploader ? { deo_visible: deoVisibleRef.current } : {}),
-        })
-        count++
+        const geomType = gf.geometry?.type?.toUpperCase() === 'POINT' ? 'POINT' : gf.geometry?.type?.toUpperCase() === 'LINESTRING' ? 'LINE' : 'POLYGON'
+        const folderId = selectedFolderId ?? null
+        
+        if (!isOnline) {
+          const tempId = -Date.now() - Math.floor(Math.random() * 1000)
+          const offlineFeature = {
+            project: selectedProjectId,
+            folder: folderId,
+            layer_name: ln,
+            geometry_type: geomType,
+            geometry: gf.geometry,
+            attributes: f.getProperties() || {},
+            deo_visible: isCantonmentUploader ? deoVisibleRef.current : true,
+          }
+          await queueOfflineFeature(offlineFeature)
+          saved.push({
+            id: tempId,
+            project: selectedProjectId,
+            folder: folderId,
+            layer_name: ln,
+            geometry_type: geomType,
+            geometry: gf.geometry,
+            attributes: f.getProperties() || {},
+            feature_id: `Offline-${Math.abs(tempId)}`,
+            is_deleted: false,
+          } as any as GISFeature)
+          count++
+        } else {
+          const r = await api.post('/projects/features/', {
+            project: selectedProjectId, folder: folderId,
+            layer_name: ln, geometry_type: geomType,
+            geometry: gf.geometry, attributes: f.getProperties(),
+            ...(isCantonmentUploader ? { deo_visible: deoVisibleRef.current } : {}),
+          })
+          saved.push(r.data)
+          count++
+        }
       } catch (_) {}
     }
-    message.success(`Pasted ${count} feature(s)`)
-    qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+    if (!isOnline) {
+      qc.setQueryData<GISFeature[]>(['map-features', selectedProjectId], (old) =>
+        old ? [...old, ...saved] : saved
+      )
+      message.success(`Pasted ${count} feature(s) offline!`)
+      getOfflineQueue().then(queue => setOfflineQueueCount(queue.length)).catch(() => {})
+    } else {
+      message.success(`Pasted ${count} feature(s)`)
+      qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+    }
   }
 
   async function deleteSelectedFeatures() {
@@ -3084,17 +4083,58 @@ export default function MapPage() {
     if (!feats.length) { message.warning('No line features selected'); return }
     const { default: turfLineOffset } = await import('@turf/line-offset')
     const fmt = new GeoJSON()
+    const saved: GISFeature[] = []
+    let count = 0
     for (const f of feats) {
-      const gf = fmt.writeFeatureObject(f, { dataProjection:'EPSG:4326', featureProjection:'EPSG:3857' })
-      const offset = turfLineOffset(gf.geometry as any, distM, { units: 'meters' })
-      await api.post('/projects/features/', {
-        project: selectedProjectId, folder: selectedFolderId ?? null,
-        layer_name: f.get('layer_name') ?? 'line_layer',
-        geometry_type: 'LINE', geometry: offset.geometry,
-      }).catch(() => {})
+      try {
+        const gf = fmt.writeFeatureObject(f, { dataProjection:'EPSG:4326', featureProjection:'EPSG:3857' })
+        const offset = turfLineOffset(gf.geometry as any, distM, { units: 'meters' })
+        const folderId = selectedFolderId ?? null
+        
+        if (!isOnline) {
+          const tempId = -Date.now() - Math.floor(Math.random() * 1000)
+          const offlineFeature = {
+            project: selectedProjectId,
+            folder: folderId,
+            layer_name: f.get('layer_name') ?? 'line_layer',
+            geometry_type: 'LINE',
+            geometry: offset.geometry,
+            attributes: {},
+          }
+          await queueOfflineFeature(offlineFeature)
+          saved.push({
+            id: tempId,
+            project: selectedProjectId,
+            folder: folderId,
+            layer_name: f.get('layer_name') ?? 'line_layer',
+            geometry_type: 'LINE',
+            geometry: offset.geometry,
+            attributes: {},
+            feature_id: `Offline-${Math.abs(tempId)}`,
+            is_deleted: false,
+          } as any as GISFeature)
+          count++
+        } else {
+          const r = await api.post('/projects/features/', {
+            project: selectedProjectId, folder: folderId,
+            layer_name: f.get('layer_name') ?? 'line_layer',
+            geometry_type: 'LINE', geometry: offset.geometry,
+          })
+          saved.push(r.data)
+          count++
+        }
+      } catch (_) {}
     }
-    qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
-    message.success(`Created ${feats.length} offset line(s)`)
+    if (!isOnline) {
+      qc.setQueryData<GISFeature[]>(['map-features', selectedProjectId], (old) =>
+        old ? [...old, ...saved] : saved
+      )
+      message.success(`Created ${count} offset line(s) offline!`)
+      getOfflineQueue().then(queue => setOfflineQueueCount(queue.length)).catch(() => {})
+    } else {
+      qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
+      message.success(`Created ${count} offset line(s)`)
+    }
   }
 
   function getLayerAttributes(ln: string): string[] {
@@ -3117,8 +4157,254 @@ export default function MapPage() {
     return `${ll[1].toFixed(5)}, ${ll[0].toFixed(5)}`
   }
 
+  const toDMS = (val: number, isLat: boolean) => {
+    const absolute = Math.abs(val)
+    const degrees = Math.floor(absolute)
+    const minutesNotTruncated = (absolute - degrees) * 60
+    const minutes = Math.floor(minutesNotTruncated)
+    const seconds = Math.floor((minutesNotTruncated - minutes) * 60)
+    let direction = ''
+    if (isLat) {
+      direction = val >= 0 ? 'N' : 'S'
+    } else {
+      direction = val >= 0 ? 'E' : 'W'
+    }
+    return `${degrees}°${minutes}'${seconds}"${direction}`
+  }
+
+  const latLonToUTM = (lat: number, lon: number) => {
+    const sa = 6378137.0
+    const sb = 6356752.314245
+    const e2 = Math.sqrt((sa * sa) - (sb * sb)) / sb
+    const e2sq = e2 * e2
+    const c = sa
+
+    const latRad = (lat * Math.PI) / 180
+    const lonRad = (lon * Math.PI) / 180
+
+    const zone = Math.floor((lon + 180) / 6) + 1
+    const lonOrigin = (zone - 1) * 6 - 180 + 3
+    const lonOriginRad = (lonOrigin * Math.PI) / 180
+
+    const N = c / Math.sqrt(1 + e2sq * Math.cos(latRad) * Math.cos(latRad))
+    const T = Math.tan(latRad) * Math.tan(latRad)
+    const C = e2sq * Math.cos(latRad) * Math.cos(latRad)
+    const A = Math.cos(latRad) * (lonRad - lonOriginRad)
+
+    const M = sa * (
+      (1 - 1/4 - 3/64 - 5/256) * latRad -
+      (3/8 + 3/32 + 45/1024) * Math.sin(2 * latRad) +
+      (15/32 + 45/512) * Math.sin(4 * latRad) +
+      (35/96) * Math.sin(6 * latRad)
+    )
+
+    const x = 500000 + 0.9996 * N * (
+      A +
+      (1 - T + C) * A * A * A / 6 +
+      (5 - 18 * T + T * T + 72 * C - 58 * e2sq) * A * A * A * A * A / 120
+    )
+
+    let y = 0.9996 * (
+      M +
+      N * Math.tan(latRad) * (
+        A * A / 2 +
+        (5 - T + 9 * C + 4 * C * C) * A * A * A * A / 24 +
+        (61 - 58 * T + T * T + 600 * C - 330 * e2sq) * A * A * A * A * A * A / 720
+      )
+    )
+
+    if (lat < 0) {
+      y += 10000000
+    }
+
+    return {
+      easting: x,
+      northing: y,
+      zone: `${zone}${lat >= 0 ? 'N' : 'S'}`
+    }
+  }
+
+  const formatCoordsDMS = () => {
+    if (!mapCoords) return ''
+    const ll = toLonLat(mapCoords)
+    const latDMS = toDMS(ll[1], true)
+    const lonDMS = toDMS(ll[0], false)
+    return `${latDMS}, ${lonDMS}`
+  }
+
+  const formatCoordsUTM = () => {
+    if (!mapCoords) return ''
+    const ll = toLonLat(mapCoords)
+    const utm = latLonToUTM(ll[1], ll[0])
+    return `${utm.easting.toFixed(0)}m E, ${utm.northing.toFixed(0)}m N, Zone ${utm.zone}`
+  }
+
+  const calculateBearing = (lon1: number, lat1: number, lon2: number, lat2: number): number => {
+    const dLon = ((lon2 - lon1) * Math.PI) / 180
+    const lat1Rad = (lat1 * Math.PI) / 180
+    const lat2Rad = (lat2 * Math.PI) / 180
+
+    const y = Math.sin(dLon) * Math.cos(lat2Rad)
+    const x = Math.cos(lat1Rad) * Math.sin(lat2Rad) - Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLon)
+    let brng = (Math.atan2(y, x) * 180) / Math.PI
+    return (brng + 360) % 360
+  }
+
+  const formatBearingDMS = (bearing: number): string => {
+    const deg = Math.floor(bearing)
+    const minDouble = (bearing - deg) * 60
+    const min = Math.floor(minDouble)
+    const sec = Math.floor((minDouble - min) * 60)
+    
+    let quad = ''
+    if (bearing >= 337.5 || bearing < 22.5) quad = `N ${deg}°${min}'${sec}"`
+    else if (bearing >= 22.5 && bearing < 67.5) quad = `N ${deg}°${min}'${sec}" E`
+    else if (bearing >= 67.5 && bearing < 112.5) quad = `E ${deg}°${min}'${sec}"`
+    else if (bearing >= 112.5 && bearing < 157.5) quad = `S ${360-deg}°${min}'${sec}" E`
+    else if (bearing >= 157.5 && bearing < 202.5) quad = `S ${360-deg}°${min}'${sec}"`
+    else if (bearing >= 202.5 && bearing < 247.5) quad = `S ${360-deg}°${min}'${sec}" W`
+    else if (bearing >= 247.5 && bearing < 292.5) quad = `W ${deg}°${min}'${sec}"`
+    else quad = `N ${deg}°${min}'${sec}" W`
+    
+    return `${bearing.toFixed(1)}° (${quad})`
+  }
+
+  const handleCoordinateJump = () => {
+    const text = coordinateJumpInput.trim()
+    if (!text) return
+
+    const map = mapInstance.current
+    if (!map) return
+
+    // DD Regex
+    const ddRegex = /^(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)$|^(-?\d+\.?\d*)\s+(-?\d+\.?\d*)$/
+    const matchDD = text.match(ddRegex)
+    if (matchDD) {
+      const lat = parseFloat(matchDD[1] || matchDD[3])
+      const lon = parseFloat(matchDD[2] || matchDD[4])
+      if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+        map.getView().animate({ center: fromLonLat([lon, lat]), zoom: 16, duration: 600 })
+        message.success(`Zoomed to: Lat ${lat.toFixed(5)}, Lon ${lon.toFixed(5)}`)
+        return
+      }
+    }
+
+    // DMS Regex
+    const dmsRegex = /(\d+)[°\s](\d+)[’'\s](\d+)\.?\d*[”"\s]([NnSs])\s*,\s*(\d+)[°\s](\d+)[’'\s](\d+)\.?\d*[”"\s]([EeWw])/
+    const matchDMS = text.match(dmsRegex)
+    if (matchDMS) {
+      const parseDMSValue = (deg: string, min: string, sec: string, dir: string) => {
+        let val = parseFloat(deg) + parseFloat(min) / 60 + parseFloat(sec) / 3600
+        if (dir.toUpperCase() === 'S' || dir.toUpperCase() === 'W') {
+          val = -val
+        }
+        return val
+      }
+      const lat = parseDMSValue(matchDMS[1], matchDMS[2], matchDMS[3], matchDMS[4])
+      const lon = parseDMSValue(matchDMS[5], matchDMS[6], matchDMS[7], matchDMS[8])
+      if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+        map.getView().animate({ center: fromLonLat([lon, lat]), zoom: 16, duration: 600 })
+        message.success(`Zoomed to DMS coordinates: Lat ${lat.toFixed(5)}, Lon ${lon.toFixed(5)}`)
+        return
+      }
+    }
+
+    // UTM Regex
+    const utmRegex = /^(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+)\s*([NnSs])$/
+    const matchUTM = text.match(utmRegex)
+    if (matchUTM) {
+      const easting = parseFloat(matchUTM[1])
+      const northing = parseFloat(matchUTM[2])
+      const zone = parseInt(matchUTM[3])
+      const hemisphere = matchUTM[4].toUpperCase()
+      
+      try {
+        const sa = 6378137.0
+        const sb = 6356752.314245
+        const e2 = Math.sqrt((sa * sa) - (sb * sb)) / sb
+        const e2sq = e2 * e2
+        const c = sa
+        
+        const x = easting - 500000
+        const y = hemisphere === 'S' ? northing - 10000000 : northing
+        
+        const lonOrigin = (zone - 1) * 6 - 180 + 3
+        const lonOriginRad = (lonOrigin * Math.PI) / 180
+        
+        const M = y / 0.9996
+        const mu = M / (sa * (1 - 1/4 - 3/64 - 5/256))
+        
+        const phi1Rad = mu + (3/2 * mu) * (1 - 27/32 * mu * mu)
+        const N1 = c / Math.sqrt(1 + e2sq * Math.cos(phi1Rad) * Math.cos(phi1Rad))
+        const T1 = Math.tan(phi1Rad) * Math.tan(phi1Rad)
+        const C1 = e2sq * Math.cos(phi1Rad) * Math.cos(phi1Rad)
+        const R1 = sa * (1 - e2sq) / Math.pow(1 - e2sq * Math.sin(phi1Rad) * Math.sin(phi1Rad), 1.5)
+        const D = x / (N1 * 0.9996)
+        
+        const latRad = phi1Rad - (N1 * Math.tan(phi1Rad) / R1) * (
+          D*D/2 - (5 + 3*T1 + 10*C1 - 4*C1*C1 - 9*e2sq)*D*D*D*D/24 +
+          (61 + 90*T1 + 298*C1 + 45*T1*T1 - 252*e2sq - 3*C1*C1)*D*D*D*D*D*D/720
+        )
+        const lonRad = lonOriginRad + (D - (1 + 2*T1 + C1)*D*D*D/6 + (5 - 2*C1 + 28*T1 - 3*C1*C1 + 8*e2sq + 24*T1*T1)*D*D*D*D*D/120) / Math.cos(phi1Rad)
+        
+        const lat = (latRad * 180) / Math.PI
+        const lon = (lonRad * 180) / Math.PI
+        
+        if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+          map.getView().animate({ center: fromLonLat([lon, lat]), zoom: 16, duration: 600 })
+          message.success(`Zoomed to UTM: Zone ${zone}${hemisphere}, Lat ${lat.toFixed(5)}, Lon ${lon.toFixed(5)}`)
+          return
+        }
+      } catch (err) {
+        console.error(err)
+      }
+    }
+
+    message.error('Invalid coordinate format. Use DD (28.6,77.2), DMS (28°36\'50\"N, 77°12\'32\"E), or UTM (703432 3167329 43N).')
+  }
+
+  const handleEnliSearch = async () => {
+    const code = enliCode.trim()
+    if (code.length < 2) {
+      message.warning('Please enter a valid eNLI Code (at least 2 characters)')
+      return
+    }
+
+    setEnliSearching(true)
+    try {
+      // Search both internal GIS features (Land_Parcel_ID) and external layers in parallel
+      const [internalRes, externalRes] = await Promise.allSettled([
+        api.get('/survey_projects/features/enli-search/', { params: { q: code } }),
+        api.get('/external/layers/search/', { params: { q: code } }),
+      ])
+
+      const internalResults = internalRes.status === 'fulfilled' ? (internalRes.value.data?.results ?? []) : []
+      const externalResults = externalRes.status === 'fulfilled' ? (externalRes.value.data?.results ?? []) : []
+      const allResults = [...internalResults, ...externalResults]
+
+      if (allResults.length > 0) {
+        const ql = code.toLowerCase()
+        const exactMatch = allResults.find((res: any) =>
+          (res.match_value || '').toLowerCase() === ql
+        )
+        const match = exactMatch || allResults[0]
+
+        flyToSearchResult(match)
+        setEnliModalOpen(false)
+        setEnliCode('')
+        message.success(`Zoomed to eNLI parcel: ${match.match_value || match.label}`)
+      } else {
+        message.error(`No land parcel found with eNLI Code: "${code}"`)
+      }
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || 'eNLI search failed')
+    } finally {
+      setEnliSearching(false)
+    }
+  }
+
   const bookmarkContent = (
-    <div style={{ width: 240 }}>
+    <div style={{ width: 280 }}>
       <div style={{ marginBottom: 8 }}>
         <div style={{ fontSize: 11, color: '#aaa', marginBottom: 4 }}>Save current view</div>
         <Space.Compact style={{ width: '100%' }}>
@@ -3136,20 +4422,20 @@ export default function MapPage() {
         <div style={{ color: '#555', fontSize: 12, textAlign: 'center', padding: '8px 0' }}>No bookmarks yet</div>
       ) : (
         bookmarks.map((bm) => (
-          <div key={bm.id} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-            <Button
-              type="link"
-              size="small"
-              style={{ flex: 1, textAlign: 'left', padding: 0, fontSize: 12, color: '#4fc3f7' }}
-              onClick={() => handleGoToBookmark(bm)}
-            >
-              {bm.name}
-            </Button>
-            <Button
-              size="small" type="text" icon={<DeleteOutlined />}
-              style={{ color: '#666', padding: 0 }}
-              onClick={() => handleDeleteBookmark(bm.id)}
-            />
+          <div key={bm.id} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, cursor: 'pointer' }} onClick={() => handleGoToBookmark(bm)}>
+            {bm.thumbnail ? (
+              <img src={bm.thumbnail} alt="" style={{ width: 60, height: 40, objectFit: 'cover', borderRadius: 3, border: '1px solid #1a2a3a', flexShrink: 0 }} />
+            ) : (
+              <div style={{ width: 60, height: 40, background: '#0d1a2a', borderRadius: 3, border: '1px solid #1a2a3a', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <GlobalOutlined style={{ color: '#444', fontSize: 16 }} />
+              </div>
+            )}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 11, color: '#4fc3f7', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{bm.name}</div>
+              <div style={{ fontSize: 10, color: '#555' }}>z{bm.zoom.toFixed(1)}</div>
+            </div>
+            <Button size="small" type="text" icon={<DeleteOutlined />} style={{ color: '#555', padding: 0, flexShrink: 0 }}
+              onClick={(e) => { e.stopPropagation(); handleDeleteBookmark(bm.id) }} />
           </div>
         ))
       )}
@@ -3160,6 +4446,114 @@ export default function MapPage() {
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       {/* Map canvas */}
       <div ref={mapRef} className="ol-map" />
+
+      {/* 10. Survey Area Area-Summary Panel */}
+      {selectedSurveyAreaId && areaSummary && (
+        <div style={{
+          position: 'absolute',
+          bottom: attrTableOpen ? 270 : 8,
+          left: 172,
+          zIndex: 20,
+          background: 'rgba(8,12,22,0.95)',
+          border: '1px solid #1a3050',
+          borderRadius: 6,
+          width: areaSummaryCollapsed ? 44 : 260,
+          color: '#e0e0e0',
+          boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+          transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+          overflow: 'hidden',
+          backdropFilter: 'blur(4px)',
+        }}>
+          {/* Header */}
+          <div
+            onClick={() => setAreaSummaryCollapsed(!areaSummaryCollapsed)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '6px 10px',
+              cursor: 'pointer',
+              background: 'rgba(14,22,40,0.95)',
+              borderBottom: areaSummaryCollapsed ? 'none' : '1px solid #1a3050',
+              userSelect: 'none',
+              height: 32,
+            }}
+          >
+            {areaSummaryCollapsed ? (
+              <Tooltip title="Show Survey Area Summary" placement="right">
+                <BarChartOutlined style={{ color: '#4fc3f7', fontSize: 16 }} />
+              </Tooltip>
+            ) : (
+              <>
+                <span style={{ fontWeight: 600, fontSize: 11, color: '#4fc3f7', letterSpacing: '0.05em' }}>
+                  AREA SUMMARY
+                </span>
+                <span style={{ fontSize: 10, color: '#888' }}>◀</span>
+              </>
+            )}
+          </div>
+
+          {!areaSummaryCollapsed && (
+            <div style={{ padding: '8px 12px 12px', fontSize: 12 }}>
+              {/* Lock status & Status */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <span style={{ fontSize: 11, color: '#888' }}>Status</span>
+                <Space size={4}>
+                  <Tag
+                    color={STATUS_COLOR[areaSummary.status] || 'default'}
+                    style={{ fontSize: 10, margin: 0, textTransform: 'capitalize' }}
+                  >
+                    {areaSummary.status?.toLowerCase()}
+                  </Tag>
+                  <Tag
+                    color={areaSummary.is_locked ? 'error' : 'success'}
+                    icon={areaSummary.is_locked ? <LockOutlined style={{ fontSize: 9 }} /> : <UnlockOutlined style={{ fontSize: 9 }} />}
+                    style={{ fontSize: 10, margin: 0 }}
+                  >
+                    {areaSummary.is_locked ? 'Locked' : 'Unlocked'}
+                  </Tag>
+                </Space>
+              </div>
+
+              {/* Total Area */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <span style={{ fontSize: 11, color: '#888' }}>Total Area</span>
+                <span style={{ fontWeight: 600, color: '#a5d6a7' }}>{areaSummary.total_area_ha} ha</span>
+              </div>
+
+              {/* Feature count by geometry type */}
+              <div style={{ borderTop: '1px solid #16253b', margin: '6px 0 8px', paddingTop: 6 }}>
+                <div style={{ fontSize: 11, color: '#aaa', fontWeight: 500, marginBottom: 4 }}>FEATURES BY GEOMETRY</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                  <span style={{ color: '#888' }}>● Points:</span>
+                  <span style={{ fontWeight: 600 }}>{areaSummary.features_count?.POINT ?? 0}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                  <span style={{ color: '#888' }}>▬ Lines:</span>
+                  <span style={{ fontWeight: 600 }}>{areaSummary.features_count?.LINE ?? 0}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                  <span style={{ color: '#888' }}>⬡ Polygons:</span>
+                  <span style={{ fontWeight: 600 }}>{areaSummary.features_count?.POLYGON ?? 0}</span>
+                </div>
+              </div>
+
+              {/* Last edited by */}
+              <div style={{ borderTop: '1px solid #16253b', paddingTop: 6, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div style={{ fontSize: 11, color: '#888' }}>Last Edited By</div>
+                <div style={{ fontWeight: 500, color: '#ccc', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }} title={areaSummary.last_edited_by}>
+                  {areaSummary.last_edited_by}
+                </div>
+                {areaSummary.last_edited_at && (
+                  <div style={{ fontSize: 10, color: '#666' }}>
+                    {dayjs(areaSummary.last_edited_at).fromNow()}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* External-layer keyword search */}
       <div style={{ position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)', zIndex: 31, width: 400, maxWidth: '70vw' }}>
@@ -3197,12 +4591,36 @@ export default function MapPage() {
 
 
       {/* ═══════════════════════════════════════════════════════════════════
+           Left toolbar toggle button (always visible)
+          ═══════════════════════════════════════════════════════════════════ */}
+      <Tooltip title={toolbarVisible ? 'Hide Tools' : 'Show Map Tools'} placement="right">
+        <div
+          onClick={() => setToolbarVisible(v => !v)}
+          style={{
+            position: 'absolute', top: 8, left: 8, zIndex: 25,
+            width: 32, height: 32, borderRadius: 6,
+            background: toolbarVisible ? '#1565c0' : 'rgba(8,12,22,0.93)',
+            border: `1px solid ${toolbarVisible ? '#1565c0' : '#2a2a3e'}`,
+            color: toolbarVisible ? '#fff' : '#b0bec5',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            cursor: 'pointer', fontSize: 15,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+            backdropFilter: 'blur(4px)',
+            transition: 'all 0.15s',
+          }}
+        >
+          <MenuOutlined />
+        </div>
+      </Tooltip>
+
+      {/* ═══════════════════════════════════════════════════════════════════
            Left toolbar — QGIS-style collapsible tool groups
           ═══════════════════════════════════════════════════════════════════ */}
+      {toolbarVisible && (
       <div style={{
-        position: 'absolute', top: 8, left: 8, zIndex: 20,
+        position: 'absolute', top: 48, left: 8, zIndex: 20,
         width: 156,
-        maxHeight: 'calc(100% - 16px)',
+        maxHeight: 'calc(100% - 56px)',
         overflowY: 'auto',
         overflowX: 'hidden',
         display: 'flex',
@@ -3569,7 +4987,13 @@ export default function MapPage() {
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2, padding: '2px 0' }}>
                     {PRIMARY_TOOLS.map((t) => (
                       <Tooltip key={t.key} title={<span><b>{t.label}</b><br /><span style={{fontSize:11,color:'#aaa'}}>{(t as any).desc}</span></span>} placement="right">
-                        <div style={btnStyle(mapTool === t.key)} onClick={() => setMapTool(t.key as any)}>{t.icon}</div>
+                        <div style={btnStyle(mapTool === t.key)} onClick={() => {
+                          if (t.key === 'enli_search') {
+                            setEnliModalOpen(true)
+                          } else {
+                            setMapTool(t.key as any)
+                          }
+                        }}>{t.icon}</div>
                       </Tooltip>
                     ))}
                   </div>
@@ -3598,13 +5022,11 @@ export default function MapPage() {
                 </div>
               )}
 
-              {/* ── Selection (always visible when not in simplified DGDE/PDDE view) ── */}
-              {!simplified && (
-                <>
-                  <GroupHeader id="sel" label="SELECTION" color="#ce93d8" />
-                  <ToolGrid tools={SELECT_TOOLS} groupKey="sel" />
-                </>
-              )}
+              {/* ── Selection (visible for all roles including DGDE/PDDE) ── */}
+              <>
+                <GroupHeader id="sel" label="SELECTION" color="#ce93d8" />
+                <ToolGrid tools={SELECT_TOOLS} groupKey="sel" />
+              </>
 
               {/* ── Measure (hidden in simplified DGDE/PDDE view) ── */}
               {!simplified && (
@@ -3623,11 +5045,9 @@ export default function MapPage() {
                       <div style={btnStyle(false)} onClick={handleUndo}><UndoOutlined /></div>
                     </Tooltip>
                   )}
-                  {!simplified && (
-                    <Tooltip title={<span><b>Attribute Table</b><br /><span style={{fontSize:11,color:'#aaa'}}>Open the feature attribute table</span></span>} placement="right">
-                      <div style={btnStyle(attrTableOpen)} onClick={() => setAttrTableOpen((v) => !v)}><TableOutlined /></div>
-                    </Tooltip>
-                  )}
+                  <Tooltip title={<span><b>Attribute Table</b><br /><span style={{fontSize:11,color:'#aaa'}}>Open the feature attribute table</span></span>} placement="right">
+                    <div style={btnStyle(attrTableOpen)} onClick={() => setAttrTableOpen((v) => !v)}><TableOutlined /></div>
+                  </Tooltip>
                   <Dropdown
                     menu={{
                       items: [
@@ -3641,11 +5061,17 @@ export default function MapPage() {
                           label: '🖼️ PNG High-Quality (300+ DPI)',
                           onClick: () => setMapExportOpen(true),
                         },
+                        { type: 'divider' },
+                        {
+                          key: 'atlas',
+                          label: '📚 Map Atlas — Print Series (one page per feature)',
+                          onClick: () => setAtlasOpen(true),
+                        },
                       ],
                     }}
                     trigger={['click']}
                   >
-                    <Tooltip title={<span><b>Print/Export Map</b><br /><span style={{fontSize:11,color:'#aaa'}}>PDF (detailed) or PNG (300+ DPI)</span></span>} placement="right">
+                    <Tooltip title={<span><b>Print/Export Map</b><br /><span style={{fontSize:11,color:'#aaa'}}>PDF, PNG, or Atlas print series</span></span>} placement="right">
                       <div style={btnStyle(false)}><PrinterOutlined /></div>
                     </Tooltip>
                   </Dropdown>
@@ -3672,6 +5098,21 @@ export default function MapPage() {
                         <span style={{ position: 'absolute', top: 1, right: 1, width: 8, height: 8, borderRadius: '50%', background: '#ff6b35', display: 'block' }} />
                       )}
                     </div>
+                  </Tooltip>
+                  <Tooltip title={<span><b>SQL View</b><br /><span style={{fontSize:11,color:'#aaa'}}>Virtual layer from custom SQL query</span></span>} placement="right">
+                    <div style={btnStyle(sqlViewOpen)} onClick={() => setSqlViewOpen(true)}><CodeOutlined /></div>
+                  </Tooltip>
+                  <Tooltip title={<span><b>Processing Toolbox</b><br /><span style={{fontSize:11,color:'#aaa'}}>Geoprocessing operations</span></span>} placement="right">
+                    <div style={btnStyle(processingToolboxOpen)} onClick={() => setProcessingToolboxOpen(v => !v)}><ToolOutlined /></div>
+                  </Tooltip>
+                  <Tooltip title={<span><b>Topology Rules</b><br /><span style={{fontSize:11,color:'#aaa'}}>Define and check topology rules</span></span>} placement="right">
+                    <div style={btnStyle(topologyRulesOpen)} onClick={() => setTopologyRulesOpen(true)}><ApartmentOutlined /></div>
+                  </Tooltip>
+                  <Tooltip title={<span><b>Terrain Analysis</b><br /><span style={{fontSize:11,color:'#aaa'}}>Hillshade, slope, aspect, contours from DEM</span></span>} placement="right">
+                    <div style={btnStyle(terrainAnalysisOpen)} onClick={() => setTerrainAnalysisOpen(true)}><LineChartOutlined /></div>
+                  </Tooltip>
+                  <Tooltip title={<span><b>Georeferencer</b><br /><span style={{fontSize:11,color:'#aaa'}}>Georeference a scanned image</span></span>} placement="right">
+                    <div style={btnStyle(georeferencerOpen)} onClick={() => setGeoreferencerOpen(true)}><ScanOutlined /></div>
                   </Tooltip>
                 </div>
               )}
@@ -3719,7 +5160,7 @@ export default function MapPage() {
               )}
 
               {/* Click-to-select hint — shown in pan mode with no selection */}
-              {!simplified && mapTool === 'pan' && selectedCount === 0 && (
+              {mapTool === 'pan' && selectedCount === 0 && (
                 <div style={{
                   margin: '4px 2px', padding: '5px 8px', borderRadius: 4, fontSize: 10,
                   background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)',
@@ -3733,6 +5174,7 @@ export default function MapPage() {
           )
         })()}
       </div>
+      )}
 
       {/* Top-right: basemap + layer panel */}
       <div
@@ -3776,11 +5218,171 @@ export default function MapPage() {
             style={{ background: 'rgba(20,20,30,0.85)', border: '1px solid #333', color: '#ddd', alignSelf: 'flex-end' }}
           />
         </Tooltip>
+
+        {/* PWA Offline & GPS Panel */}
+        <div style={{
+          background: 'rgba(10, 16, 30, 0.95)',
+          border: '1px solid #1e293b',
+          borderRadius: 8,
+          padding: 12,
+          width: 200,
+          color: '#cbd5e1',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+          backdropFilter: 'blur(8px)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 10,
+          fontSize: 12,
+          alignSelf: 'flex-end',
+        }}>
+          {/* Header & Status */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #334155', paddingBottom: 6 }}>
+            <span style={{ fontWeight: 600, letterSpacing: '0.05em', color: '#38bdf8' }}>OFFLINE FIELD PWA</span>
+            <Tooltip title={isOnline ? 'Online' : 'Offline Mode'}>
+              <Badge status={isOnline ? 'success' : 'warning'} text={isOnline ? <span style={{ color: '#4ade80', fontSize: 11 }}>Online</span> : <span style={{ color: '#fbbf24', fontSize: 11 }}>Offline</span>} />
+            </Tooltip>
+          </div>
+
+          {/* Sync & Download Buttons */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <Button
+              type="primary"
+              size="small"
+              icon={offlineDownloading ? <Spin size="small" /> : <DownloadOutlined />}
+              disabled={!selectedProjectId || offlineDownloading}
+              onClick={downloadOfflineTilesAndData}
+              style={{ background: '#0284c7', borderColor: '#0284c7' }}
+            >
+              {offlineDownloading ? 'Downloading...' : 'Cache for Offline'}
+            </Button>
+            
+            {offlineQueueCount > 0 && (
+              <Badge count={offlineQueueCount} size="small" offset={[-8, 2]} style={{ backgroundColor: '#ef4444', width: '100%' }}>
+                <Button
+                  size="small"
+                  type="primary"
+                  danger
+                  disabled={!isOnline}
+                  icon={<SyncOutlined />}
+                  onClick={syncOfflineEdits}
+                  style={{ width: '100%' }}
+                >
+                  Sync Edits ({offlineQueueCount})
+                </Button>
+              </Badge>
+            )}
+          </div>
+
+          {/* GPS Tracking Controls */}
+          <div style={{ borderTop: '1px solid #1e293b', paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>GPS Tracking</span>
+              <Switch
+                size="small"
+                checked={gpsActive}
+                onChange={setGpsActive}
+              />
+            </div>
+
+            {gpsActive && (
+              <>
+                {gpsCoords && (
+                  <div style={{ fontSize: 10, color: '#f8fafc', background: 'rgba(30, 41, 59, 0.5)', padding: '4px 6px', borderRadius: 4, fontFamily: 'monospace' }}>
+                    Lat: {gpsCoords[1].toFixed(5)}<br />
+                    Lon: {gpsCoords[0].toFixed(5)}
+                  </div>
+                )}
+                
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <Tooltip title="Center map on current GPS location">
+                    <Button
+                      size="small"
+                      icon={<AimOutlined />}
+                      onClick={panToGpsLocation}
+                      style={{ flex: 1, background: '#1e293b', borderColor: '#334155', color: '#e2e8f0' }}
+                    />
+                  </Tooltip>
+                  
+                  {drawInteraction.current && (
+                    <Tooltip title="Add vertex at current GPS location">
+                      <Button
+                        size="small"
+                        icon={<EnvironmentOutlined />}
+                        onClick={addVertexAtGps}
+                        style={{ flex: 1, background: '#1e293b', borderColor: '#334155', color: '#e2e8f0' }}
+                      />
+                    </Tooltip>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 10, color: '#94a3b8' }}>Auto-Center</span>
+                  <Switch
+                    size="small"
+                    checked={gpsAutoTrack}
+                    onChange={setGpsAutoTrack}
+                  />
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       </div>
 
-      {/* Coordinate display */}
+      {/* Coordinate display & interactive converter/jump tool */}
       {mapCoords && (
-        <div className="map-coords">{formatCoords()}</div>
+        <div style={{
+          position: 'absolute',
+          bottom: 32,
+          right: 12,
+          zIndex: 100,
+          background: '#0e1a2e', // harmonized HSL/Dark color matching project
+          border: '1px solid #1f2937',
+          borderRadius: 8,
+          padding: '8px 12px',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+          fontFamily: 'monospace',
+          color: '#e2e8f0',
+          width: 320,
+        }}>
+          {/* header */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: 4 }}>
+            <span style={{ fontSize: 10, fontWeight: 600, color: '#38bdf8', textTransform: 'uppercase', letterSpacing: 0.5 }}>Coordinate Tool</span>
+            <Tooltip title="Type coordinates below and press enter to jump. Supports Lat,Lon (DD/DMS) or UTM (Easting Northing Zone)">
+              <InfoCircleOutlined style={{ fontSize: 11, color: '#64748b', cursor: 'help' }} />
+            </Tooltip>
+          </div>
+          
+          {/* displays */}
+          <div style={{ fontSize: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div><span style={{ color: '#64748b' }}>DD:  </span>{formatCoords()}</div>
+            <div><span style={{ color: '#64748b' }}>DMS: </span>{formatCoordsDMS()}</div>
+            <div><span style={{ color: '#64748b' }}>UTM: </span>{formatCoordsUTM()}</div>
+          </div>
+          
+          <Divider style={{ margin: '8px 0', borderColor: 'rgba(255,255,255,0.1)' }} />
+          
+          {/* jump input */}
+          <div style={{ display: 'flex', gap: 6 }}>
+            <Input
+              size="small"
+              placeholder="Jump (e.g. 28.6139, 77.2090)"
+              value={coordinateJumpInput}
+              onChange={(e) => setCoordinateJumpInput(e.target.value)}
+              onPressEnter={handleCoordinateJump}
+              style={{ background: '#0a0f1d', border: '1px solid #1f2937', color: '#fff', fontSize: 11 }}
+            />
+            <Button
+              size="small"
+              type="primary"
+              onClick={handleCoordinateJump}
+              icon={<AimOutlined />}
+              style={{ fontSize: 11 }}
+            >
+              Go
+            </Button>
+          </div>
+        </div>
       )}
 
       {/* Surveyor (CEO/ADEO): share new shapes with the parent DEO office */}
@@ -4136,6 +5738,13 @@ export default function MapPage() {
         selectedCount={selectedCount}
       />
 
+      <MapAtlasModal
+        open={atlasOpen}
+        onClose={() => setAtlasOpen(false)}
+        projectId={selectedProjectId}
+        features={mapFeatures}
+      />
+
       <ExternalLayersPanel
         open={extLayersPanelOpen}
         onClose={() => setExtLayersPanelOpen(false)}
@@ -4185,42 +5794,65 @@ export default function MapPage() {
         </Space>
       </DraggableModal>
 
-      {/* Topology results modal */}
+      {/* eNLI Code Search Modal */}
       <DraggableModal
-        title={<><CheckCircleOutlined style={{ marginRight: 8 }} />Topology Check Results</>}
-        open={topoOpen}
-        onCancel={() => setTopoOpen(false)}
-        footer={<Button onClick={() => setTopoOpen(false)}>Close</Button>}
-        width={560}
-        styles={{ body: { background: '#0e0e1e', maxHeight: 420, overflowY: 'auto' } }}
+        title={<><SearchOutlined style={{ marginRight: 8, color: '#38bdf8' }} />Search eNLI Code</>}
+        open={enliModalOpen}
+        onCancel={() => { setEnliModalOpen(false); setEnliCode('') }}
+        onOk={handleEnliSearch}
+        confirmLoading={enliSearching}
+        okText="Search"
+        width={360}
+        styles={{ body: { background: '#0e0e1e' } }}
       >
-        {topoIssues.length === 0 ? (
-          <div style={{ color: '#4CAF50', textAlign: 'center', padding: 24, fontSize: 14 }}>
-            <CheckCircleOutlined style={{ fontSize: 32, marginBottom: 8, display: 'block' }} />
-            No topology issues found!
+        <Space direction="vertical" style={{ width: '100%', marginTop: 12 }} size={10}>
+          <div>
+            <div style={{ color: '#aaa', fontSize: 12, marginBottom: 6 }}>Natural Location Identifier (eNLI Code)</div>
+            <Input 
+              placeholder="e.g. 7521RSDCLDB6H0" 
+              value={enliCode}
+              onChange={(e) => setEnliCode(e.target.value)} 
+              onPressEnter={handleEnliSearch} 
+              autoFocus
+            />
           </div>
-        ) : (
-          <Space direction="vertical" style={{ width: '100%' }} size={6}>
-            {topoIssues.map((issue, i) => (
-              <div key={i}
-                style={{ background: '#0a0e1a', border: '1px solid #1a3a5a', borderRadius: 4, padding: '8px 12px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                  <WarningOutlined style={{ color: issue.type === 'OVERLAP' ? '#ff9800' : '#f44336' }} />
-                  <Tag color={issue.type === 'OVERLAP' ? 'orange' : 'red'} style={{ fontSize: 11 }}>
-                    {issue.type}
-                  </Tag>
-                </div>
-                <div style={{ color: '#ccc', fontSize: 12 }}>
-                  Parcel: <span style={{ color: '#4fc3f7' }}>{issue.parcel_a.parcel_id}</span> — {issue.parcel_a.name}
-                  {issue.parcel_b && (
-                    <> &amp; <span style={{ color: '#4fc3f7' }}>{issue.parcel_b.parcel_id}</span> — {issue.parcel_b.name}</>
-                  )}
-                </div>
-              </div>
-            ))}
-          </Space>
-        )}
+        </Space>
       </DraggableModal>
+
+      {/* Review Annotation Creation Modal */}
+      <Modal
+        title={<span style={{ color: '#4fc3f7' }}>Add Review Markup Comment</span>}
+        open={annotationDrawModal}
+        onOk={saveAnnotation}
+        onCancel={() => { setAnnotationDrawModal(false); pendingAnnotationGeom.current = null }}
+        okText="Save"
+        cancelText="Discard"
+        width={400}
+        styles={{ body: { background: '#0e0e1e' } }}
+      >
+        <Space direction="vertical" style={{ width: '100%', marginTop: 12 }} size={12}>
+          <div>
+            <div style={{ color: '#aaa', fontSize: 11, marginBottom: 4 }}>Markup Type</div>
+            <Tag color={annotationType === 'comment' ? 'blue' : annotationType === 'highlight' ? 'orange' : 'red'}>
+              {annotationType === 'comment' ? 'Comment Pin' : annotationType === 'highlight' ? 'Highlight' : 'Redline'}
+            </Tag>
+          </div>
+          <div>
+            <div style={{ color: '#aaa', fontSize: 11, marginBottom: 4 }}>Color</div>
+            <ColorPicker value={annotationColor} onChange={(c) => setAnnotationColor(c.toHexString())} />
+          </div>
+          <div>
+            <div style={{ color: '#aaa', fontSize: 11, marginBottom: 4 }}>Comment / Remark</div>
+            <Input.TextArea
+              rows={3}
+              placeholder="Enter instructions or comment for SDO/Surveyor..."
+              value={annotationComment}
+              onChange={(e) => setAnnotationComment(e.target.value)}
+              style={{ background: '#1a1a2e', color: '#ccc', borderColor: '#333' }}
+            />
+          </div>
+        </Space>
+      </Modal>
 
       {/* Coordinate picker modal */}
       <DraggableModal
@@ -4387,6 +6019,27 @@ export default function MapPage() {
               )}
               {meta.length === 0 && attrs.length === 0 && (
                 <div style={{ color: '#666', textAlign: 'center', padding: '20px 0' }}>No attributes available</div>
+              )}
+              {/* Photo attachments — project features only */}
+              {featureModalMeta?.featureId && (
+                <FeaturePhotoPanel featureId={featureModalMeta.featureId} />
+              )}
+              {featureModalMeta?.layerType === 'external' && (
+                <div style={{
+                  marginTop: 16,
+                  padding: '10px 12px',
+                  borderRadius: 6,
+                  background: 'rgba(255, 102, 0, 0.08)',
+                  border: '1px solid rgba(255, 102, 0, 0.25)',
+                  color: '#ff6600',
+                  fontSize: 12,
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 8,
+                }}>
+                  <span style={{ fontSize: 14 }}>ℹ</span>
+                  <span>External layers are read-only and do not support photo attachments or OCR auto-fill.</span>
+                </div>
               )}
             </div>
           )
@@ -4643,8 +6296,13 @@ export default function MapPage() {
                                       onClick={() => { if (confirm(`Delete ALL ${cnt} features in "${ln}"?`)) deleteAllInLayer(ln) }}
                                       style={{ fontSize: 10 }}>Clear All</Button>
                                     <Button size="small" icon={<FunctionOutlined />}
-                                      onClick={() => { setGradField(''); setGraduatedModal({ ln }) }}
-                                      style={{ fontSize: 10 }}>Classify…</Button>
+                                      onClick={() => {
+                                        setGradField('')
+                                        setGradMode('rules')
+                                        setRuleRows(layerRulesRef.current[ln] ?? [])
+                                        setGraduatedModal({ ln })
+                                      }}
+                                      style={{ fontSize: 10 }}>Style Rules…</Button>
                                   </Space>
                                 </div>
                               ),
@@ -4738,40 +6396,32 @@ export default function MapPage() {
             </div>
           ))}
 
-          {/* Topology check */}
+          {/* Topology — unified: opens TopologyRulesModal which includes DefenceParcel quick-check */}
           <Divider style={{ borderColor: '#1a1a2e', margin: '10px 0' }} />
           <div style={{ color: '#aaa', fontSize: 11, letterSpacing: 1, marginBottom: 6 }}>TOPOLOGY</div>
           <Button
             size="small"
-            icon={<CheckCircleOutlined />}
-            loading={topoLoading}
-            onClick={handleCheckTopology}
+            icon={<ApartmentOutlined />}
+            onClick={() => setTopologyRulesOpen(true)}
             style={{ width: '100%', fontSize: 12 }}
           >
-            Check Topology
+            Topology Rules &amp; Check
           </Button>
 
-          {/* Vector Analysis */}
+          {/* Vector Analysis — Dissolve/Clip/Join/Near/Hull/Centroids moved to Processing Toolbox */}
           <Divider style={{ borderColor: '#1a1a2e', margin: '10px 0' }} />
           <div style={{ color: '#aaa', fontSize: 11, letterSpacing: 1, marginBottom: 6 }}>VECTOR ANALYSIS</div>
           <Space wrap size={4}>
-            <Button size="small" icon={<SisternodeOutlined />} onClick={() => { setAnalysisLayer(''); setDissolveModal(true) }} style={{ fontSize: 10 }}>Dissolve</Button>
-            <Button size="small" icon={<NodeIndexOutlined />} onClick={() => { setSpatialJoinModal(true) }} style={{ fontSize: 10 }}>Spatial Join</Button>
-            <Button size="small" icon={<ScissorOutlined />} onClick={() => { setClipModal(true) }} style={{ fontSize: 10 }}>Clip</Button>
             <Button size="small" icon={<CalculatorOutlined />} onClick={() => { setSummaryModal(true); setSummaryData(null) }} style={{ fontSize: 10 }}>Summary Stats</Button>
-            <Button size="small" icon={<RadiusUprightOutlined />} onClick={() => { setNearModal(true) }} style={{ fontSize: 10 }}>Near</Button>
-            <Button size="small" icon={<RadiusUpleftOutlined />} onClick={() => { setHullModal(true) }} style={{ fontSize: 10 }}>Convex Hull</Button>
-            <Button size="small" icon={<EnvironmentOutlined />} onClick={() => { setCentroidModal(true) }} style={{ fontSize: 10 }}>Centroids</Button>
-            <Button size="small" icon={<CalculatorOutlined />} onClick={() => {
-              if (selectedProjectId) {
-                setAnalysisLoading(true)
-                api.post('/projects/features/auto-geometry-stats/', { project: selectedProjectId })
-                  .then(r => message.success(r.data.detail))
-                  .catch(() => message.error('Failed'))
-                  .finally(() => setAnalysisLoading(false))
-              }
-            }} loading={analysisLoading} style={{ fontSize: 10 }}>Geometry Stats</Button>
           </Space>
+          <Button
+            size="small"
+            icon={<ToolOutlined />}
+            onClick={() => setProcessingToolboxOpen(true)}
+            style={{ width: '100%', fontSize: 11, marginTop: 6 }}
+          >
+            ⚙ Processing Toolbox (Dissolve, Clip, Buffer…)
+          </Button>
 
           {/* Swipe comparison */}
           <Divider style={{ borderColor: '#1a1a2e', margin: '10px 0' }} />
@@ -4795,15 +6445,163 @@ export default function MapPage() {
             )}
           </Space>
 
-          {/* Snapping */}
-          <Divider style={{ borderColor: '#1a1a2e', margin: '10px 0' }} />
-          <div style={{ color: '#aaa', fontSize: 11, letterSpacing: 1, marginBottom: 6 }}>SNAPPING</div>
-          <Space size={4} wrap>
-            <Button size="small" type={snapVertex ? 'primary' : 'default'} onClick={() => setSnapVertex(!snapVertex)} style={{ fontSize: 10 }}>Vertex</Button>
-            <Button size="small" type={snapEdge ? 'primary' : 'default'} onClick={() => setSnapEdge(!snapEdge)} style={{ fontSize: 10 }}>Edge</Button>
-            <Button size="small" type={snapMidpoint ? 'primary' : 'default'} onClick={() => setSnapMidpoint(!snapMidpoint)} style={{ fontSize: 10 }}>Midpoint</Button>
-          </Space>
+          {/* Snapping — only for DRAFT / RETURNED survey areas */}
+          {canDraw && !isReadOnly && !isOverviewMode && (
+            <>
+              <Divider style={{ borderColor: '#1a1a2e', margin: '10px 0' }} />
+              <div style={{ color: '#aaa', fontSize: 11, letterSpacing: 1, marginBottom: 6 }}>SNAPPING</div>
+              <Space size={4} wrap>
+                <Button size="small" type={snapVertex ? 'primary' : 'default'} onClick={() => setSnapVertex(!snapVertex)} style={{ fontSize: 10 }}>Vertex</Button>
+                <Button size="small" type={snapEdge ? 'primary' : 'default'} onClick={() => setSnapEdge(!snapEdge)} style={{ fontSize: 10 }}>Edge</Button>
+                <Button size="small" type={snapMidpoint ? 'primary' : 'default'} onClick={() => setSnapMidpoint(!snapMidpoint)} style={{ fontSize: 10 }}>Midpoint</Button>
+                <Button size="small" type={snapPerpendicular ? 'primary' : 'default'} onClick={() => setSnapPerpendicular(!snapPerpendicular)} title="Show perpendicular guide line to nearest edge" style={{ fontSize: 10 }}>⊥ Perp</Button>
+                <Button size="small" type={snapTrace ? 'primary' : 'default'} onClick={() => setSnapTrace(!snapTrace)} title="Trace along existing feature edges while drawing" style={{ fontSize: 10, color: snapTrace ? undefined : '#aaa' }}>Trace</Button>
+              </Space>
+              {(snapPerpendicular || snapTrace) && (
+                <div style={{ fontSize: 10, color: '#4fc3f7', marginTop: 4 }}>
+                  {snapPerpendicular && <span>⊥ Perp: green guide line to nearest edge foot-point. </span>}
+                  {snapTrace && <span>Trace: drawn segments near existing edges are auto-expanded to follow them.</span>}
+                </div>
+              )}
+            </>
+          )}
           </div>{/* end read-only gate */}
+
+          {/* Review Annotations (Redline Markup) */}
+          {selectedSurveyAreaId && (
+            <>
+              <Divider style={{ borderColor: '#1a1a2e', margin: '10px 0' }} />
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                <div style={{ color: '#aaa', fontSize: 11, letterSpacing: 1 }}>REVIEW ANNOTATIONS ({annotations.length})</div>
+                <Checkbox
+                  checked={showResolvedAnnotations}
+                  onChange={(e) => setShowResolvedAnnotations(e.target.checked)}
+                  style={{ color: '#888', fontSize: 10 }}
+                >
+                  Show Resolved
+                </Checkbox>
+              </div>
+
+              {/* Toolbar for Reviewers to draw annotations */}
+              {isReviewer && (
+                <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+                  <Button
+                    size="small"
+                    icon={<EditOutlined />}
+                    onClick={() => startDrawingAnnotation('redline')}
+                    style={{ fontSize: 10, flex: 1, background: '#1a1a2e', borderColor: '#ff4444', color: '#ff4444' }}
+                  >
+                    Redline
+                  </Button>
+                  <Button
+                    size="small"
+                    icon={<HighlightOutlined />}
+                    onClick={() => startDrawingAnnotation('highlight')}
+                    style={{ fontSize: 10, flex: 1, background: '#1a1a2e', borderColor: '#fa8c16', color: '#fa8c16' }}
+                  >
+                    Highlight
+                  </Button>
+                  <Button
+                    size="small"
+                    icon={<CommentOutlined />}
+                    onClick={() => startDrawingAnnotation('comment')}
+                    style={{ fontSize: 10, flex: 1, background: '#1a1a2e', borderColor: '#1890ff', color: '#1890ff' }}
+                  >
+                    Comment
+                  </Button>
+                </div>
+              )}
+
+              {/* List of Annotations */}
+              <div style={{ maxHeight: 200, overflowY: 'auto', marginBottom: 10 }}>
+                {annotations
+                  .filter((a: any) => showResolvedAnnotations || !a.properties.is_resolved)
+                  .map((a: any) => {
+                    const id = a.id
+                    const p = a.properties
+                    const isResolved = p.is_resolved
+                    const createdName = p.created_by_name || 'Reviewer'
+                    const dateStr = dayjs(p.created_at).fromNow()
+
+                    return (
+                      <div
+                        key={id}
+                        style={{
+                          background: '#0d1a2a',
+                          border: `1px solid ${isResolved ? '#2a2a2a' : p.color ?? '#ff4444'}`,
+                          borderRadius: 4,
+                          padding: 8,
+                          marginBottom: 6,
+                          opacity: isResolved ? 0.6 : 1,
+                          transition: 'opacity 0.2s'
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
+                          <span
+                            style={{
+                              fontSize: 10,
+                              fontWeight: 600,
+                              textTransform: 'uppercase',
+                              color: isResolved ? '#666' : p.color ?? '#ff4444',
+                              cursor: 'pointer'
+                            }}
+                            onClick={() => zoomToAnnotation(a.geometry)}
+                          >
+                            📍 {p.annotation_type_display || p.annotation_type}
+                          </span>
+                          <Space size={2}>
+                            {isReviewer && (
+                              <Button
+                                size="small"
+                                type="text"
+                                icon={isResolved ? <UndoOutlined style={{ fontSize: 10, color: '#aaa' }} /> : <CheckOutlined style={{ fontSize: 10, color: '#52c41a' }} />}
+                                onClick={() => toggleResolveAnnotation(id, isResolved)}
+                                title={isResolved ? 'Mark Unresolved' : 'Mark Resolved'}
+                              />
+                            )}
+                            {isReviewer && (
+                              <Popconfirm
+                                title="Delete markup?"
+                                onConfirm={() => deleteAnnotation(id)}
+                                okText="Yes"
+                                cancelText="No"
+                                okType="danger"
+                              >
+                                <Button
+                                  size="small"
+                                  type="text"
+                                  danger
+                                  icon={<DeleteOutlined style={{ fontSize: 10 }} />}
+                                />
+                              </Popconfirm>
+                            )}
+                          </Space>
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 12,
+                            color: '#ccc',
+                            marginBottom: 4,
+                            wordBreak: 'break-word',
+                            textDecoration: isResolved ? 'line-through' : 'none'
+                          }}
+                        >
+                          {p.comment || '(No comment)'}
+                        </div>
+                        <div style={{ fontSize: 9, color: '#555' }}>
+                          By {createdName} · {dateStr}
+                        </div>
+                      </div>
+                    )
+                  })}
+                {annotations.filter((a: any) => showResolvedAnnotations || !a.properties.is_resolved).length === 0 && (
+                  <div style={{ color: '#555', fontSize: 11, textAlign: 'center', padding: '10px 0' }}>
+                    No active review markups
+                  </div>
+                )}
+              </div>
+            </>
+          )}
 
           {/* Projects */}
           <Divider style={{ borderColor: '#1a1a2e', margin: '10px 0' }} />
@@ -4930,62 +6728,7 @@ export default function MapPage() {
       </DraggableModal>
 
       {/* ── Dissolve Modal ──────────────────────────────────────────────── */}
-      <DraggableModal title="Dissolve Layer" open={dissolveModal} onCancel={() => setDissolveModal(false)} footer={null}>
-        <Space direction="vertical" style={{ width: '100%' }} size={10}>
-          <AntSelect placeholder="Layer to dissolve" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer} />
-          <Input placeholder="Field to dissolve by (e.g. district)" value={analysisField} onChange={e => setAnalysisField(e.target.value)} />
-          <Input placeholder="Output layer name" value={analysisOutLayer} onChange={e => setAnalysisOutLayer(e.target.value)} />
-          <Button type="primary" loading={analysisLoading} style={{ width: '100%' }}
-            onClick={() => {
-              if (!analysisLayer) { message.warning('Select a layer to dissolve'); return }
-              if (!analysisField.trim()) { message.warning('Enter a field to dissolve by'); return }
-              if (!selectedProjectId) { message.warning('Select a project first'); return }
-              setAnalysisLoading(true)
-              api.post('/projects/features/dissolve/', { project: selectedProjectId, layer_name: analysisLayer, dissolve_field: analysisField, out_layer: analysisOutLayer || undefined })
-                .then(r => { message.success(r.data.detail); qc.invalidateQueries({ queryKey: qk.projectFeatures(selectedProjectId ?? 0) }); setDissolveModal(false) })
-                .catch(e => message.error(e?.response?.data?.detail || 'Dissolve failed'))
-                .finally(() => setAnalysisLoading(false))
-            }}>Run Dissolve</Button>
-        </Space>
-      </DraggableModal>
-
-      {/* ── Spatial Join Modal ──────────────────────────────────────────── */}
-      <DraggableModal title="Spatial Join" open={spatialJoinModal} onCancel={() => setSpatialJoinModal(false)} footer={null}>
-        <Space direction="vertical" style={{ width: '100%' }} size={10}>
-          <AntSelect placeholder="Base layer (receives attributes)" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer} />
-          <AntSelect placeholder="Overlay layer (provides attributes)" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer2} />
-          <Button type="primary" loading={analysisLoading} style={{ width: '100%' }}
-            onClick={() => {
-              if (!analysisLayer) { message.warning('Select a base layer'); return }
-              if (!analysisLayer2) { message.warning('Select an overlay layer'); return }
-              setAnalysisLoading(true)
-              api.post('/projects/features/spatial-join/', { project: selectedProjectId, base_layer: analysisLayer, overlay_layer: analysisLayer2 })
-                .then(r => { message.success(r.data.detail); qc.invalidateQueries({ queryKey: qk.projectFeatures(selectedProjectId ?? 0) }); setSpatialJoinModal(false) })
-                .catch(e => message.error(e?.response?.data?.detail || 'Spatial join failed'))
-                .finally(() => setAnalysisLoading(false))
-            }}>Run Spatial Join</Button>
-        </Space>
-      </DraggableModal>
-
-      {/* ── Clip Modal ──────────────────────────────────────────────────── */}
-      <DraggableModal title="Clip Layer to Boundary" open={clipModal} onCancel={() => setClipModal(false)} footer={null}>
-        <Space direction="vertical" style={{ width: '100%' }} size={10}>
-          <AntSelect placeholder="Layer to clip" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer} />
-          <AntSelect placeholder="Clip boundary layer" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer2} />
-          <Button type="primary" danger loading={analysisLoading} style={{ width: '100%' }}
-            onClick={() => {
-              if (!analysisLayer) { message.warning('Select a layer to clip'); return }
-              if (!analysisLayer2) { message.warning('Select a clip boundary layer'); return }
-              setAnalysisLoading(true)
-              api.post('/projects/features/clip-to-boundary/', { project: selectedProjectId, layer_name: analysisLayer, clip_layer: analysisLayer2 })
-                .then(r => { message.success(r.data.detail); qc.invalidateQueries({ queryKey: qk.projectFeatures(selectedProjectId ?? 0) }); setClipModal(false) })
-                .catch(e => message.error(e?.response?.data?.detail || 'Clip failed'))
-                .finally(() => setAnalysisLoading(false))
-            }}>Clip (modifies features in-place)</Button>
-        </Space>
-      </DraggableModal>
-
-      {/* ── Summary Stats Modal ─────────────────────────────────────────── */}
+      {/* ── Summary Stats Modal (unique — attribute statistics, not in Processing Toolbox) ── */}
       <DraggableModal title="Summary Statistics" open={summaryModal} onCancel={() => setSummaryModal(false)} footer={null} width={560}>
         <Space direction="vertical" style={{ width: '100%' }} size={10}>
           <AntSelect placeholder="Select layer" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))}
@@ -5015,58 +6758,6 @@ export default function MapPage() {
         </Space>
       </DraggableModal>
 
-      {/* ── Near Analysis Modal ─────────────────────────────────────────── */}
-      <DraggableModal title="Near Analysis" open={nearModal} onCancel={() => setNearModal(false)} footer={null}>
-        <Space direction="vertical" style={{ width: '100%' }} size={10}>
-          <AntSelect placeholder="Base layer (features to analyze)" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer} />
-          <AntSelect placeholder="Near layer (find nearest from)" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer2} />
-          <Button type="primary" loading={analysisLoading} style={{ width: '100%' }}
-            onClick={() => {
-              if (!analysisLayer) { message.warning('Select a base layer'); return }
-              if (!analysisLayer2) { message.warning('Select a near layer'); return }
-              setAnalysisLoading(true)
-              api.post('/projects/features/near-analysis/', { project: selectedProjectId, base_layer: analysisLayer, near_layer: analysisLayer2 })
-                .then(r => { message.success(r.data.detail); qc.invalidateQueries({ queryKey: qk.projectFeatures(selectedProjectId ?? 0) }); setNearModal(false) })
-                .catch(e => message.error(e?.response?.data?.detail || 'Near analysis failed'))
-                .finally(() => setAnalysisLoading(false))
-            }}>Run Near Analysis</Button>
-        </Space>
-      </DraggableModal>
-
-      {/* ── Convex Hull Modal ───────────────────────────────────────────── */}
-      <DraggableModal title="Convex Hull" open={hullModal} onCancel={() => setHullModal(false)} footer={null}>
-        <Space direction="vertical" style={{ width: '100%' }} size={10}>
-          <AntSelect placeholder="Source layer" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer} />
-          <Input placeholder="Output layer name (optional)" value={analysisOutLayer} onChange={e => setAnalysisOutLayer(e.target.value)} />
-          <Button type="primary" loading={analysisLoading} style={{ width: '100%' }}
-            onClick={() => {
-              if (!analysisLayer) { message.warning('Select a source layer'); return }
-              setAnalysisLoading(true)
-              api.post('/projects/features/convex-hull/', { project: selectedProjectId, layer_name: analysisLayer, out_layer: analysisOutLayer || undefined })
-                .then(r => { message.success(r.data.detail); qc.invalidateQueries({ queryKey: qk.projectFeatures(selectedProjectId ?? 0) }); setHullModal(false) })
-                .catch(e => message.error(e?.response?.data?.detail || 'Convex hull failed'))
-                .finally(() => setAnalysisLoading(false))
-            }}>Generate Convex Hull</Button>
-        </Space>
-      </DraggableModal>
-
-      {/* ── Centroid Extract Modal ──────────────────────────────────────── */}
-      <DraggableModal title="Extract Centroids" open={centroidModal} onCancel={() => setCentroidModal(false)} footer={null}>
-        <Space direction="vertical" style={{ width: '100%' }} size={10}>
-          <AntSelect placeholder="Polygon layer" style={{ width: '100%' }} options={layerNames.map(l => ({ value: l, label: l }))} onChange={setAnalysisLayer} />
-          <Input placeholder="Output layer name (optional)" value={analysisOutLayer} onChange={e => setAnalysisOutLayer(e.target.value)} />
-          <Button type="primary" loading={analysisLoading} style={{ width: '100%' }}
-            onClick={() => {
-              if (!analysisLayer) { message.warning('Select a polygon layer'); return }
-              setAnalysisLoading(true)
-              api.post('/projects/features/centroid-extract/', { project: selectedProjectId, layer_name: analysisLayer, out_layer: analysisOutLayer || undefined })
-                .then(r => { message.success(r.data.detail); qc.invalidateQueries({ queryKey: qk.projectFeatures(selectedProjectId ?? 0) }); setCentroidModal(false) })
-                .catch(e => message.error(e?.response?.data?.detail || 'Centroid extraction failed'))
-                .finally(() => setAnalysisLoading(false))
-            }}>Extract Centroids</Button>
-        </Space>
-      </DraggableModal>
-
       {/* ── Find & Replace Modal ────────────────────────────────────────── */}
       <DraggableModal title={`Find & Replace — ${findReplaceModal?.ln}`} open={!!findReplaceModal} onCancel={() => setFindReplaceModal(null)} footer={null}>
         <Space direction="vertical" style={{ width: '100%' }} size={10}>
@@ -5088,58 +6779,144 @@ export default function MapPage() {
         </Space>
       </DraggableModal>
 
-      {/* ── Graduated / Classify Modal ──────────────────────────────────── */}
-      <DraggableModal title={`Classify Layer — ${graduatedModal?.ln}`} open={!!graduatedModal} onCancel={() => setGraduatedModal(null)} footer={null} width={500}>
-        <Space direction="vertical" style={{ width: '100%' }} size={10}>
-          <Radio.Group value={gradMode} onChange={e => setGradMode(e.target.value)}>
-            <Radio.Button value="unique">Unique Values</Radio.Button>
-            <Radio.Button value="graduated">Graduated Colors</Radio.Button>
-          </Radio.Group>
-          <Input placeholder="Attribute field to classify by (e.g. category, district)" value={gradField} onChange={e => setGradField(e.target.value)} />
-          {gradMode === 'graduated' && (
-            <div>
-              <div style={{ color: '#aaa', fontSize: 12, marginBottom: 4 }}>Number of classes</div>
-              <InputNumber min={2} max={10} value={gradBreaks} onChange={v => setGradBreaks(v ?? 5)} />
-            </div>
-          )}
-          <Button type="primary" style={{ width: '100%' }}
-            onClick={() => {
-              const ln = graduatedModal?.ln
-              if (!ln || !gradField) return
-              const src = projectLayer.current?.getSource()
-              if (!src) return
-              const vals = new Set<string>()
-              src.getFeatures().forEach(f => {
-                if (f.get('layer_name') === ln) {
-                  const a = f.get('attributes') as any
-                  if (a && gradField in a) vals.add(String(a[gradField]))
-                }
-              })
-              const PALETTE = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#34495e','#e91e63','#00bcd4']
-              const rules: Record<string, string[]> = {}
-              Array.from(vals).forEach((v, i) => {
-                rules[v] = [PALETTE[i % PALETTE.length], PALETTE[i % PALETTE.length]]
-              })
-              setGraduatedRules(prev => ({ ...prev, [ln]: rules }))
-              graduatedRulesRef.current = { ...(graduatedRulesRef.current || {}), [ln]: rules }
-              graduatedFieldRef.current = { ...(graduatedFieldRef.current || {}), [ln]: gradField }
-              projectLayer.current?.getSource()?.changed()
-              message.success(`Applied ${vals.size} color classes for "${gradField}"`)
-              setGraduatedModal(null)
-            }}>Apply Classification</Button>
-          <Button style={{ width: '100%' }} onClick={() => {
-            const ln = graduatedModal?.ln
-            if (!ln) return
-            const newRules = { ...graduatedRulesRef.current }
-            delete newRules[ln]
-            graduatedRulesRef.current = newRules
-            const newFields = { ...graduatedFieldRef.current }
-            delete newFields[ln]
-            graduatedFieldRef.current = newFields
-            projectLayer.current?.getSource()?.changed()
-            setGraduatedModal(null)
-          }}>Clear Classification</Button>
-        </Space>
+      {/* ── Rule-Based Symbology / Classify Modal ───────────────────────── */}
+      <DraggableModal
+        title={<><FunctionOutlined style={{ marginRight: 8, color: '#ce93d8' }} />Rule-Based Symbology — {graduatedModal?.ln}</>}
+        open={!!graduatedModal}
+        onCancel={() => setGraduatedModal(null)}
+        footer={null}
+        width={620}
+      >
+        {graduatedModal && (() => {
+          const ln = graduatedModal.ln
+          const src = projectLayer.current?.getSource()
+          // Collect available attribute fields from features in this layer
+          const layerAttrKeys: string[] = []
+          src?.getFeatures().forEach(f => {
+            if (f.get('layer_name') === ln) {
+              const a = f.get('attributes') as Record<string, unknown> | undefined
+              if (a) Object.keys(a).forEach(k => { if (!layerAttrKeys.includes(k)) layerAttrKeys.push(k) })
+            }
+          })
+          const OP_LABELS: Record<string, string> = {
+            '=': '=', '!=': '≠', '>': '>', '<': '<', '>=': '≥', '<=': '≤',
+            'contains': 'contains', 'startswith': 'starts with', '*': 'else (all)',
+          }
+          return (
+            <Space direction="vertical" style={{ width: '100%' }} size={8}>
+              <Radio.Group value={gradMode} onChange={e => { setGradMode(e.target.value); setRuleRows(layerRulesRef.current[ln] ?? []) }} size="small">
+                <Radio.Button value="rules">Custom Rules</Radio.Button>
+                <Radio.Button value="unique">Auto: Unique Values</Radio.Button>
+              </Radio.Group>
+
+              {gradMode === 'unique' && (
+                <Space direction="vertical" style={{ width: '100%' }} size={6}>
+                  <Input placeholder="Attribute field (e.g. category, status)" value={gradField} onChange={e => setGradField(e.target.value)} />
+                  <Button type="primary" block onClick={() => {
+                    if (!gradField) return
+                    const vals = new Set<string>()
+                    src?.getFeatures().forEach(f => {
+                      if (f.get('layer_name') === ln) {
+                        const a = f.get('attributes') as any
+                        if (a && gradField in a) vals.add(String(a[gradField]))
+                      }
+                    })
+                    const newRules: FeatureRule[] = Array.from(vals).map((v, i) => ({
+                      id: `r${Date.now()}_${i}`, label: v, field: gradField, op: '=', value: v,
+                      fill: RULE_PALETTE[i % RULE_PALETTE.length],
+                      stroke: RULE_PALETTE[i % RULE_PALETTE.length], width: 2,
+                    }))
+                    newRules.push({ id: `r${Date.now()}_else`, label: 'else', field: '', op: '*', value: '', fill: '#607d8b', stroke: '#455a64', width: 1 })
+                    setRuleRows(newRules)
+                    setGradMode('rules')
+                    message.success(`Generated ${vals.size} rules from "${gradField}" — review & apply`)
+                  }}>Generate Rules from Values</Button>
+                </Space>
+              )}
+
+              {gradMode === 'rules' && (
+                <Space direction="vertical" style={{ width: '100%' }} size={4}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '16px 2fr 80px 2fr 36px 36px 60px 36px', gap: 4, alignItems: 'center', padding: '0 2px' }}>
+                    {['', 'Field', 'Op', 'Value', 'Fill', 'Line', 'W', ''].map((h, i) => (
+                      <span key={i} style={{ color: '#666', fontSize: 10, fontWeight: 600 }}>{h}</span>
+                    ))}
+                  </div>
+                  {ruleRows.map((rule, idx) => (
+                    <div key={rule.id} style={{ display: 'grid', gridTemplateColumns: '16px 2fr 80px 2fr 36px 36px 60px 36px', gap: 4, alignItems: 'center' }}>
+                      {/* Row indicator */}
+                      <span style={{ color: '#555', fontSize: 10 }}>{idx + 1}</span>
+                      {/* Field */}
+                      {rule.op === '*' ? (
+                        <span style={{ color: '#ce93d8', fontSize: 11, fontStyle: 'italic', gridColumn: 'span 3' }}>else (all remaining features)</span>
+                      ) : (
+                        <>
+                          <AntSelect size="small" style={{ width: '100%' }} value={rule.field || undefined}
+                            onChange={v => setRuleRows(prev => prev.map((r, i) => i === idx ? { ...r, field: v ?? '' } : r))}
+                            showSearch allowClear placeholder="field"
+                            options={layerAttrKeys.map(k => ({ value: k, label: k }))} />
+                          <AntSelect size="small" value={rule.op}
+                            onChange={v => setRuleRows(prev => prev.map((r, i) => i === idx ? { ...r, op: v } : r))}
+                            options={Object.entries(OP_LABELS).filter(([k]) => k !== '*').map(([v, l]) => ({ value: v, label: l }))} />
+                          <Input size="small" value={rule.value} placeholder="value"
+                            onChange={e => setRuleRows(prev => prev.map((r, i) => i === idx ? { ...r, value: e.target.value } : r))} />
+                        </>
+                      )}
+                      {/* Fill color */}
+                      <input type="color" value={rule.fill}
+                        style={{ width: 30, height: 26, border: 'none', borderRadius: 4, cursor: 'pointer', padding: 2 }}
+                        onChange={e => setRuleRows(prev => prev.map((r, i) => i === idx ? { ...r, fill: e.target.value } : r))} />
+                      {/* Stroke color */}
+                      <input type="color" value={rule.stroke}
+                        style={{ width: 30, height: 26, border: 'none', borderRadius: 4, cursor: 'pointer', padding: 2 }}
+                        onChange={e => setRuleRows(prev => prev.map((r, i) => i === idx ? { ...r, stroke: e.target.value } : r))} />
+                      {/* Stroke width */}
+                      <InputNumber size="small" min={0.5} max={10} step={0.5} value={rule.width}
+                        onChange={v => setRuleRows(prev => prev.map((r, i) => i === idx ? { ...r, width: v ?? 2 } : r))} />
+                      {/* Remove */}
+                      <Button size="small" type="text" danger icon={<DeleteOutlined />}
+                        onClick={() => setRuleRows(prev => prev.filter((_, i) => i !== idx))} />
+                    </div>
+                  ))}
+
+                  {/* Add rule / else buttons */}
+                  <Space size={4}>
+                    <Button size="small" icon={<PlusOutlined />} onClick={() => setRuleRows(prev => [
+                      ...prev,
+                      { id: `r${Date.now()}`, label: '', field: '', op: '=', value: '', fill: RULE_PALETTE[prev.length % RULE_PALETTE.length], stroke: '#455a64', width: 2 },
+                    ])}>Add Rule</Button>
+                    {!ruleRows.find(r => r.op === '*') && (
+                      <Button size="small" onClick={() => setRuleRows(prev => [
+                        ...prev,
+                        { id: `r${Date.now()}_else`, label: 'else', field: '', op: '*', value: '', fill: '#607d8b', stroke: '#455a64', width: 1 },
+                      ])}>+ Else</Button>
+                    )}
+                  </Space>
+                </Space>
+              )}
+
+              {/* Action buttons */}
+              <div style={{ display: 'flex', gap: 8, paddingTop: 8, borderTop: '1px solid #1a2a3a' }}>
+                <Button type="primary" style={{ flex: 1 }} onClick={() => {
+                  setLayerRules(prev => ({ ...prev, [ln]: ruleRows }))
+                  layerRulesRef.current = { ...layerRulesRef.current, [ln]: ruleRows }
+                  projectLayer.current?.getSource()?.changed()
+                  message.success(`Applied ${ruleRows.length} style rules to "${ln}"`)
+                  setGraduatedModal(null)
+                }}>Apply Rules</Button>
+                <Button onClick={() => {
+                  setLayerRules(prev => { const n = { ...prev }; delete n[ln]; return n })
+                  layerRulesRef.current = { ...layerRulesRef.current }
+                  delete layerRulesRef.current[ln]
+                  // Also clear legacy graduated
+                  const nr = { ...graduatedRulesRef.current }; delete nr[ln]; graduatedRulesRef.current = nr
+                  const nf = { ...graduatedFieldRef.current }; delete nf[ln]; graduatedFieldRef.current = nf
+                  projectLayer.current?.getSource()?.changed()
+                  setGraduatedModal(null)
+                }}>Clear All</Button>
+              </div>
+            </Space>
+          )
+        })()}
       </DraggableModal>
 
       {/* ── Rotate Feature modal ── */}
@@ -5219,8 +6996,18 @@ export default function MapPage() {
             ln = drawExistingLayer
             if (!ln) { message.warning('Select a layer from the list'); return }
           }
-          saveDrawnFeature(ln)
-          setDrawLayerModal(false)
+          // Check if there's an attribute template for this layer
+          const tmpl = attributeTemplates.find((t: any) => t.layer_name === ln)
+          if (tmpl && Array.isArray(tmpl.fields) && tmpl.fields.length > 0) {
+            setSmartFormLayer(ln)
+            setSmartFormTemplate(tmpl)
+            setSmartFormValues({})
+            setDrawLayerModal(false)
+            setSmartFormOpen(true)
+          } else {
+            saveDrawnFeature(ln)
+            setDrawLayerModal(false)
+          }
         }}
         width={420}
       >
@@ -5330,6 +7117,254 @@ export default function MapPage() {
           onImported={() => {
             qc.invalidateQueries({ queryKey: ['map-features', selectedProjectId] })
             qc.invalidateQueries({ queryKey: ['folders-flat', selectedProjectId] })
+          }}
+        />
+      )}
+
+      {/* ── Feature 11: SQL View Modal ───────────────────────── */}
+      <DraggableModal
+        title="Virtual Layer — SQL View"
+        open={sqlViewOpen}
+        onCancel={() => setSqlViewOpen(false)}
+        footer={null}
+        width={600}
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size={8}>
+          <div style={{ fontSize: 11, color: '#aaa' }}>
+            Execute a read-only SELECT query against survey_projects_gisfeature. Result rendered as a teal vector layer.
+          </div>
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+            {[
+              { label: 'All parcels', q: `SELECT id, ST_AsGeoJSON(geometry) as geom, layer_name FROM survey_projects_gisfeature WHERE project_id = ${selectedProjectId ?? 0} AND is_deleted = false LIMIT 100` },
+              { label: 'Layer filter', q: `SELECT id, ST_AsGeoJSON(geometry) as geom, attributes FROM survey_projects_gisfeature WHERE project_id = ${selectedProjectId ?? 0} AND layer_name = 'parcels' AND is_deleted = false` },
+            ].map(({ label, q }) => (
+              <Button key={label} size="small" onClick={() => setSqlViewQuery(q)} style={{ fontSize: 11 }}>{label}</Button>
+            ))}
+          </div>
+          <Input.TextArea
+            rows={5}
+            value={sqlViewQuery}
+            onChange={(e) => setSqlViewQuery(e.target.value)}
+            placeholder="SELECT id, ST_AsGeoJSON(geometry) as geom, layer_name FROM survey_projects_gisfeature WHERE ..."
+            style={{ fontFamily: 'monospace', fontSize: 11, background: '#0d1117', color: '#e6edf3', border: '1px solid #30363d' }}
+          />
+          <Button
+            type="primary"
+            loading={sqlViewLoading}
+            disabled={!sqlViewQuery.trim()}
+            onClick={async () => {
+              setSqlViewLoading(true)
+              try {
+                const r = await api.post('/projects/features/sql-view/', { query: sqlViewQuery })
+                const fc = r.data
+                const layerId = `sqlview_${Date.now()}`
+                const name = `SQL View (${fc.count} features)`
+                const src = new VectorSource()
+                const fmt = new GeoJSON()
+                const feats = fmt.readFeatures(fc, { featureProjection: 'EPSG:3857' })
+                src.addFeatures(feats)
+                const lyr = new VectorLayer({
+                  source: src,
+                  style: new Style({
+                    fill: new Fill({ color: 'rgba(0,188,212,0.3)' }),
+                    stroke: new Stroke({ color: '#00bcd4', width: 2 }),
+                    image: new CircleStyle({ radius: 5, fill: new Fill({ color: '#00bcd4' }) }),
+                  }),
+                  zIndex: 50,
+                })
+                mapInstance.current?.addLayer(lyr)
+                sqlViewLayerRefs.current[layerId] = lyr
+                setSqlViewLayers(prev => [...prev, { id: layerId, name }])
+                message.success(`Added layer: ${name}`)
+              } catch (err: any) {
+                message.error(err?.response?.data?.detail || 'SQL error')
+              } finally {
+                setSqlViewLoading(false)
+              }
+            }}
+          >Run Query</Button>
+          {sqlViewLayers.length > 0 && (
+            <div>
+              <div style={{ fontSize: 11, color: '#aaa', marginBottom: 4 }}>Active SQL View Layers:</div>
+              {sqlViewLayers.map(sl => (
+                <div key={sl.id} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                  <span style={{ flex: 1, fontSize: 12, color: '#00bcd4' }}>{sl.name}</span>
+                  <Button size="small" type="text" icon={<DeleteOutlined />} style={{ color: '#666' }}
+                    onClick={() => {
+                      const lyr = sqlViewLayerRefs.current[sl.id]
+                      if (lyr) { mapInstance.current?.removeLayer(lyr); delete sqlViewLayerRefs.current[sl.id] }
+                      setSqlViewLayers(prev => prev.filter(x => x.id !== sl.id))
+                    }} />
+                </div>
+              ))}
+            </div>
+          )}
+        </Space>
+      </DraggableModal>
+
+      {/* ── Feature 9: Smart Form Modal ──────────────────────── */}
+      <DraggableModal
+        title={`Feature Attributes — ${smartFormLayer}`}
+        open={smartFormOpen}
+        onCancel={() => {
+          setSmartFormOpen(false)
+          if (pendingDrawFeatureRef.current)
+            projectLayer.current?.getSource()?.removeFeature(pendingDrawFeatureRef.current)
+          pendingDrawFeatureRef.current = null
+        }}
+        okText="Save Feature"
+        onOk={() => {
+          // Validate required fields
+          if (smartFormTemplate) {
+            const geomType = pendingDrawTypeRef.current
+            for (const field of (smartFormTemplate.fields ?? [])) {
+              // Check conditional visibility
+              if (field.show_if_geom && field.show_if_geom !== geomType) continue
+              if (field.show_if) {
+                const depVal = smartFormValues[field.show_if.field] ?? ''
+                if (depVal !== field.show_if.value) continue
+              }
+              if (field.required && !smartFormValues[field.name]?.trim()) {
+                message.warning(`"${field.label || field.name}" is required`)
+                return
+              }
+            }
+          }
+          saveDrawnFeature(smartFormLayer, undefined, smartFormValues)
+          setSmartFormOpen(false)
+        }}
+        width={480}
+      >
+        {smartFormTemplate && (
+          <Space direction="vertical" style={{ width: '100%' }} size={8}>
+            {(smartFormTemplate.fields ?? []).map((field: any) => {
+              const geomType = pendingDrawTypeRef.current
+              // Conditional: hide if wrong geom type
+              if (field.show_if_geom && field.show_if_geom !== geomType) return null
+              // Conditional: hide if dependency field doesn't match
+              if (field.show_if) {
+                const depVal = smartFormValues[field.show_if.field] ?? ''
+                if (depVal !== field.show_if.value) return null
+              }
+              const label = field.label || field.name
+              const required = field.required
+              return (
+                <div key={field.name}>
+                  <div style={{ fontSize: 11, color: '#aaa', marginBottom: 3 }}>
+                    {label}{required && <span style={{ color: '#ff4d4f', marginLeft: 3 }}>*</span>}
+                    {field.description && <span style={{ color: '#555', marginLeft: 4 }}>— {field.description}</span>}
+                  </div>
+                  {field.type === 'choice' && field.choices ? (
+                    <AntSelect
+                      size="small"
+                      style={{ width: '100%' }}
+                      value={smartFormValues[field.name] || undefined}
+                      onChange={(v) => setSmartFormValues(prev => ({ ...prev, [field.name]: v }))}
+                      options={field.choices.map((c: string) => ({ value: c, label: c }))}
+                      placeholder={`Select ${label}`}
+                    />
+                  ) : field.type === 'boolean' ? (
+                    <AntSelect
+                      size="small"
+                      style={{ width: '100%' }}
+                      value={smartFormValues[field.name] || undefined}
+                      onChange={(v) => setSmartFormValues(prev => ({ ...prev, [field.name]: v }))}
+                      options={[{ value: 'true', label: 'Yes' }, { value: 'false', label: 'No' }]}
+                    />
+                  ) : (
+                    <Input
+                      size="small"
+                      type={field.type === 'integer' || field.type === 'decimal' ? 'number' : 'text'}
+                      value={smartFormValues[field.name] ?? ''}
+                      onChange={(e) => setSmartFormValues(prev => ({ ...prev, [field.name]: e.target.value }))}
+                      placeholder={label}
+                    />
+                  )}
+                </div>
+              )
+            })}
+          </Space>
+        )}
+      </DraggableModal>
+
+      {/* ── Feature 5: Processing Toolbox Panel ──────────────── */}
+      <ProcessingToolboxPanel
+        open={processingToolboxOpen}
+        onClose={() => setProcessingToolboxOpen(false)}
+        layerNames={layerNames}
+        isReadOnly={isReadOnly}
+        canDraw={canDraw}
+      />
+
+      {/* ── Feature 6: Topology Rules Modal ──────────────────── */}
+      {topologyRulesOpen && selectedProjectId && (
+        <TopologyRulesModal
+          open={topologyRulesOpen}
+          onClose={() => setTopologyRulesOpen(false)}
+          projectId={selectedProjectId}
+          layerNames={layerNames}
+          onViolationsFound={(geojson) => {
+            const src = new VectorSource()
+            const fmt = new GeoJSON()
+            const feats = fmt.readFeatures(geojson, { featureProjection: 'EPSG:3857' })
+            src.addFeatures(feats)
+            const lyr = new VectorLayer({
+              source: src,
+              style: new Style({
+                fill: new Fill({ color: 'rgba(255,0,0,0.25)' }),
+                stroke: new Stroke({ color: '#ff0000', width: 2 }),
+                image: new CircleStyle({ radius: 6, fill: new Fill({ color: '#ff0000' }) }),
+              }),
+              zIndex: 60,
+            })
+            mapInstance.current?.addLayer(lyr)
+            message.warning(`${geojson.violation_count ?? geojson.features?.length ?? 0} topology violation(s) shown in red`)
+          }}
+        />
+      )}
+
+      {/* ── Feature 7: Terrain Analysis Modal ────────────────── */}
+      {terrainAnalysisOpen && selectedProjectId && (
+        <TerrainAnalysisModal
+          open={terrainAnalysisOpen}
+          onClose={() => setTerrainAnalysisOpen(false)}
+          projectId={selectedProjectId}
+          geotiffs={geotiffs}
+          onLayerAdded={(result) => {
+            if (result.type === 'contour') {
+              const src = new VectorSource()
+              const fmt = new GeoJSON()
+              const feats = fmt.readFeatures(result.geojson, { featureProjection: 'EPSG:3857' })
+              src.addFeatures(feats)
+              const lyr = new VectorLayer({
+                source: src,
+                style: new Style({ stroke: new Stroke({ color: '#8bc34a', width: 1 }) }),
+                zIndex: 55,
+              })
+              mapInstance.current?.addLayer(lyr)
+              message.success('Contour lines added to map')
+            } else {
+              // COG layer - add as WebGL tile layer
+              const cogSrc = new GeoTIFFSource({ sources: [{ url: result.cog_url }] })
+              const cogLyr = new WebGLTileLayer({ source: cogSrc, zIndex: 55, opacity: 0.8 })
+              mapInstance.current?.addLayer(cogLyr)
+              message.success(`${result.layer_name} added to map`)
+              qc.invalidateQueries({ queryKey: qk.geotiffs(selectedProjectId) })
+            }
+          }}
+        />
+      )}
+
+      {/* ── Feature 3: Georeferencer Modal ───────────────────── */}
+      {georeferencerOpen && selectedProjectId && (
+        <GeoreferencerModal
+          open={georeferencerOpen}
+          onClose={() => setGeoreferencerOpen(false)}
+          projectId={selectedProjectId}
+          surveyAreas={surveyAreas as any}
+          onSaved={() => {
+            setGeoreferencerOpen(false)
+            qc.invalidateQueries({ queryKey: qk.geotiffs(selectedProjectId) })
           }}
         />
       )}

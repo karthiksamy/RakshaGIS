@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Table, Select, Button, Space, Input, Modal, message, Tooltip, Tabs, Tag,
@@ -11,6 +11,7 @@ import {
   FilterOutlined, ReloadOutlined, CheckOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
+import * as turf from '@turf/turf'
 import api from '@/services/api'
 import type { GISFeature } from '@/types'
 
@@ -61,6 +62,7 @@ export default function AttributeTablePanel({ open, onClose, projectId, onFeatur
   const [calcField, setCalcField] = useState('')
   const [calcExpr, setCalcExpr] = useState('')
   const [calcTarget, setCalcTarget] = useState<'selected' | 'all'>('all')
+  const [calcPreview, setCalcPreview] = useState<string | null>(null)
 
   // Schema tab
   const [addFieldOpen, setAddFieldOpen] = useState(false)
@@ -218,22 +220,73 @@ export default function AttributeTablePanel({ open, onClose, projectId, onFeatur
     URL.revokeObjectURL(a.href)
   }
 
+  function evalCalcExpr(expr: string, f: GISFeature): unknown {
+    try {
+      let resolved = expr
+      // Geometry tokens first
+      if (resolved.includes('$area') || resolved.includes('$perimeter') ||
+          resolved.includes('$length') || resolved.includes('$x') || resolved.includes('$y')) {
+        const geom = f.geometry as any
+        if (geom) {
+          const feat = { type: 'Feature' as const, geometry: geom, properties: {} }
+          const gt = geom.type as string
+          const areaM2 = (gt === 'Polygon' || gt === 'MultiPolygon') ? Math.round(turf.area(feat) * 100) / 100 : 0
+          const lenM = (gt === 'LineString' || gt === 'MultiLineString') ? Math.round(turf.length(feat, { units: 'meters' }) * 100) / 100 : 0
+          const perimM = (gt === 'Polygon' || gt === 'MultiPolygon')
+            ? Math.round(turf.length(turf.polygonToLine(feat as any) as any, { units: 'meters' }) * 100) / 100 : 0
+          const ctr = turf.centroid(feat).geometry.coordinates
+          resolved = resolved
+            .replace(/\$area/g, String(areaM2))
+            .replace(/\$perimeter/g, String(perimM))
+            .replace(/\$length/g, String(lenM))
+            .replace(/\$x/g, String(Math.round(ctr[0] * 100000) / 100000))
+            .replace(/\$y/g, String(Math.round(ctr[1] * 100000) / 100000))
+        }
+      }
+      // Attribute interpolation ${field}
+      resolved = resolved.replace(/\$\{(\w+)\}/g, (_, k) => String(f.attributes?.[k] ?? ''))
+      // String functions
+      resolved = resolved.replace(/UPPER\(([^)]+)\)/gi, (_, s) => s.trim().replace(/^["']|["']$/g, '').toUpperCase())
+      resolved = resolved.replace(/LOWER\(([^)]+)\)/gi, (_, s) => s.trim().replace(/^["']|["']$/g, '').toLowerCase())
+      resolved = resolved.replace(/TRIM\(([^)]+)\)/gi, (_, s) => s.trim().replace(/^["']|["']$/g, '').trim())
+      // IF(condition, true_val, false_val) — simple equality only
+      const ifMatch = resolved.match(/^IF\((.+?),\s*(.+?),\s*(.+?)\)$/i)
+      if (ifMatch) {
+        const [, cond, tv, fv] = ifMatch
+        const condResult = Function('"use strict"; return(' + cond + ')')()
+        return condResult ? tv.trim().replace(/^["']|["']$/g, '') : fv.trim().replace(/^["']|["']$/g, '')
+      }
+      // Arithmetic evaluation
+      if (/^[-\d+\-*/.() ,e]+$/.test(resolved.trim())) {
+        // eslint-disable-next-line no-new-func
+        return Function('"use strict";return(' + resolved + ')')()
+      }
+      return resolved
+    } catch {
+      return expr
+    }
+  }
+
+  // Live preview: recompute whenever expression or target rows change
+  useEffect(() => {
+    if (!calcOpen) { setCalcPreview(null); return }
+    const sample = (calcTarget === 'selected' && selectedRowKeys.length)
+      ? rows.find(f => selectedRowKeys.includes(f.id))
+      : rows[0]
+    if (!sample) { setCalcPreview(null); return }
+    try {
+      const val = evalCalcExpr(calcExpr, sample)
+      setCalcPreview(String(val ?? ''))
+    } catch { setCalcPreview(null) }
+  }, [calcExpr, calcOpen, rows, selectedRowKeys, calcTarget])
+
   async function applyFieldCalc() {
     if (!calcField) { message.warning('Enter a field name'); return }
     const targets = calcTarget === 'selected' && selectedRowKeys.length
       ? rows.filter(f => selectedRowKeys.includes(f.id))
       : rows
     const promises = targets.map(f => {
-      let value: unknown = calcExpr
-      try {
-        const resolved = calcExpr.replace(/\$\{(\w+)\}/g, (_, k) => String(f.attributes?.[k] ?? ''))
-        if (/^[-\d+*/.() ]+$/.test(resolved.trim())) {
-          // eslint-disable-next-line no-new-func
-          value = Function(`"use strict";return(${resolved})`)()
-        } else {
-          value = resolved
-        }
-      } catch (_) {}
+      const value = evalCalcExpr(calcExpr, f)
       return api.patch(`/projects/features/${f.id}/`, { attributes: { ...f.attributes, [calcField]: value } })
     })
     await Promise.allSettled(promises)
@@ -635,31 +688,91 @@ export default function AttributeTablePanel({ open, onClose, projectId, onFeatur
 
       {/* ── Field Calculator modal ──────────────────────────────────────── */}
       <Modal title={<><CalculatorOutlined style={{ marginRight: 8 }} />Field Calculator</>}
-        open={calcOpen} onCancel={() => setCalcOpen(false)} onOk={applyFieldCalc} okText="Apply" width={460}
+        open={calcOpen} onCancel={() => { setCalcOpen(false); setCalcPreview(null) }} onOk={applyFieldCalc} okText="Apply" width={520}
         styles={{ body: { background: '#0e0e1e' } }}>
-        <Space direction="vertical" style={{ width: '100%', marginTop: 12 }} size={10}>
+        <Space direction="vertical" style={{ width: '100%', marginTop: 10 }} size={10}>
           <div>
-            <div style={{ color: '#aaa', fontSize: 12, marginBottom: 4 }}>Field to update (existing or new)</div>
+            <div style={{ color: '#aaa', fontSize: 12, marginBottom: 4 }}>Target field (existing or new)</div>
             <Select showSearch allowClear style={{ width: '100%' }} value={calcField || undefined}
-              onChange={v => setCalcField(v ?? '')} placeholder="Select or type field name"
-              options={attrKeys.map(k => ({ value: k, label: k }))} />
-            <Input style={{ marginTop: 6 }} placeholder="Or type a new field name"
-              value={calcField} onChange={e => setCalcField(e.target.value)} />
+              onChange={v => setCalcField(v ?? '')} placeholder="Select or type a field name"
+              options={attrKeys.map(k => ({ value: k, label: k }))}
+              dropdownRender={menu => (
+                <>
+                  {menu}
+                  <div style={{ padding: '4px 8px' }}>
+                    <Input size="small" placeholder="New field name…"
+                      onPressEnter={e => setCalcField((e.target as HTMLInputElement).value)} />
+                  </div>
+                </>
+              )} />
           </div>
+
+          {/* Quick-insert buttons */}
+          <div>
+            <div style={{ color: '#666', fontSize: 11, marginBottom: 4 }}>Quick insert</div>
+            <Space wrap size={[4, 4]}>
+              {[
+                { label: '$area',      tip: 'Polygon area in m²',         val: '$area' },
+                { label: '$perimeter', tip: 'Polygon perimeter in m',      val: '$perimeter' },
+                { label: '$length',    tip: 'Line length in m',            val: '$length' },
+                { label: '$x',         tip: 'Centroid longitude (WGS84)',  val: '$x' },
+                { label: '$y',         tip: 'Centroid latitude (WGS84)',   val: '$y' },
+              ].map(b => (
+                <Tooltip key={b.val} title={b.tip}>
+                  <Tag
+                    color="blue" style={{ cursor: 'pointer', fontSize: 11, userSelect: 'none' }}
+                    onClick={() => setCalcExpr(e => e + b.val)}
+                  >{b.label}</Tag>
+                </Tooltip>
+              ))}
+              {[
+                { label: 'UPPER()',  val: 'UPPER(${field})' },
+                { label: 'LOWER()',  val: 'LOWER(${field})' },
+                { label: 'TRIM()',   val: 'TRIM(${field})' },
+                { label: 'IF()',     val: 'IF(${a}==${b}, yes, no)' },
+                { label: 'round()',  val: 'Math.round($area)' },
+              ].map(b => (
+                <Tag key={b.val} color="geekblue" style={{ cursor: 'pointer', fontSize: 11, userSelect: 'none' }}
+                  onClick={() => setCalcExpr(b.val)}>
+                  {b.label}
+                </Tag>
+              ))}
+              {attrKeys.slice(0, 6).map(k => (
+                <Tag key={k} style={{ cursor: 'pointer', fontSize: 11, userSelect: 'none', color: '#4fc3f7', borderColor: '#1a3a5a' }}
+                  onClick={() => setCalcExpr(e => e + '${' + k + '}')}>
+                  {'${' + k + '}'}
+                </Tag>
+              ))}
+            </Space>
+          </div>
+
           <div>
             <div style={{ color: '#aaa', fontSize: 12, marginBottom: 4 }}>Expression</div>
-            <Input.TextArea rows={2} placeholder={'e.g.  2025  or  ${survey_no}_v2  or  10 * 2 + 5'}
-              value={calcExpr} onChange={e => setCalcExpr(e.target.value)} />
-            <div style={{ color: '#555', fontSize: 11, marginTop: 4 }}>
-              Use <code style={{ color: '#4fc3f7' }}>{'${field}'}</code> to reference other attributes. Simple arithmetic is auto-evaluated.
-            </div>
+            <Input.TextArea rows={2}
+              placeholder={'e.g.  $area  or  ${survey_no}_v2  or  UPPER(${category})  or  $x'}
+              value={calcExpr} onChange={e => setCalcExpr(e.target.value)}
+              style={{ fontFamily: 'monospace', fontSize: 12 }} />
           </div>
+
+          {/* Live preview */}
+          {calcPreview !== null && (
+            <div style={{ background: '#0a1a0a', border: '1px solid #1a3a1a', borderRadius: 4, padding: '6px 10px' }}>
+              <span style={{ color: '#666', fontSize: 11 }}>Preview (first row): </span>
+              <code style={{ color: '#52c41a', fontSize: 12 }}>{calcPreview}</code>
+            </div>
+          )}
+
           <div>
             <span style={{ color: '#aaa', fontSize: 12, marginRight: 8 }}>Apply to:</span>
             <Radio.Group value={calcTarget} onChange={e => setCalcTarget(e.target.value)} size="small">
               <Radio value="selected">Selected ({selectedRowKeys.length})</Radio>
               <Radio value="all">All rows ({rows.length})</Radio>
             </Radio.Group>
+          </div>
+
+          <div style={{ color: '#444', fontSize: 10, borderTop: '1px solid #1a1a2e', paddingTop: 6 }}>
+            Tokens: <code style={{ color: '#4fc3f7' }}>$area</code> m² · <code style={{ color: '#4fc3f7' }}>$perimeter</code> m · <code style={{ color: '#4fc3f7' }}>$length</code> m ·
+            <code style={{ color: '#4fc3f7' }}> $x/$y</code> centroid · <code style={{ color: '#4fc3f7' }}>${'{field}'}</code> attribute · arithmetic &amp; IF() supported
           </div>
         </Space>
       </Modal>

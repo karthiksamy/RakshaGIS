@@ -17,6 +17,46 @@
 #       service named "db" in another project is never confused with ours
 set -e
 
+# ── Dynamic sudo wrapping for Docker and System Actions ─────────────────────────
+DOCKER_NEED_SUDO=false
+if command -v docker &>/dev/null; then
+  if ! docker ps &>/dev/null; then
+    if sudo docker ps &>/dev/null; then
+      DOCKER_NEED_SUDO=true
+    fi
+  fi
+fi
+
+docker() {
+  if [[ "$1" == "--version" ]] || [[ "$1" == "version" ]]; then
+    command docker "$@"
+    return
+  fi
+  if [[ "$DOCKER_NEED_SUDO" == true ]]; then
+    sudo docker "$@"
+  else
+    command docker "$@"
+  fi
+}
+
+mkdir_p_safe() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    if ! mkdir -p "$dir" 2>/dev/null; then
+      echo "    Access restricted. Using sudo to create directory: $dir"
+      sudo mkdir -p "$dir"
+    fi
+  fi
+}
+
+chmod_safe() {
+  local mode="$1"
+  local path="$2"
+  if ! chmod "$mode" "$path" 2>/dev/null; then
+    sudo chmod "$mode" "$path"
+  fi
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_DATA_DIR="/RakshaGIS"
 
@@ -371,6 +411,47 @@ echo ""
 # Combined profile flags used by pull / save / status commands
 ALL_PROFILE_FLAGS="$DOCKER_PROFILES"
 
+# Function to detect SSD vs HDD type
+detect_drive_type() {
+  local dev="$1"
+  if [[ -z "$dev" ]]; then
+    echo "Unknown"
+    return
+  fi
+  
+  if [[ "$dev" == /dev/mapper/* ]]; then
+    local real_dev
+    real_dev=$(readlink -f "$dev" 2>/dev/null)
+    if [[ -n "$real_dev" ]]; then
+      dev="$real_dev"
+    fi
+  fi
+  
+  local base_dev
+  base_dev=$(basename "$dev" 2>/dev/null)
+  if [[ "$base_dev" =~ ^nvme ]]; then
+    base_dev=$(echo "$base_dev" | sed -E 's/p[0-9]+.*$//')
+  elif [[ "$base_dev" =~ ^mmcblk ]]; then
+    base_dev=$(echo "$base_dev" | sed -E 's/p[0-9]+.*$//')
+  else
+    base_dev=$(echo "$base_dev" | sed -E 's/[0-9]+.*$//')
+  fi
+  
+  if [[ -f "/sys/block/${base_dev}/queue/rotational" ]]; then
+    local rot
+    rot=$(cat "/sys/block/${base_dev}/queue/rotational" 2>/dev/null)
+    if [[ "$rot" == "0" ]]; then
+      echo "SSD"
+    elif [[ "$rot" == "1" ]]; then
+      echo "HDD"
+    else
+      echo "Unknown"
+    fi
+  else
+    echo "Unknown"
+  fi
+}
+
 # ── Step 1: Determine data directory ─────────────────────────────────────────
 if [[ -z "$DATA_DIR" ]]; then
   # Check if already set in .env
@@ -383,9 +464,42 @@ if [[ -z "$DATA_DIR" ]]; then
   fi
 
   if [[ -z "$DATA_DIR" ]]; then
-    read -r -p "Enter data directory [$DEFAULT_DATA_DIR]: " USER_INPUT
+    echo -e "${BOLD}>>> Configure Storage Location${RESET}"
+    echo "RakshaGIS needs to store persistent application data (database, media, AI models, maps) and Docker images."
+    echo "Scanning available storage drives..."
+    echo ""
+    printf "  %-25s %-10s %-10s %-10s %-10s\n" "Mount Point" "Size" "Used" "Available" "Type"
+    printf "  %-25s %-10s %-10s %-10s %-10s\n" "-----------" "----" "----" "---------" "----"
+
+    # Read from df while filtering virtual / system filesystems
+    while IFS= read -r line; do
+      local dev
+      dev=$(echo "$line" | awk '{print $1}')
+      local size
+      size=$(echo "$line" | awk '{print $2}')
+      local used
+      used=$(echo "$line" | awk '{print $3}')
+      local avail
+      avail=$(echo "$line" | awk '{print $4}')
+      local mnt
+      mnt=$(echo "$line" | awk '{print $6}')
+      local drive_type
+      drive_type=$(detect_drive_type "$dev")
+      printf "  %-25s %-10s %-10s %-10s %-10s\n" "$mnt" "$size" "$used" "$avail" "$drive_type"
+    done < <(df -h 2>/dev/null | grep -E '^/dev/')
+    echo ""
+
+    read -r -p "Enter path to store RakshaGIS data (e.g. /mnt/ssd/RakshaGIS) [$DEFAULT_DATA_DIR]: " USER_INPUT
     DATA_DIR="${USER_INPUT:-$DEFAULT_DATA_DIR}"
   fi
+fi
+
+# Clean trailing slash from DATA_DIR
+DATA_DIR="${DATA_DIR%/}"
+
+# Ensure DATA_DIR is absolute
+if [[ "$DATA_DIR" != /* ]]; then
+  DATA_DIR="$SCRIPT_DIR/$DATA_DIR"
 fi
 
 echo "Data directory: $DATA_DIR"
@@ -393,10 +507,15 @@ echo "Data directory: $DATA_DIR"
 # ── Step 2: Create data directory structure ───────────────────────────────────
 echo ""
 echo ">>> Creating data directories..."
-mkdir -p "$DATA_DIR"/{postgres,redis,staticfiles,media,logs,prometheus,grafana,backups,images} \
-         "$DATA_DIR"/certbot/{conf,www} \
-         "$DATA_DIR"/models/{ollama,localai,llamacpp,anythingllm}
-chmod 777 "$DATA_DIR"/staticfiles "$DATA_DIR"/media "$DATA_DIR"/logs
+for sub in postgres redis staticfiles media logs prometheus grafana backups images certbot/conf certbot/www models/ollama models/localai models/llamacpp models/anythingllm; do
+  mkdir_p_safe "$DATA_DIR/$sub"
+done
+
+# Change permissions so both host user and container services can write
+echo ">>> Setting directory permissions..."
+for sub in postgres redis staticfiles media logs prometheus grafana backups images certbot/conf certbot/www models/ollama models/localai models/llamacpp models/anythingllm; do
+  chmod_safe 777 "$DATA_DIR/$sub"
+done
 
 echo "    ✓ Data directories created"
 
@@ -611,8 +730,8 @@ fi
 if [[ "$SAVE_IMAGES" == true ]]; then
   IMAGES_DIR="$DATA_DIR/images"
   echo ""
-  echo ">>> Saving Docker images to $IMAGES_DIR..."
-  mkdir -p "$IMAGES_DIR"
+  mkdir_p_safe "$IMAGES_DIR"
+  chmod_safe 777 "$IMAGES_DIR"
 
   IMAGES=(
     "postgis/postgis:16-3.4"
@@ -693,7 +812,10 @@ if [[ "$IMPORT_OSM" == true ]]; then
   PBF_FILE="$OSM_DIR/india-latest.osm.pbf"
   OSM_DATA_DIR="$OSM_DIR/osm-data"
   OSM_CACHE_DIR="$OSM_DIR/tile-cache"
-  mkdir -p "$OSM_DATA_DIR" "$OSM_CACHE_DIR"
+  mkdir_p_safe "$OSM_DATA_DIR"
+  mkdir_p_safe "$OSM_CACHE_DIR"
+  chmod_safe 777 "$OSM_DATA_DIR"
+  chmod_safe 777 "$OSM_CACHE_DIR"
 
   # Download India extract from Geofabrik (one-time, requires internet)
   if [[ -f "$PBF_FILE" ]]; then

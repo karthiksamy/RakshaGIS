@@ -5,7 +5,7 @@ from .models import (
     SurveyProject, SurveyArea, GISFeature, DefenceParcel, AttributeTemplate,
     ShapefileImport, ProjectLayerFolder, ProjectShare, GeoTiffLayer,
     FeatureAttachment, ProjectMilestone, QGISUploadLog, TemporaryLayer,
-    SurveyAreaAccessRequest,
+    SurveyAreaAccessRequest, ReviewAnnotation, TopologyRule,
 )
 
 
@@ -323,3 +323,32 @@ class SurveyAreaAccessRequestSerializer(serializers.ModelSerializer):
             'id', 'requested_by', 'requesting_org', 'status',
             'reviewed_by', 'reviewed_at', 'created_at',
         ]
+
+
+class ReviewAnnotationSerializer(GeoFeatureModelSerializer):
+    created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True, default='')
+    annotation_type_display = serializers.CharField(source='get_annotation_type_display', read_only=True)
+
+    class Meta:
+        model = ReviewAnnotation
+        geo_field = 'geometry'
+        fields = [
+            'id', 'survey_area', 'annotation_type', 'annotation_type_display',
+            'comment', 'color', 'is_resolved',
+            'created_by', 'created_by_name', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
+
+
+class TopologyRuleSerializer(serializers.ModelSerializer):
+    rule_type_display = serializers.CharField(source='get_rule_type_display', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True, default='')
+
+    class Meta:
+        model = TopologyRule
+        fields = [
+            'id', 'project', 'rule_type', 'rule_type_display',
+            'layer_a', 'layer_b', 'tolerance', 'description',
+            'is_active', 'created_by', 'created_by_name', 'created_at',
+        ]
+        read_only_fields = ['id', 'created_by', 'created_at']

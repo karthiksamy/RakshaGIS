@@ -30,8 +30,31 @@ def spa_index(request):
     response['Expires'] = '0'
     return response
 
+
+def serve_sw(request):
+    """Serve the service worker script sw.js with the correct content type."""
+    sw_path = os.path.join(settings.BASE_DIR, 'static', 'frontend', 'sw.js')
+    if not os.path.exists(sw_path):
+        sw_path = os.path.join(settings.BASE_DIR, 'frontend', 'public', 'sw.js')
+    if os.path.exists(sw_path):
+        return FileResponse(open(sw_path, 'rb'), content_type='application/javascript')
+    raise Http404("Service Worker not found")
+
+
+def serve_manifest(request):
+    """Serve the PWA manifest.json file with the correct content type."""
+    manifest_path = os.path.join(settings.BASE_DIR, 'static', 'frontend', 'manifest.json')
+    if not os.path.exists(manifest_path):
+        manifest_path = os.path.join(settings.BASE_DIR, 'frontend', 'public', 'manifest.json')
+    if os.path.exists(manifest_path):
+        return FileResponse(open(manifest_path, 'rb'), content_type='application/json')
+    raise Http404("Manifest not found")
+
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('sw.js', serve_sw, name='service-worker'),
+    path('manifest.json', serve_manifest, name='manifest'),
 
     # Auth
     path('api/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),

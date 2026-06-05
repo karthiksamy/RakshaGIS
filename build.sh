@@ -530,36 +530,154 @@ fi
 
 echo "Data directory: $DATA_DIR"
 
-# ── Portable deployment prompt (only on a fresh install) ─────────────────────
-# Ask once whether to archive Docker images under DATA_DIR/images/ so the whole
-# deployment can be transferred to another system without internet access.
+# ── Image archiving: always save to selected location on fresh install ────────
+# All Docker images — base services, AI backends, and the built RakshaGIS app
+# image — are archived as .tar files under DATA_DIR/images/.  This means the
+# entire deployment (data + images) lives under the single selected storage path
+# and can be copied to any other machine for fully offline installation.
+# Override with --save-images (force on) on any subsequent run.
 if [[ "$DATA_DIR_IS_NEW" == true && "$SAVE_IMAGES" == false ]]; then
-  echo ""
-  echo -e "  ${CYAN}Portable / offline deployment${RESET}"
-  echo "  Saving Docker images as .tar archives under ${DATA_DIR}/images/ lets"
-  echo "  you copy this entire directory to another system and install offline"
-  echo "  (no internet pull required on the target machine)."
-  echo "  Recommended when the target environment is air-gapped or has slow internet."
-  read -rp "  Save Docker images for portable deployment? [Y/n]: " _PORTABLE
-  if [[ "${_PORTABLE,,}" != "n" ]]; then
-    SAVE_IMAGES=true
-    echo -e "  ${GREEN}✓ Docker images will be archived to ${DATA_DIR}/images/${RESET}"
-  else
-    echo "  (Skipping — re-run with --save-images later to add portability)"
-  fi
+  SAVE_IMAGES=true
+  echo -e "  ${GREEN}✓ All Docker images (including built app image) will be archived${RESET}"
+  echo "    to ${DATA_DIR}/images/ — copy this directory to any machine"
+  echo "    and run  ./build.sh --data-dir <path>  for a fully offline install."
   echo ""
 fi
+
+# ── Prerequisites: Optional Component Selection ───────────────────────────────
+# Defaults — loaded from .env on re-run, or selected interactively on fresh install
+OPT_OSM=false
+OPT_TERRAIN=false
+OPT_TERRAIN_SKIP_DOWNLOAD=false
+OPT_MONITORING=false
+OPT_ONLYOFFICE=false
+OPT_HTTPS=false
+OPT_HTTPS_DOMAIN=""
+
+# Load stored choices from an already-configured .env (re-run case)
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  _load_opt() { grep "^$1=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r'; }
+  [[ "$(_load_opt RAKSHA_OPT_OSM)"        == "true" ]] && OPT_OSM=true
+  [[ "$(_load_opt RAKSHA_OPT_TERRAIN)"    == "true" ]] && OPT_TERRAIN=true && OPT_TERRAIN_SKIP_DOWNLOAD=true
+  [[ "$(_load_opt RAKSHA_OPT_MONITORING)" == "true" ]] && OPT_MONITORING=true
+  [[ "$(_load_opt RAKSHA_OPT_ONLYOFFICE)" == "true" ]] && OPT_ONLYOFFICE=true
+  [[ "$(_load_opt RAKSHA_OPT_HTTPS)"      == "true" ]] && OPT_HTTPS=true
+  _hd=$(_load_opt RAKSHA_OPT_HTTPS_DOMAIN); [[ -n "$_hd" ]] && OPT_HTTPS_DOMAIN="$_hd"
+fi
+
+if [[ "$DATA_DIR_IS_NEW" == true ]]; then
+  echo -e "${BOLD}>>> Optional Components${RESET}"
+  echo "  Select which optional components to enable."
+  echo "  All require a one-time internet download; fully offline after setup."
+  echo "  Each can be added later by re-running build.sh."
+  echo ""
+
+  # ── [1] OSM Offline Tiles ───────────────────────────────────────────────────
+  echo -e "  ${BOLD}[1] India OSM Offline Tile Server${RESET}"
+  echo "      Serves India base maps entirely from local storage after import."
+  echo "      Download : ~800 MB  |  Import : 2-4 hours  |  Disk : ~20 GB"
+  if [[ -d "$DATA_DIR/tiles/osm-data" ]] && \
+     [[ -n "$(ls -A "$DATA_DIR/tiles/osm-data" 2>/dev/null)" ]]; then
+    echo -e "      ${GREEN}✓ OSM data already present — tile server will be started.${RESET}"
+    OPT_OSM=true
+  else
+    read -rp "      Enable OSM offline tile server? [y/N]: " _r
+    if [[ "${_r,,}" == "y" ]]; then
+      OPT_OSM=true; IMPORT_OSM=true
+      echo -e "      ${GREEN}✓ Selected — will download & import after build.${RESET}"
+    fi
+  fi
+  echo ""
+
+  # ── [2] Terrain Elevation Server ────────────────────────────────────────────
+  echo -e "  ${BOLD}[2] India Terrain Elevation Server (Cesium 3D)${RESET}"
+  echo "      SRTM elevation → quantized-mesh tiles for 3D terrain in Cesium."
+  echo "      Download : ~2-6 GB  |  Convert : 30-60 min  |  Disk : ~10 GB"
+  if [[ -n "$(find "$DATA_DIR/terrain/tilesets/terrain" -name "*.terrain" 2>/dev/null | head -1)" ]]; then
+    echo -e "      ${GREEN}✓ Terrain tiles already present — terrain server will be started.${RESET}"
+    OPT_TERRAIN=true; OPT_TERRAIN_SKIP_DOWNLOAD=true
+  else
+    read -rp "      Enable terrain elevation server? [y/N]: " _r
+    if [[ "${_r,,}" == "y" ]]; then
+      OPT_TERRAIN=true
+      echo "      Setup mode:"
+      echo "      [1] Download + convert SRTM now  (needs internet, ~60-90 min)"
+      echo "      [2] Data already copied — start server only"
+      read -rp "      Choice [1]: " _tm
+      [[ "${_tm}" == "2" ]] && OPT_TERRAIN_SKIP_DOWNLOAD=true
+      echo -e "      ${GREEN}✓ Terrain server selected.${RESET}"
+    fi
+  fi
+  echo ""
+
+  # ── [3] Monitoring ──────────────────────────────────────────────────────────
+  echo -e "  ${BOLD}[3] Monitoring — Prometheus + Grafana${RESET}"
+  echo "      Dashboards for service health, DB performance, resource usage."
+  echo "      Image pull : ~200 MB  |  Startup : <1 min"
+  read -rp "      Enable monitoring? [y/N]: " _r
+  [[ "${_r,,}" == "y" ]] && OPT_MONITORING=true && \
+    echo -e "      ${GREEN}✓ Monitoring selected.${RESET}"
+  echo ""
+
+  # ── [4] OnlyOffice Document Server ─────────────────────────────────────────
+  echo -e "  ${BOLD}[4] OnlyOffice Document Server${RESET}"
+  echo "      In-browser editing of Word/Excel/PowerPoint files in survey records."
+  echo "      Image pull : ~1.5 GB  |  Startup : ~2 min"
+  echo "      Skip if in-browser document editing is not required."
+  read -rp "      Enable OnlyOffice? [y/N]: " _r
+  [[ "${_r,,}" == "y" ]] && OPT_ONLYOFFICE=true && \
+    echo -e "      ${GREEN}✓ OnlyOffice selected.${RESET}"
+  echo ""
+
+  # ── [5] HTTPS / SSL (Certbot / Let's Encrypt) ───────────────────────────────
+  echo -e "  ${BOLD}[5] HTTPS / SSL — Let's Encrypt via Certbot${RESET}"
+  echo "      Secures the web UI with a free SSL certificate."
+  echo "      Requires : a public domain + ports 80 & 443 reachable from the internet."
+  echo -e "      ${YELLOW}NOT suitable for private/intranet-only deployments.${RESET}"
+  read -rp "      Enable HTTPS? [y/N]: " _r
+  if [[ "${_r,,}" == "y" ]]; then
+    read -rp "      Enter your domain (e.g. gis.example.com): " _domain
+    if [[ -n "$_domain" ]]; then
+      OPT_HTTPS=true; OPT_HTTPS_DOMAIN="$_domain"
+      echo -e "      ${GREEN}✓ HTTPS selected — domain: ${_domain}${RESET}"
+    else
+      echo -e "      ${YELLOW}⚠  No domain entered — skipping HTTPS.${RESET}"
+    fi
+  fi
+  echo ""
+
+  # ── Selection summary ────────────────────────────────────────────────────────
+  echo -e "  ${BOLD}── Component selection summary ─────────────────────────────────${RESET}"
+  [[ "$OPT_OSM" == true ]]        && echo -e "  ${GREEN}✓${RESET} OSM Offline Tile Server"           || echo "  ✗ OSM Offline Tile Server       (skipped)"
+  [[ "$OPT_TERRAIN" == true ]]    && echo -e "  ${GREEN}✓${RESET} Terrain Elevation Server"          || echo "  ✗ Terrain Elevation Server      (skipped)"
+  [[ "$OPT_MONITORING" == true ]] && echo -e "  ${GREEN}✓${RESET} Monitoring (Prometheus+Grafana)"   || echo "  ✗ Monitoring                    (skipped)"
+  [[ "$OPT_ONLYOFFICE" == true ]] && echo -e "  ${GREEN}✓${RESET} OnlyOffice Document Server"        || echo "  ✗ OnlyOffice Document Server    (skipped)"
+  [[ "$OPT_HTTPS" == true ]]      && echo -e "  ${GREEN}✓${RESET} HTTPS (${OPT_HTTPS_DOMAIN})"       || echo "  ✗ HTTPS / SSL                   (skipped)"
+  echo ""
+fi
+
+# Build OPTIONAL_PROFILES string used by docker compose commands throughout this script
+OPTIONAL_PROFILES=""
+[[ "$OPT_OSM" == true ]]        && OPTIONAL_PROFILES="$OPTIONAL_PROFILES --profile osm"
+[[ "$OPT_TERRAIN" == true ]]    && OPTIONAL_PROFILES="$OPTIONAL_PROFILES --profile terrain"
+[[ "$OPT_MONITORING" == true ]] && OPTIONAL_PROFILES="$OPTIONAL_PROFILES --profile monitoring"
+[[ "$OPT_HTTPS" == true ]]      && OPTIONAL_PROFILES="$OPTIONAL_PROFILES --profile https"
 
 # ── Step 2: Create data directory structure ───────────────────────────────────
 echo ""
 echo ">>> Creating data directories..."
-for sub in postgres redis staticfiles media logs prometheus grafana backups images certbot/conf certbot/www models/ollama models/localai models/llamacpp models/anythingllm; do
+_CORE_SUBDIRS="postgres redis staticfiles media logs backups images certbot/conf certbot/www models/ollama models/localai models/llamacpp models/anythingllm"
+[[ "$OPT_MONITORING" == true ]] && _CORE_SUBDIRS="$_CORE_SUBDIRS prometheus grafana"
+[[ "$OPT_OSM" == true ]]        && _CORE_SUBDIRS="$_CORE_SUBDIRS tiles/osm-data tiles/tile-cache"
+[[ "$OPT_TERRAIN" == true ]]    && _CORE_SUBDIRS="$_CORE_SUBDIRS terrain terrain/srtm_raw terrain/tilesets/terrain"
+[[ "$OPT_ONLYOFFICE" == true ]] && _CORE_SUBDIRS="$_CORE_SUBDIRS onlyoffice/data onlyoffice/logs onlyoffice/cache"
+
+for sub in $_CORE_SUBDIRS; do
   mkdir_p_safe "$DATA_DIR/$sub"
 done
 
-# Change permissions so both host user and container services can write
 echo ">>> Setting directory permissions..."
-for sub in postgres redis staticfiles media logs prometheus grafana backups images certbot/conf certbot/www models/ollama models/localai models/llamacpp models/anythingllm; do
+for sub in $_CORE_SUBDIRS; do
   chmod_safe 777 "$DATA_DIR/$sub"
 done
 
@@ -647,6 +765,15 @@ GRAFANA_PASSWORD=$(openssl rand -base64 12 | tr -d '=+/')
 ONLYOFFICE_JWT_SECRET=$(openssl rand -base64 32 | tr -d '=+/')
 # Internal base URL so OnlyOffice container fetches documents via nginx
 ONLYOFFICE_INTERNAL_BASE_URL=http://nginx
+
+# Optional component selections (persisted so re-runs don't re-prompt)
+RAKSHA_OPT_OSM=${OPT_OSM}
+RAKSHA_OPT_TERRAIN=${OPT_TERRAIN}
+RAKSHA_OPT_MONITORING=${OPT_MONITORING}
+RAKSHA_OPT_ONLYOFFICE=${OPT_ONLYOFFICE}
+RAKSHA_OPT_HTTPS=${OPT_HTTPS}
+RAKSHA_OPT_HTTPS_DOMAIN=${OPT_HTTPS_DOMAIN}
+TERRAIN_TILE_URL=/terrain-tiles
 EOF
   echo "    ✓ .env created"
 else
@@ -668,12 +795,20 @@ else
   _upsert_env AI_BACKENDS                "${AI_BACKENDS_DOCKER}"
   _upsert_env RAKSHAGIS_HTTP_PORT        "${HOST_PORT}"
   _upsert_env COMPOSE_PROJECT_NAME       "rakshagis"
+  # Persist optional component selections
+  _upsert_env RAKSHA_OPT_OSM             "${OPT_OSM}"
+  _upsert_env RAKSHA_OPT_TERRAIN         "${OPT_TERRAIN}"
+  _upsert_env RAKSHA_OPT_MONITORING      "${OPT_MONITORING}"
+  _upsert_env RAKSHA_OPT_ONLYOFFICE      "${OPT_ONLYOFFICE}"
+  _upsert_env RAKSHA_OPT_HTTPS           "${OPT_HTTPS}"
+  _upsert_env RAKSHA_OPT_HTTPS_DOMAIN    "${OPT_HTTPS_DOMAIN}"
+  _upsert_env TERRAIN_TILE_URL           "/terrain-tiles"
   # Add OnlyOffice secrets/config if not already set
   grep -q "^ONLYOFFICE_JWT_SECRET=" "$ENV_FILE" || \
     echo "ONLYOFFICE_JWT_SECRET=$(openssl rand -base64 32 | tr -d '=+/')" >> "$ENV_FILE"
   grep -q "^ONLYOFFICE_INTERNAL_BASE_URL=" "$ENV_FILE" || \
     echo "ONLYOFFICE_INTERNAL_BASE_URL=http://nginx" >> "$ENV_FILE"
-  echo "    ✓ Updated .env (DATA_DIR + AI backend URLs + GPU settings + HTTP port)"
+  echo "    ✓ Updated .env (DATA_DIR + AI backend URLs + GPU settings + optional components)"
 fi
 
 # ── Step 4: Load Docker images from tarballs (offline install) ───────────────
@@ -753,16 +888,17 @@ if [[ -z "$LOAD_IMAGES_DIR" ]]; then
   echo ">>> Checking dependency images..."
 
   # Map service name → expected image (must match docker-compose.yml)
+  # Core images are always pulled; optional ones only if the component was selected.
   declare -A SVC_IMAGE=(
     [db]="postgis/postgis:16-3.4"
     [redis]="redis:7-alpine"
     [nginx]="nginx:1.27-alpine"
     [pg_tileserv]="pramsey/pg_tileserv:latest"
-    [prometheus]="prom/prometheus:v2.55.1"
-    [grafana]="grafana/grafana:11.4.2"
-    [onlyoffice]="onlyoffice/documentserver:8.2.2"
-    [osm-tiles]="overv/openstreetmap-tile-server:2.3.0"
   )
+  [[ "$OPT_MONITORING" == true ]] && SVC_IMAGE[prometheus]="prom/prometheus:v2.55.1"
+  [[ "$OPT_MONITORING" == true ]] && SVC_IMAGE[grafana]="grafana/grafana:11.4.2"
+  [[ "$OPT_ONLYOFFICE" == true ]] && SVC_IMAGE[onlyoffice]="onlyoffice/documentserver:8.2.2"
+  [[ "$OPT_OSM" == true ]]        && SVC_IMAGE[osm-tiles]="overv/openstreetmap-tile-server:2.3.0"
   [[ "$OLLAMA_BASE_URL_VAL" == "http://ollama:11434" ]] && \
     SVC_IMAGE["ollama${GPU_PROFILE_SUFFIX}"]="ollama/ollama:latest"
 
@@ -798,19 +934,17 @@ if [[ "$SAVE_IMAGES" == true ]]; then
   mkdir_p_safe "$IMAGES_DIR"
   chmod_safe 777 "$IMAGES_DIR"
 
+  # Always save core images; conditionally save optional ones
   IMAGES=(
     "postgis/postgis:16-3.4"
     "redis:7-alpine"
     "nginx:1.27-alpine"
     "pramsey/pg_tileserv:latest"
-    "overv/openstreetmap-tile-server:2.3.0"
-    "onlyoffice/documentserver:8.2.2"
-    "prom/prometheus:v2.55.1"
-    "grafana/grafana:11.4.2"
   )
-  # Include Ollama only if using Docker-managed Ollama
-  [[ "$OLLAMA_BASE_URL_VAL" == "http://ollama:11434" ]] && \
-    IMAGES+=("ollama/ollama:latest")
+  [[ "$OPT_OSM" == true ]]        && IMAGES+=("overv/openstreetmap-tile-server:2.3.0")
+  [[ "$OPT_ONLYOFFICE" == true ]] && IMAGES+=("onlyoffice/documentserver:8.2.2")
+  [[ "$OPT_MONITORING" == true ]] && IMAGES+=("prom/prometheus:v2.55.1" "grafana/grafana:11.4.2")
+  [[ "$OLLAMA_BASE_URL_VAL" == "http://ollama:11434" ]] && IMAGES+=("ollama/ollama:latest")
 
   for img in "${IMAGES[@]}"; do
     safe_name=$(echo "$img" | tr '/:' '_')
@@ -925,11 +1059,24 @@ if [[ "$IMPORT_OSM" == true ]]; then
 
   echo ""
   echo -e "  ${GREEN}✓ OSM import complete.${RESET}"
-  echo "    Starting the tile server (profile: osm)..."
-  docker compose --profile osm up -d osm-tiles
   echo "    The local tile server will serve India map tiles at /osm-tiles/{z}/{x}/{y}.png"
   echo "    In the application: Settings → Basemaps → activate 'Local OSM (Offline)'"
   echo ""
+fi
+
+# ── Step 8c: Terrain setup ────────────────────────────────────────────────────
+if [[ "$OPT_TERRAIN" == true && "$OPT_TERRAIN_SKIP_DOWNLOAD" == false ]]; then
+  echo ""
+  echo -e "${BOLD}>>> India Terrain Elevation — SRTM download + conversion${RESET}"
+  if [[ -x "$SCRIPT_DIR/setup_terrain.sh" ]]; then
+    DATA_DIR="$DATA_DIR" "$SCRIPT_DIR/setup_terrain.sh" --all
+  else
+    echo -e "  ${YELLOW}⚠  setup_terrain.sh not found or not executable.${RESET}"
+    echo "     Run manually:  DATA_DIR=${DATA_DIR} ./setup_terrain.sh --all"
+  fi
+elif [[ "$OPT_TERRAIN" == true && "$OPT_TERRAIN_SKIP_DOWNLOAD" == true ]]; then
+  echo ""
+  echo -e "  ${GREEN}✓ Terrain data present — terrain server will be started.${RESET}"
 fi
 
 # ── Step 9: Build frontend (skip when source files unchanged) ────────────────
@@ -959,9 +1106,16 @@ if command -v node &> /dev/null && [[ -d "$SCRIPT_DIR/frontend" ]]; then
     # ── Skip npm install when package.json / lockfile unchanged ──────────────
     NPM_HASH_FILE="$SCRIPT_DIR/.npm-hash"
     NPM_HASH=$(sha256sum package.json package-lock.json 2>/dev/null | sha256sum | cut -d' ' -f1)
-    if [[ "$(cat "$NPM_HASH_FILE" 2>/dev/null)" != "$NPM_HASH" ]] || [[ ! -d node_modules ]]; then
+    # Verify vite's internal entrypoint exists — a missing dist/node/cli.js means
+    # node_modules was copied or extracted incompletely even if the hash matches.
+    _VITE_OK=false
+    [[ -f "node_modules/vite/dist/node/cli.js" ]] && _VITE_OK=true
+    if [[ "$(cat "$NPM_HASH_FILE" 2>/dev/null)" != "$NPM_HASH" ]] || \
+       [[ ! -d node_modules ]] || [[ "$_VITE_OK" == false ]]; then
+      [[ "$_VITE_OK" == false && -d node_modules ]] && \
+        echo "    node_modules incomplete (vite/dist/node/cli.js missing) — reinstalling..."
       echo "    Installing npm dependencies..."
-      npm install --silent
+      npm install
       echo "$NPM_HASH" > "$NPM_HASH_FILE"
     else
       echo "    npm deps unchanged — skipping install"
@@ -970,7 +1124,7 @@ if command -v node &> /dev/null && [[ -d "$SCRIPT_DIR/frontend" ]]; then
     # ── Cesium asset cache: avoid re-copying 14 MB on every app-code change ──
     # Cesium assets live in staticfiles/cesium/ but emptyOutDir wipes that dir.
     # We keep a persistent copy in .cesium-build/ keyed by the cesium npm version.
-    CESIUM_VER=$(node -p "require('./package.json').dependencies.cesium" 2>/dev/null || echo "unknown")
+    CESIUM_VER=$(node -p "require('./package.json').dependencies.cesium.replace(/^[^0-9]*/,'')" 2>/dev/null || echo "unknown")
     CESIUM_CACHE="$SCRIPT_DIR/.cesium-build"
     CESIUM_VER_FILE="$CESIUM_CACHE/.version"
     CESIUM_CACHED=false
@@ -1017,13 +1171,34 @@ echo "  Compute mode : ${GPU_MODE^^}"
 [[ -n "$AI_BACKENDS_DOCKER" ]] \
   && echo "  AI (Docker)  : $AI_BACKENDS_DOCKER" \
   || echo "  AI (Docker)  : none (all using local installs)"
+[[ "$OPT_OSM" == true ]]        && echo "  OSM tiles    : enabled"
+[[ "$OPT_TERRAIN" == true ]]    && echo "  Terrain      : enabled"
+[[ "$OPT_MONITORING" == true ]] && echo "  Monitoring   : enabled"
+[[ "$OPT_ONLYOFFICE" == true ]] && echo "  OnlyOffice   : enabled"
+[[ "$OPT_HTTPS" == true ]]      && echo "  HTTPS        : enabled (${OPT_HTTPS_DOMAIN})"
 
 # Core application services (always started)
+echo ""
 echo "  ▶ Starting core services (db · redis · web · celery · nginx · pg_tileserv)..."
 docker compose up -d
 echo -e "  ${GREEN}✓ Core services running${RESET}"
 
-# Start only backends that are NOT already running (START_PROFILES built by detection)
+# Start optional services selected during setup
+if [[ -n "$OPTIONAL_PROFILES" ]]; then
+  echo "  ▶ Starting optional services..."
+  # shellcheck disable=SC2086
+  docker compose $OPTIONAL_PROFILES up -d
+  echo -e "  ${GREEN}✓ Optional services started${RESET}"
+fi
+
+# Start OnlyOffice (no separate profile — part of core compose, but only if selected)
+if [[ "$OPT_ONLYOFFICE" == true ]]; then
+  echo "  ▶ Starting OnlyOffice document server..."
+  docker compose up -d onlyoffice
+  echo -e "  ${GREEN}✓ OnlyOffice started${RESET}"
+fi
+
+# Start only AI backends that are NOT already running (START_PROFILES built by detection)
 if [[ -n "$START_PROFILES" ]]; then
   echo "  ▶ Starting Docker AI backends..."
   # shellcheck disable=SC2086
@@ -1038,6 +1213,8 @@ echo ""
 ACCESS_URL="http://localhost"
 [[ "${HOST_PORT}" != "80" ]] && ACCESS_URL="http://localhost:${HOST_PORT}"
 
+_yn() { [[ "$1" == "true" ]] && echo "enabled" || echo "disabled"; }
+
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║                RakshaGIS Setup Complete                 ║"
 echo "╠══════════════════════════════════════════════════════════╣"
@@ -1049,15 +1226,18 @@ printf "║  AI backends     : %-35s║\n" "${AI_BACKENDS_DOCKER:-local only}"
 echo "║  Default login   : admin / admin123                     ║"
 printf "║  Access URL      : %-35s║\n" "${ACCESS_URL}"
 echo "╠══════════════════════════════════════════════════════════╣"
+echo "║  Optional components                                    ║"
+printf "║    OSM offline tiles    : %-29s║\n" "$(_yn "$OPT_OSM")"
+printf "║    Terrain elevation    : %-29s║\n" "$(_yn "$OPT_TERRAIN")"
+printf "║    Monitoring           : %-29s║\n" "$(_yn "$OPT_MONITORING")"
+printf "║    OnlyOffice           : %-29s║\n" "$(_yn "$OPT_ONLYOFFICE")"
+printf "║    HTTPS / SSL          : %-29s║\n" "$(_yn "$OPT_HTTPS")"
+echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Use './RakshaGIS.sh start|stop|restart|status'         ║"
 echo "║  Go to Settings → AI Config to activate a backend       ║"
+echo "║  Re-run build.sh at any time to enable more components  ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Multi-project isolation: all resources are prefixed    ║"
 echo "║  'rakshagis_' — other projects on this host are safe.   ║"
-echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  OFFLINE TILE SERVER (one-time, needs internet):        ║"
-echo "║    ./build.sh --import-osm                              ║"
-echo "║    Downloads India OSM (~800 MB), import ~2-4 hrs       ║"
-echo "║    After import: fully offline India base map           ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""

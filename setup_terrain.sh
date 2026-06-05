@@ -12,7 +12,19 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/data}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Resolve DATA_DIR in priority order:
+#   1. Caller-exported env var  (build.sh passes DATA_DIR="$DATA_DIR")
+#   2. DATA_DIR= line in .env   (standalone run after setup)
+#   3. /RakshaGIS fallback
+if [[ -z "${DATA_DIR:-}" ]]; then
+  if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    DATA_DIR=$(grep "^DATA_DIR=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r')
+  fi
+  DATA_DIR="${DATA_DIR:-/RakshaGIS}"
+fi
+
 TERRAIN_DIR="${DATA_DIR}/terrain"
 SRTM_DIR="${TERRAIN_DIR}/srtm_raw"
 OUTPUT_DIR="${TERRAIN_DIR}/tilesets/terrain"
@@ -113,8 +125,9 @@ convert_to_terrain() {
   echo "    Tile count: $(find "${OUTPUT_DIR}" -name "*.terrain" | wc -l)"
   echo ""
   echo "==> Next steps:"
+  echo "    Terrain tiles stored at : ${OUTPUT_DIR}"
   echo "    1. Start terrain server:  docker compose --profile terrain up -d terrain-server"
-  echo "    2. Add to .env:           TERRAIN_TILE_URL=/terrain-tiles"
+  echo "    2. Ensure .env has:       TERRAIN_TILE_URL=/terrain-tiles"
   echo "    3. Restart web:           docker compose restart web"
 }
 

@@ -517,6 +517,11 @@ export default function TerrainPage() {
     viewerRef.current?.camera.flyTo({ destination: INDIA_RECT, duration: 2 })
   }
 
+  const terrainLabel =
+    terrainCfg?.terrain_source === 'ion' ? 'Cesium ION' :
+    terrainCfg?.terrain_source === 'local' ? 'Local Server' :
+    'Ellipsoid (flat)'
+
   // ── Export helpers ──────────────────────────────────────────────────────────
 
   const exportPNG = useCallback(() => {
@@ -653,11 +658,6 @@ export default function TerrainPage() {
       setExporting(false)
     }
   }, [slopeGridData])
-
-  const terrainLabel =
-    terrainCfg?.terrain_source === 'ion' ? 'Cesium ION' :
-    terrainCfg?.terrain_source === 'local' ? 'Local Server' :
-    'Ellipsoid (flat)'
 
   if (cesiumError) {
     return (

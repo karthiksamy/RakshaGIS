@@ -262,25 +262,27 @@ do_start() {
   echo ""
 
   # ── Optional-service port checks ────────────────────────────────────────────
-  # Check ports for each enabled optional service before Docker tries to bind.
-  _opt_port_check() {
-    local svc="$1" port="$2"
-    if _port_in_use "$port" && [[ "$(_port_owner "$port")" != "rakshagis" ]]; then
-      echo -e "  ${RED}✗ Cannot start ${svc} — port ${port} is already allocated${RESET}"
-      echo "    Occupied by: $(_port_owner "$port" || echo 'another process')"
-      echo "    Fix: stop the conflicting process or disable ${svc} in .env"
-      echo "         (set RAKSHA_OPT_$(echo "$svc" | tr '[:lower:]' '[:upper:]')=false)"
-      return 1
+  # Monitoring ports conflict: skip monitoring for this run (non-fatal — it's optional).
+  if [[ "$OPT_MONITORING" == "true" ]]; then
+    _MON_BLOCKED=false
+    if _port_in_use 3000 && [[ "$(_port_owner 3000)" != "rakshagis" ]]; then
+      echo -e "  ${YELLOW}⚠  Grafana port 3000 occupied by: $(_port_owner 3000 || echo 'another process')${RESET}"
+      _MON_BLOCKED=true
     fi
-    return 0
-  }
-  _START_BLOCKED=false
-  [[ "$OPT_MONITORING" == "true" ]] && ! _opt_port_check "Grafana"    3000 && _START_BLOCKED=true
-  [[ "$OPT_MONITORING" == "true" ]] && ! _opt_port_check "Prometheus" 9090 && _START_BLOCKED=true
-  if [[ "$_START_BLOCKED" == true ]]; then
-    echo ""
-    echo -e "  ${RED}Startup aborted — resolve the port conflicts above and re-run.${RESET}"
-    return 1
+    if _port_in_use 9090 && [[ "$(_port_owner 9090)" != "rakshagis" ]]; then
+      echo -e "  ${YELLOW}⚠  Prometheus port 9090 occupied by: $(_port_owner 9090 || echo 'another process')${RESET}"
+      _MON_BLOCKED=true
+    fi
+    if [[ "$_MON_BLOCKED" == true ]]; then
+      echo -e "  ${YELLOW}    Monitoring skipped this run — ports in use by other services.${RESET}"
+      echo "    To free the ports or disable permanently:"
+      echo "      set RAKSHA_OPT_MONITORING=false in .env  then  ./RakshaGIS.sh restart"
+      OPT_MONITORING=false
+      # Remove --profile monitoring from OPTIONAL_PROFILES for this run
+      OPTIONAL_PROFILES="${OPTIONAL_PROFILES// --profile monitoring/}"
+      ALL_PROFILE_FLAGS="${ALL_PROFILE_FLAGS// --profile monitoring/}"
+      echo ""
+    fi
   fi
 
   echo ">>> Starting core services (db · redis · web · celery · nginx · pg_tileserv)…"

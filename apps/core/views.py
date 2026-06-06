@@ -426,6 +426,93 @@ class TerrainConfigView(APIView):
         })
 
 
+class TerrainExportGeoTIFFView(APIView):
+    """
+    POST /api/core/terrain/export-geotiff/
+
+    Body: { elevGrid: float[], bbox: [minLon,minLat,maxLon,maxLat], gridN: int }
+
+    Returns a 2-band GeoTIFF (WGS84 / EPSG:4326):
+      Band 1 – elevation in metres
+      Band 2 – slope in degrees (computed from the elevation grid)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        import math, tempfile, os
+        from django.http import HttpResponse as DjResponse
+
+        try:
+            from osgeo import gdal, osr
+            import numpy as np
+        except ImportError:
+            return Response({'error': 'GDAL / numpy not available'}, status=503)
+
+        elev_flat = request.data.get('elevGrid', [])
+        bbox      = request.data.get('bbox', [])
+        grid_n    = int(request.data.get('gridN', 15))
+
+        if not elev_flat or len(elev_flat) != grid_n * grid_n or len(bbox) != 4:
+            return Response({'error': 'Invalid grid data'}, status=400)
+
+        min_lon, min_lat, max_lon, max_lat = [float(v) for v in bbox]
+
+        # Elevation array — row 0 = southernmost lat; flip north-south for GeoTIFF
+        # (GeoTIFF row 0 = northernmost → negate y-axis in geotransform or flip array)
+        elev_arr = np.array(elev_flat, dtype=np.float32).reshape(grid_n, grid_n)
+        elev_arr = np.flipud(elev_arr)  # row 0 → northernmost
+
+        # Ground sample distances in metres
+        def _hav(lat1, lon1, lat2, lon2):
+            R = 6_371_000
+            dlat = math.radians(lat2 - lat1)
+            dlon = math.radians(lon2 - lon1)
+            a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+            return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+        dx = _hav(min_lat, min_lon, min_lat, max_lon) / max(grid_n - 1, 1)
+        dy = _hav(min_lat, min_lon, max_lat, min_lon) / max(grid_n - 1, 1)
+
+        # Slope from gradient (degrees)
+        grad_y, grad_x = np.gradient(elev_arr, dy, dx)
+        slope_arr = np.degrees(np.arctan(np.sqrt(grad_x**2 + grad_y**2))).astype(np.float32)
+
+        # Write GeoTIFF
+        tmp = tempfile.mktemp(suffix='.tif')
+        pixel_w = (max_lon - min_lon) / grid_n
+        pixel_h = (max_lat - min_lat) / grid_n
+
+        driver = gdal.GetDriverByName('GTiff')
+        ds = driver.Create(tmp, grid_n, grid_n, 2, gdal.GDT_Float32,
+                           options=['COMPRESS=LZW', 'TILED=YES'])
+        ds.SetGeoTransform([min_lon, pixel_w, 0, max_lat, 0, -pixel_h])
+
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        ds.SetProjection(srs.ExportToWkt())
+
+        b1 = ds.GetRasterBand(1)
+        b1.WriteArray(elev_arr)
+        b1.SetDescription('Elevation (m)')
+        b1.SetNoDataValue(-9999)
+
+        b2 = ds.GetRasterBand(2)
+        b2.WriteArray(slope_arr)
+        b2.SetDescription('Slope (degrees)')
+        b2.SetNoDataValue(-9999)
+
+        ds.FlushCache()
+        ds = None
+
+        with open(tmp, 'rb') as f:
+            content = f.read()
+        os.unlink(tmp)
+
+        resp = DjResponse(content, content_type='image/tiff')
+        resp['Content-Disposition'] = 'attachment; filename="terrain-slope-analysis.tif"'
+        return resp
+
+
 # Mapnik export endpoints
 from django.http import HttpResponse, JsonResponse
 from rest_framework.decorators import api_view, permission_classes

@@ -102,7 +102,7 @@ convert_to_terrain() {
   mkdir -p "${OUTPUT_DIR}"
   local merged="${TERRAIN_DIR}/india_dem_merged.vrt"
 
-  docker run --rm -v "${TERRAIN_DIR}:/data" osgeo/gdal:ubuntu-small-latest \
+  docker run --rm -v "${TERRAIN_DIR}:/data" ghcr.io/osgeo/gdal:ubuntu-small-latest \
     gdalbuildvrt /data/india_dem_merged.vrt /data/srtm_raw/*.tif
 
   echo "==> Converting VRT → quantized-mesh terrain tiles using ctb-tile…"

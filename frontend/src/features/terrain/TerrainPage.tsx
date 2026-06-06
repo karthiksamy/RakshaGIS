@@ -2,28 +2,35 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import * as Cesium from 'cesium'
 import 'cesium/Build/Cesium/Widgets/widgets.css'
 import {
-  Button, Select, Space, Typography, Card, Statistic, Spin, message,
-  Tooltip, Divider, Tag, Row, Col, Slider, Alert,
+  Button, Select, Typography, Statistic, Spin, message,
+  Tooltip, Divider, Tag, Row, Col, Slider, Alert, Dropdown,
 } from 'antd'
+import type { MenuProps } from 'antd'
 import {
-  EnvironmentOutlined, LineChartOutlined, AreaChartOutlined,
+  LineChartOutlined, AreaChartOutlined,
   AimOutlined, ReloadOutlined, GlobalOutlined, InfoCircleOutlined,
-  CloseOutlined, ColumnHeightOutlined,
+  CloseOutlined, ColumnHeightOutlined, ExportOutlined,
+  FileImageOutlined, FilePdfOutlined, FileTextOutlined,
 } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 import api from '@/services/api'
 import ElevationChart from './ElevationChart'
 
-const { Title, Text } = Typography
+const { Text } = Typography
 
 type Tool = 'none' | 'elevation' | 'profile' | 'slope'
 
 // India bounding box
 const INDIA_RECT = Cesium.Rectangle.fromDegrees(68.0, 6.5, 97.5, 37.5)
 
-interface ElevPoint { dist: number; elev: number }
+interface ElevPoint { dist: number; elev: number; lat: number; lon: number }
 interface SlopeStats { min: number; max: number; avg: number; gridSize: number }
 interface ClickedElev { lat: number; lon: number; elev: number }
+interface SlopeGridData {
+  elevGrid: number[]
+  bbox: [number, number, number, number]  // [minLon, minLat, maxLon, maxLat] degrees
+  gridN: number
+}
 
 // Color features by layer_name (consistent hash-based color)
 function layerColor(name?: string | null): Cesium.Color {
@@ -153,8 +160,10 @@ export default function TerrainPage() {
   const [clickedElev, setClickedElev] = useState<ClickedElev | null>(null)
   const [profileData, setProfileData] = useState<ElevPoint[]>([])
   const [slopeStats, setSlopeStats] = useState<SlopeStats | null>(null)
+  const [slopeGridData, setSlopeGridData] = useState<SlopeGridData | null>(null)
   const [profileBuilding, setProfileBuilding] = useState(false)
   const [slopeBuilding, setSlopeBuilding] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   // Feature extrusion height (0 = drape flat on the terrain; >0 = raise as a volume).
   // Default 0 so parcels render as proper shapes clamped to the ground.
@@ -395,8 +404,9 @@ export default function TerrainPage() {
           setSlopeBuilding(true)
           setPanelOpen(true)
           try {
-            const stats = await computeSlopeStats(viewer, slopeWaypointsRef.current[0], slopeWaypointsRef.current[1])
+            const { stats, gridData } = await computeSlopeStats(viewer, slopeWaypointsRef.current[0], slopeWaypointsRef.current[1])
             setSlopeStats(stats)
+            setSlopeGridData(gridData)
           } finally {
             setSlopeBuilding(false)
             setActiveTool('none')
@@ -497,6 +507,7 @@ export default function TerrainPage() {
     setClickedElev(null)
     setProfileData([])
     setSlopeStats(null)
+    setSlopeGridData(null)
     profileWaypointsRef.current = []
     slopeWaypointsRef.current = []
     setActiveTool('none')
@@ -505,6 +516,143 @@ export default function TerrainPage() {
   function flyToIndia() {
     viewerRef.current?.camera.flyTo({ destination: INDIA_RECT, duration: 2 })
   }
+
+  // ── Export helpers ──────────────────────────────────────────────────────────
+
+  const exportPNG = useCallback(() => {
+    const viewer = viewerRef.current
+    if (!viewer) return
+    try {
+      viewer.render()
+      viewer.scene.canvas.toBlob((blob) => {
+        if (!blob) { message.error('PNG capture failed'); return }
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.png`
+        a.click()
+        URL.revokeObjectURL(url)
+      }, 'image/png')
+    } catch {
+      message.error('PNG export failed — canvas may be unavailable')
+    }
+  }, [])
+
+  const exportPDF = useCallback(async () => {
+    setExporting(true)
+    try {
+      const { jsPDF } = await import('jspdf')
+      const viewer = viewerRef.current
+      const W = 297, H = 210  // A4 landscape mm
+      const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' })
+
+      // Header bar
+      pdf.setFillColor(13, 13, 31)
+      pdf.rect(0, 0, W, 22, 'F')
+      pdf.setTextColor(79, 195, 247)
+      pdf.setFontSize(14)
+      pdf.text('RakshaGIS — Terrain Analysis Report', 10, 14)
+      pdf.setTextColor(160, 160, 160)
+      pdf.setFontSize(8)
+      pdf.text(`Generated: ${new Date().toLocaleString()}   |   Terrain source: ${terrainLabel}`, 10, 20)
+
+      // Globe screenshot
+      if (viewer) {
+        try {
+          viewer.render()
+          const imgData = viewer.scene.canvas.toDataURL('image/jpeg', 0.85)
+          pdf.addImage(imgData, 'JPEG', 10, 26, W - 20, 110)
+        } catch { /* tainted canvas — skip image */ }
+      }
+
+      // Analysis data
+      let x = 10, y = 144
+      pdf.setTextColor(30, 30, 30)
+
+      if (clickedElev) {
+        pdf.setFontSize(11); pdf.setTextColor(79, 195, 247)
+        pdf.text('Point Elevation', x, y); y += 6
+        pdf.setFontSize(9); pdf.setTextColor(50, 50, 50)
+        pdf.text(`Latitude  : ${clickedElev.lat.toFixed(5)}°`, x + 4, y); y += 5
+        pdf.text(`Longitude : ${clickedElev.lon.toFixed(5)}°`, x + 4, y); y += 5
+        pdf.text(`Elevation : ${clickedElev.elev.toFixed(1)} m`, x + 4, y); y += 8
+      }
+
+      if (profileData.length > 0) {
+        pdf.setFontSize(11); pdf.setTextColor(79, 195, 247)
+        pdf.text('Elevation Profile', x, y); y += 6
+        pdf.setFontSize(9); pdf.setTextColor(50, 50, 50)
+        const minE = Math.min(...profileData.map(d => d.elev))
+        const maxE = Math.max(...profileData.map(d => d.elev))
+        const lenKm = ((profileData[profileData.length - 1]?.dist ?? 0) / 1000).toFixed(2)
+        pdf.text(`Length    : ${lenKm} km`, x + 4, y); y += 5
+        pdf.text(`Min elev  : ${minE.toFixed(1)} m`, x + 4, y); y += 5
+        pdf.text(`Max elev  : ${maxE.toFixed(1)} m`, x + 4, y); y += 5
+        pdf.text(`Relief    : ${(maxE - minE).toFixed(1)} m`, x + 4, y); y += 8
+      }
+
+      if (slopeStats) {
+        pdf.setFontSize(11); pdf.setTextColor(79, 195, 247)
+        pdf.text('Slope Analysis', x, y); y += 6
+        pdf.setFontSize(9); pdf.setTextColor(50, 50, 50)
+        const desc = slopeStats.avg < 5 ? 'Mostly flat' : slopeStats.avg < 15 ? 'Gentle slopes'
+          : slopeStats.avg < 30 ? 'Moderate terrain' : 'Steep terrain'
+        pdf.text(`Min slope : ${slopeStats.min.toFixed(1)}°`, x + 4, y); y += 5
+        pdf.text(`Avg slope : ${slopeStats.avg.toFixed(1)}°  (${desc})`, x + 4, y); y += 5
+        pdf.text(`Max slope : ${slopeStats.max.toFixed(1)}°`, x + 4, y); y += 5
+        pdf.text(`Grid      : ${slopeStats.gridSize}×${slopeStats.gridSize} samples`, x + 4, y)
+      }
+
+      // Footer
+      pdf.setTextColor(120, 120, 120); pdf.setFontSize(7)
+      pdf.text('RakshaGIS — Defence GIS Platform', W - 10, H - 4, { align: 'right' })
+
+      pdf.save(`rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.pdf`)
+      message.success('PDF exported')
+    } catch (e) {
+      message.error('PDF export failed')
+    } finally {
+      setExporting(false)
+    }
+  }, [clickedElev, profileData, slopeStats, terrainLabel])
+
+  const exportProfileCSV = useCallback(() => {
+    if (!profileData.length) return
+    const rows = ['point,distance_m,latitude_deg,longitude_deg,elevation_m']
+    profileData.forEach((p, i) =>
+      rows.push(`${i + 1},${p.dist.toFixed(1)},${p.lat.toFixed(6)},${p.lon.toFixed(6)},${p.elev.toFixed(2)}`)
+    )
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `elevation-profile-${new Date().toISOString().slice(0, 10)}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+    message.success('CSV exported')
+  }, [profileData])
+
+  const exportGeoTIFF = useCallback(async () => {
+    if (!slopeGridData) return
+    setExporting(true)
+    try {
+      message.loading({ content: 'Building GeoTIFF…', key: 'gtiff' })
+      const res = await api.post('/core/terrain/export-geotiff/', slopeGridData, {
+        responseType: 'blob',
+      })
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `slope-analysis-${new Date().toISOString().slice(0, 10)}.tif`
+      a.click()
+      URL.revokeObjectURL(url)
+      message.success({ content: 'GeoTIFF exported (Band 1: elevation m, Band 2: slope°)', key: 'gtiff' })
+    } catch {
+      message.error({ content: 'GeoTIFF export failed', key: 'gtiff' })
+    } finally {
+      setExporting(false)
+    }
+  }, [slopeGridData])
 
   const terrainLabel =
     terrainCfg?.terrain_source === 'ion' ? 'Cesium ION' :
@@ -809,6 +957,48 @@ export default function TerrainPage() {
               </>
             )}
 
+            {/* Export bar */}
+            {(clickedElev || profileData.length > 0 || slopeStats) && (
+              <>
+                <Divider style={{ margin: '8px 0', borderColor: '#1a1a2e' }} />
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <Text style={{ color: '#666', fontSize: 10, marginRight: 2 }}>Export:</Text>
+                  <Tooltip title="Screenshot of the 3D globe as PNG">
+                    <Button
+                      size="small" icon={<FileImageOutlined />}
+                      loading={exporting} onClick={exportPNG}
+                      style={{ fontSize: 11 }}
+                    >PNG</Button>
+                  </Tooltip>
+                  <Tooltip title="PDF report — map screenshot + analysis stats">
+                    <Button
+                      size="small" icon={<FilePdfOutlined />}
+                      loading={exporting} onClick={exportPDF}
+                      style={{ fontSize: 11 }}
+                    >PDF</Button>
+                  </Tooltip>
+                  {profileData.length > 0 && (
+                    <Tooltip title="Elevation profile as CSV (point, distance, lat, lon, elevation)">
+                      <Button
+                        size="small" icon={<FileTextOutlined />}
+                        onClick={exportProfileCSV}
+                        style={{ fontSize: 11 }}
+                      >CSV</Button>
+                    </Tooltip>
+                  )}
+                  {slopeGridData && (
+                    <Tooltip title="Slope analysis as GeoTIFF raster (Band 1: elevation m, Band 2: slope°)">
+                      <Button
+                        size="small" icon={<ExportOutlined />}
+                        loading={exporting} onClick={exportGeoTIFF}
+                        style={{ fontSize: 11 }}
+                      >GeoTIFF</Button>
+                    </Tooltip>
+                  )}
+                </div>
+              </>
+            )}
+
             {/* Terrain info */}
             <Divider style={{ margin: '8px 0', borderColor: '#1a1a2e' }} />
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#666' }}>
@@ -878,6 +1068,8 @@ async function buildElevationProfile(
   return sampled.map((c, i) => ({
     dist: geoDist[i],
     elev: (c as Cesium.Cartographic).height ?? 0,
+    lat: Cesium.Math.toDegrees(positions[i].latitude),
+    lon: Cesium.Math.toDegrees(positions[i].longitude),
   }))
 }
 
@@ -886,21 +1078,21 @@ async function computeSlopeStats(
   corner1: Cesium.Cartesian3,
   corner2: Cesium.Cartesian3,
   gridN = 15,
-): Promise<SlopeStats> {
+): Promise<{ stats: SlopeStats; gridData: SlopeGridData }> {
   const c1 = Cesium.Cartographic.fromCartesian(corner1)
   const c2 = Cesium.Cartographic.fromCartesian(corner2)
 
-  const minLon = Math.min(c1.longitude, c2.longitude)
-  const maxLon = Math.max(c1.longitude, c2.longitude)
-  const minLat = Math.min(c1.latitude, c2.latitude)
-  const maxLat = Math.max(c1.latitude, c2.latitude)
+  const minLonRad = Math.min(c1.longitude, c2.longitude)
+  const maxLonRad = Math.max(c1.longitude, c2.longitude)
+  const minLatRad = Math.min(c1.latitude, c2.latitude)
+  const maxLatRad = Math.max(c1.latitude, c2.latitude)
 
-  // Build grid
+  // Build grid (row 0 = southernmost, so north→south flip happens in backend)
   const positions: Cesium.Cartographic[] = []
   for (let row = 0; row < gridN; row++) {
     for (let col = 0; col < gridN; col++) {
-      const lon = minLon + (col / (gridN - 1)) * (maxLon - minLon)
-      const lat = minLat + (row / (gridN - 1)) * (maxLat - minLat)
+      const lon = minLonRad + (col / (gridN - 1)) * (maxLonRad - minLonRad)
+      const lat = minLatRad + (row / (gridN - 1)) * (maxLatRad - minLatRad)
       positions.push(new Cesium.Cartographic(lon, lat))
     }
   }
@@ -910,37 +1102,45 @@ async function computeSlopeStats(
     ? await Cesium.sampleTerrainMostDetailed(tp, positions)
     : positions  // EllipsoidTerrainProvider: heights remain 0 (no DEM data)
 
+  // Raw elevation grid for GeoTIFF export (degrees bbox)
+  const elevGrid = sampled.map(c => (c as Cesium.Cartographic).height ?? 0)
+  const bbox: [number, number, number, number] = [
+    Cesium.Math.toDegrees(minLonRad), Cesium.Math.toDegrees(minLatRad),
+    Cesium.Math.toDegrees(maxLonRad), Cesium.Math.toDegrees(maxLatRad),
+  ]
+
   const slopes: number[] = []
   const dx = haversineM(
-    Cesium.Math.toDegrees(minLat), Cesium.Math.toDegrees(minLon),
-    Cesium.Math.toDegrees(minLat), Cesium.Math.toDegrees(maxLon),
+    Cesium.Math.toDegrees(minLatRad), Cesium.Math.toDegrees(minLonRad),
+    Cesium.Math.toDegrees(minLatRad), Cesium.Math.toDegrees(maxLonRad),
   ) / (gridN - 1)
   const dy = haversineM(
-    Cesium.Math.toDegrees(minLat), Cesium.Math.toDegrees(minLon),
-    Cesium.Math.toDegrees(maxLat), Cesium.Math.toDegrees(minLon),
+    Cesium.Math.toDegrees(minLatRad), Cesium.Math.toDegrees(minLonRad),
+    Cesium.Math.toDegrees(maxLatRad), Cesium.Math.toDegrees(minLonRad),
   ) / (gridN - 1)
 
   for (let row = 1; row < gridN - 1; row++) {
     for (let col = 1; col < gridN - 1; col++) {
       const idx = row * gridN + col
-      const h00 = sampled[idx]?.height ?? 0
-      const hE = sampled[idx + 1]?.height ?? h00
-      const hN = sampled[idx + gridN]?.height ?? h00
+      const h00 = elevGrid[idx] ?? 0
+      const hE = elevGrid[idx + 1] ?? h00
+      const hN = elevGrid[idx + gridN] ?? h00
       const dzdx = (hE - h00) / dx
       const dzdy = (hN - h00) / dy
-      const slopeDeg = Math.atan(Math.sqrt(dzdx ** 2 + dzdy ** 2)) * (180 / Math.PI)
-      slopes.push(slopeDeg)
+      slopes.push(Math.atan(Math.sqrt(dzdx ** 2 + dzdy ** 2)) * (180 / Math.PI))
     }
   }
 
-  if (!slopes.length) return { min: 0, max: 0, avg: 0, gridSize: gridN }
+  const stats: SlopeStats = slopes.length
+    ? {
+        min: Math.min(...slopes),
+        max: Math.max(...slopes),
+        avg: slopes.reduce((a, b) => a + b, 0) / slopes.length,
+        gridSize: gridN,
+      }
+    : { min: 0, max: 0, avg: 0, gridSize: gridN }
 
-  return {
-    min: Math.min(...slopes),
-    max: Math.max(...slopes),
-    avg: slopes.reduce((a, b) => a + b, 0) / slopes.length,
-    gridSize: gridN,
-  }
+  return { stats, gridData: { elevGrid, bbox, gridN } }
 }
 
 function SlopeColorBar() {

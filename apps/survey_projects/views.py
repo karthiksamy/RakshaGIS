@@ -358,7 +358,7 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
     serializer_class = GISFeatureSerializer
     lookup_value_regex = r'\d+'
     filter_backends = [DjangoFilterBackend, SearchFilter]
-    filterset_fields = ['project', 'layer_name', 'geometry_type', 'is_deleted']
+    filterset_fields = ['project', 'folder', 'layer_name', 'geometry_type', 'is_deleted']
     search_fields = ['layer_name', 'feature_id']
     pagination_class = None  # map must load all features; pagination breaks the map layer
 

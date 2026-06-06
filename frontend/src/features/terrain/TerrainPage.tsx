@@ -242,7 +242,10 @@ export default function TerrainPage() {
     const initViewer = (tp: Cesium.TerrainProvider) => {
       if (!containerRef.current) return
       const viewer = new Cesium.Viewer(containerRef.current, {
-        terrainProvider: tp,
+        // terrainProvider was removed from the Viewer constructor in Cesium 1.107 —
+        // setting it here silently does nothing in 1.107+, leaving the globe with an
+        // undefined provider and crashing at computeMaximumLevelAtPosition.
+        // Set it directly on the viewer after construction instead (see below).
         animation: false,
         baseLayerPicker: false,
         fullscreenButton: false,
@@ -257,8 +260,9 @@ export default function TerrainPage() {
         creditContainer: document.createElement('div'),
       })
 
-      // Initial imagery (post-construction — imageryProvider was removed from the
-      // constructor in Cesium 1.101). A later effect swaps in the chosen basemap.
+      // terrainProvider + imageryProvider must both be set post-construction
+      // (both options were removed from the Viewer constructor in Cesium 1.107/1.101).
+      viewer.terrainProvider = tp
       viewer.imageryLayers.removeAll()
       viewer.imageryLayers.addImageryProvider(makeCesiumImagery())
 
@@ -330,10 +334,13 @@ export default function TerrainPage() {
         const carto = Cesium.Cartographic.fromCartesian(cart)
         const lat = Cesium.Math.toDegrees(carto.latitude)
         const lon = Cesium.Math.toDegrees(carto.longitude)
-        const sampled = await Cesium.sampleTerrainMostDetailed(
-          viewer.terrainProvider, [Cesium.Cartographic.fromDegrees(lon, lat)]
-        )
-        setClickedElev({ lat, lon, elev: sampled[0].height ?? carto.height ?? 0 })
+        // sampleTerrainMostDetailed requires a CesiumTerrainProvider (needs availability).
+        // EllipsoidTerrainProvider has no availability — fall back to the globe-picked height.
+        const tp = viewer.terrainProvider
+        const elev = (tp as any).availability
+          ? (await Cesium.sampleTerrainMostDetailed(tp, [Cesium.Cartographic.fromDegrees(lon, lat)]))[0].height ?? carto.height ?? 0
+          : carto.height ?? 0
+        setClickedElev({ lat, lon, elev })
         setPanelOpen(true)
       }, Cesium.ScreenSpaceEventType.LEFT_CLICK)
     }
@@ -863,11 +870,14 @@ async function buildElevationProfile(
     geoDist.push(geoDist[i - 1] + d)
   }
 
-  const sampled = await Cesium.sampleTerrainMostDetailed(viewer.terrainProvider, positions)
+  const tp = viewer.terrainProvider
+  const sampled = (tp as any).availability
+    ? await Cesium.sampleTerrainMostDetailed(tp, positions)
+    : positions  // EllipsoidTerrainProvider: heights remain 0 (no DEM data)
 
   return sampled.map((c, i) => ({
     dist: geoDist[i],
-    elev: c.height ?? 0,
+    elev: (c as Cesium.Cartographic).height ?? 0,
   }))
 }
 
@@ -895,7 +905,10 @@ async function computeSlopeStats(
     }
   }
 
-  const sampled = await Cesium.sampleTerrainMostDetailed(viewer.terrainProvider, positions)
+  const tp = viewer.terrainProvider
+  const sampled = (tp as any).availability
+    ? await Cesium.sampleTerrainMostDetailed(tp, positions)
+    : positions  // EllipsoidTerrainProvider: heights remain 0 (no DEM data)
 
   const slopes: number[] = []
   const dx = haversineM(

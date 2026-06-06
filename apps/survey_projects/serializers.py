@@ -76,12 +76,28 @@ class ProjectShareSerializer(serializers.ModelSerializer):
         read_only_fields = ['granted_by', 'created_at']
 
 
+class _FolderPKField(serializers.PrimaryKeyRelatedField):
+    """Accept any folder pk; silently return None when the folder no longer exists.
+
+    folder is null=True/blank=True/on_delete=SET_NULL on GISFeature, so saving
+    with folder=None is always safe.  Raising a 400 here would discard the whole
+    feature — a stale folder id (e.g. after a DB reset or folder deletion) must
+    not cause data loss.
+    """
+    def to_internal_value(self, data):
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError:
+            return None
+
+
 class GISFeatureSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
     geometry = GeometryField()
     # Override to remove validate_layer_name — layer_name is a plain text label
     # stored in a text column, not used as a SQL identifier, so strict naming is not needed
     layer_name = serializers.CharField(max_length=200)
+    folder = _FolderPKField(queryset=ProjectLayerFolder.objects.all(), allow_null=True, required=False)
 
     class Meta:
         model = GISFeature

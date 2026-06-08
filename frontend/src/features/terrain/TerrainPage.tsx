@@ -162,6 +162,7 @@ export default function TerrainPage() {
   const [panelOpen, setPanelOpen] = useState(false)
   const [cesiumError, setCesiumError] = useState<string | null>(null)
   const [autoArcGisTerrain, setAutoArcGisTerrain] = useState(false)
+  const [terrainExaggeration, setTerrainExaggeration] = useState(2)
 
   // Tool results
   const [clickedElev, setClickedElev] = useState<ClickedElev | null>(null)
@@ -283,9 +284,14 @@ export default function TerrainPage() {
 
       viewer.scene.globe.depthTestAgainstTerrain = true
       viewer.scene.globe.enableLighting = false
+      viewer.scene.verticalExaggeration = 2
 
-      // Fly to India
-      viewer.camera.flyTo({ destination: INDIA_RECT, duration: 2 })
+      // Fly to India with a tilted perspective so terrain looks 3D
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(82, 20, 3200000),
+        orientation: { heading: 0, pitch: Cesium.Math.toRadians(-50), roll: 0 },
+        duration: 2,
+      })
 
       viewerRef.current = viewer
       setReady(true)
@@ -538,6 +544,12 @@ export default function TerrainPage() {
     }
   }, [extrusionH])
 
+  useEffect(() => {
+    const viewer = viewerRef.current
+    if (!viewer || !ready) return
+    viewer.scene.verticalExaggeration = terrainExaggeration
+  }, [terrainExaggeration, ready])
+
   function clearAll() {
     const viewer = viewerRef.current
     if (!viewer) return
@@ -560,7 +572,11 @@ export default function TerrainPage() {
   }
 
   function flyToIndia() {
-    viewerRef.current?.camera.flyTo({ destination: INDIA_RECT, duration: 2 })
+    viewerRef.current?.camera.flyTo({
+      destination: Cesium.Cartesian3.fromDegrees(82, 20, 3200000),
+      orientation: { heading: 0, pitch: Cesium.Math.toRadians(-50), roll: 0 },
+      duration: 2,
+    })
   }
 
   const terrainLabel =
@@ -868,6 +884,18 @@ export default function TerrainPage() {
               onChange={setExtrusionH}
               style={{ width: 80 }}
               tooltip={{ formatter: (v) => `${v}m` }}
+            />
+          </div>
+        </Tooltip>
+
+        <Tooltip title="Terrain vertical exaggeration — increase to make hills and mountains appear more dramatic">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ color: '#888', fontSize: 11 }}>Exag</span>
+            <Slider
+              min={1} max={5} step={0.5} value={terrainExaggeration}
+              onChange={setTerrainExaggeration}
+              style={{ width: 70 }}
+              tooltip={{ formatter: (v) => `${v}×` }}
             />
           </div>
         </Tooltip>

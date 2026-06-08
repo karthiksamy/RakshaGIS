@@ -1,4 +1,5 @@
 import math
+import os
 from rest_framework import viewsets, permissions, parsers
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -425,7 +426,8 @@ class ElevationLookupView(APIView):
     def _srtm_dir(cls):
         from django.conf import settings
         from pathlib import Path
-        return Path(getattr(settings, 'DATA_DIR', '/data')) / 'terrain' / 'srtm_raw'
+        data_dir = getattr(settings, 'DATA_DIR', None) or os.environ.get('DATA_DIR', '/data')
+        return Path(data_dir) / 'terrain' / 'srtm_raw'
 
     @classmethod
     def _open_tile(cls, path_str: str):

@@ -14,16 +14,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Resolve DATA_DIR in priority order:
-#   1. Caller-exported env var  (build.sh passes DATA_DIR="$DATA_DIR")
-#   2. DATA_DIR= line in .env   (standalone run after setup)
-#   3. /RakshaGIS fallback
+# Resolve DATA_DIR — no hardcoded fallback; must come from .env or caller env.
 if [[ -z "${DATA_DIR:-}" ]]; then
   if [[ -f "$SCRIPT_DIR/.env" ]]; then
-    DATA_DIR=$(grep "^DATA_DIR=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r')
+    DATA_DIR=$(grep "^DATA_DIR=" "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '\r"'"'"' ')
   fi
-  DATA_DIR="${DATA_DIR:-/RakshaGIS}"
 fi
+
+if [[ -z "${DATA_DIR:-}" ]]; then
+  echo "ERROR: DATA_DIR is not set."
+  echo "  Set it in .env:  DATA_DIR=/your/data/path"
+  echo "  Or export it:    DATA_DIR=/your/data/path ./setup_terrain.sh --download"
+  exit 1
+fi
+
+# Resolve to absolute path so relative values in .env work correctly
+DATA_DIR="$(cd "$DATA_DIR" 2>/dev/null && pwd || echo "$DATA_DIR")"
 
 TERRAIN_DIR="${DATA_DIR}/terrain"
 SRTM_DIR="${TERRAIN_DIR}/srtm_raw"

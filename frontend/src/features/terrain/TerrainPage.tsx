@@ -43,7 +43,13 @@ function layerColor(name?: string | null): Cesium.Color {
 
 // Build a Cesium imagery provider from a configured BasemapConfig (or a sensible
 // public-OSM fallback). Handles {a-c}-style subdomain templates → Cesium {s}.
-function makeCesiumImagery(basemap?: any): Cesium.ImageryProvider {
+function makeCesiumImagery(basemap?: any): Cesium.ImageryProvider | Promise<Cesium.ImageryProvider> {
+  if (basemap?.provider === 'ARCGIS' && basemap?.url_template) {
+    return Cesium.ArcGisMapServerImageryProvider.fromUrl(basemap.url_template, {
+      token: basemap.api_key || undefined,
+    })
+  }
+
   let url = (basemap?.url_template || '').trim()
   let subdomains: string[] | undefined
   const m = url.match(/\{([a-z])-([a-z])\}/i)
@@ -241,9 +247,8 @@ export default function TerrainPage() {
       return
     }
 
-    // Disable ION if no token
     const token = terrainCfg?.cesium_ion_token ?? ''
-    Cesium.Ion.defaultAccessToken = token || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy'
+    if (token) Cesium.Ion.defaultAccessToken = token
 
     // Terrain provider
     let terrainProvider: Cesium.TerrainProvider = new Cesium.EllipsoidTerrainProvider()
@@ -251,10 +256,9 @@ export default function TerrainPage() {
     const initViewer = (tp: Cesium.TerrainProvider) => {
       if (!containerRef.current) return
       const viewer = new Cesium.Viewer(containerRef.current, {
-        // terrainProvider was removed from the Viewer constructor in Cesium 1.107 —
-        // setting it here silently does nothing in 1.107+, leaving the globe with an
-        // undefined provider and crashing at computeMaximumLevelAtPosition.
-        // Set it directly on the viewer after construction instead (see below).
+        // baseLayer: false prevents the default Ion/Bing fromWorldImagery call during
+        // construction — we add our own imagery provider immediately after.
+        baseLayer: false as any,
         animation: false,
         baseLayerPicker: false,
         fullscreenButton: false,
@@ -273,7 +277,8 @@ export default function TerrainPage() {
       // (both options were removed from the Viewer constructor in Cesium 1.107/1.101).
       viewer.terrainProvider = tp
       viewer.imageryLayers.removeAll()
-      viewer.imageryLayers.addImageryProvider(makeCesiumImagery())
+      // No basemap arg → always returns sync OSM provider
+      viewer.imageryLayers.addImageryProvider(makeCesiumImagery() as Cesium.ImageryProvider)
 
       viewer.scene.globe.depthTestAgainstTerrain = true
       viewer.scene.globe.enableLighting = false
@@ -317,8 +322,23 @@ export default function TerrainPage() {
     const viewer = viewerRef.current
     if (!viewer || !ready) return
     const bm = basemaps.find((b: any) => b.id === selectedBasemap)
-    viewer.imageryLayers.removeAll()
-    viewer.imageryLayers.addImageryProvider(makeCesiumImagery(bm))
+    const providerOrPromise = makeCesiumImagery(bm)
+    if (providerOrPromise instanceof Promise) {
+      providerOrPromise.then((provider) => {
+        if (!viewer.isDestroyed()) {
+          viewer.imageryLayers.removeAll()
+          viewer.imageryLayers.addImageryProvider(provider)
+        }
+      }).catch(() => {
+        if (!viewer.isDestroyed()) {
+          viewer.imageryLayers.removeAll()
+          viewer.imageryLayers.addImageryProvider(makeCesiumImagery() as Cesium.ImageryProvider)
+        }
+      })
+    } else {
+      viewer.imageryLayers.removeAll()
+      viewer.imageryLayers.addImageryProvider(providerOrPromise)
+    }
   }, [ready, selectedBasemap, basemaps])
 
   // Install click handler based on active tool

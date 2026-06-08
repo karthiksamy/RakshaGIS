@@ -293,6 +293,13 @@ const TOOL_ACTIVITY_LABEL: Record<string, string> = {
 function makeBasemapSource(bm: BasemapConfig | null) {
   if (!bm || bm.provider === 'OSM') return new OSM()
   if (bm.provider === 'LOCAL_COG') return new OSM()  // hidden when LOCAL_COG active; placeholder
+  if (bm.provider === 'ARCGIS') {
+    const token = bm.api_key ? `?token=${encodeURIComponent(bm.api_key)}` : ''
+    return new XYZ({
+      url: `${bm.url_template}/tile/{z}/{y}/{x}${token}`,
+      crossOrigin: 'anonymous',
+    })
+  }
   return new XYZ({ url: bm.url_template, crossOrigin: 'anonymous' })
 }
 

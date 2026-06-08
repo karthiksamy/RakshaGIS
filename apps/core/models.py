@@ -45,6 +45,7 @@ class BasemapConfig(models.Model):
     WMTS      = 'WMTS'
     BING      = 'BING'
     BHUVAN    = 'BHUVAN'
+    ARCGIS    = 'ARCGIS'
     LOCAL_COG = 'LOCAL_COG'   # Field-office uploaded GeoTIFF, converted to COG
 
     PROVIDER_CHOICES = [
@@ -54,6 +55,7 @@ class BasemapConfig(models.Model):
         (WMTS,      'WMTS Service'),
         (BING,      'Bing Maps'),
         (BHUVAN,    'Bhuvan (ISRO India)'),
+        (ARCGIS,    'ArcGIS Map Service'),
         (LOCAL_COG, 'Local Basemap (uploaded GeoTIFF)'),
     ]
 
@@ -73,7 +75,11 @@ class BasemapConfig(models.Model):
     provider     = models.CharField(max_length=12, choices=PROVIDER_CHOICES)
     url_template = models.CharField(
         max_length=500, blank=True,
-        help_text='Tile URL template (not used for LOCAL_COG).',
+        help_text='Tile URL template. For ARCGIS, enter the MapServer base URL (e.g. https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer).',
+    )
+    api_key      = models.CharField(
+        max_length=500, blank=True,
+        help_text='API key / token for authenticated services (ArcGIS, Bing, etc.).',
     )
     attribution  = models.CharField(max_length=300, blank=True)
     is_active    = models.BooleanField(default=True)

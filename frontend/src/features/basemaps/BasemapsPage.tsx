@@ -14,8 +14,9 @@ import { qk } from '@/services/queryKeys'
 import { useAppStore } from '@/app/store'
 import type { BasemapConfig } from '@/types'
 
-const GLOBAL_PROVIDERS = ['OSM', 'XYZ', 'WMS', 'WMTS', 'BING', 'BHUVAN']
+const GLOBAL_PROVIDERS = ['OSM', 'XYZ', 'WMS', 'WMTS', 'BING', 'BHUVAN', 'ARCGIS']
 const GLOBAL_PROVIDER_OPTIONS = GLOBAL_PROVIDERS.map((p) => ({ label: p, value: p }))
+const PROVIDERS_WITH_API_KEY = ['ARCGIS', 'BING']
 
 function CogStatusTag({ status, error }: { status?: string; error?: string | null }) {
   if (!status || status === 'PENDING')
@@ -36,6 +37,7 @@ export default function BasemapsPage() {
   const [uploadModalOpen, setUploadModalOpen] = useState(false)
   const [form] = Form.useForm()
   const [uploadForm] = Form.useForm()
+  const [formProvider, setFormProvider] = useState<string>('')
   const [tiffFile, setTiffFile] = useState<File | null>(null)
   const [uploading, setUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
@@ -273,7 +275,7 @@ export default function BasemapsPage() {
       <Modal
         title="Add URL / Tile Basemap"
         open={modalOpen}
-        onCancel={() => { setModalOpen(false); form.resetFields() }}
+        onCancel={() => { setModalOpen(false); form.resetFields(); setFormProvider('') }}
         onOk={() => form.submit()}
         confirmLoading={createMutation.isPending}
       >
@@ -282,11 +284,26 @@ export default function BasemapsPage() {
             <Input />
           </Form.Item>
           <Form.Item name="provider" label="Provider" rules={[{ required: true }]}>
-            <Select options={GLOBAL_PROVIDER_OPTIONS} />
+            <Select options={GLOBAL_PROVIDER_OPTIONS} onChange={(v) => setFormProvider(v)} />
           </Form.Item>
-          <Form.Item name="url_template" label="URL Template" rules={[{ required: true }]}>
-            <Input placeholder="https://{a-c}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+          <Form.Item
+            name="url_template"
+            label={formProvider === 'ARCGIS' ? 'MapServer Base URL' : 'URL Template'}
+            rules={[{ required: true }]}
+            extra={formProvider === 'ARCGIS'
+              ? 'Enter the MapServer URL, e.g. https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer'
+              : undefined}
+          >
+            <Input placeholder={formProvider === 'ARCGIS'
+              ? 'https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer'
+              : 'https://{a-c}.tile.openstreetmap.org/{z}/{x}/{y}.png'}
+            />
           </Form.Item>
+          {PROVIDERS_WITH_API_KEY.includes(formProvider) && (
+            <Form.Item name="api_key" label="API Key / Token" rules={[{ required: true }]}>
+              <Input.Password placeholder="Paste your ArcGIS token here" />
+            </Form.Item>
+          )}
           <Form.Item name="attribution" label="Attribution">
             <Input />
           </Form.Item>

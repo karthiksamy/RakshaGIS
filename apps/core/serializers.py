@@ -20,7 +20,7 @@ class BasemapConfigSerializer(serializers.ModelSerializer):
         model = BasemapConfig
         fields = [
             'id', 'name', 'provider', 'provider_display',
-            'url_template', 'attribution',
+            'url_template', 'api_key', 'attribution',
             'is_active', 'is_default', 'is_system',
             'organisation', 'organisation_name',
             # LOCAL_COG fields

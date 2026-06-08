@@ -264,13 +264,14 @@ export interface BrandingConfig {
   logo_url: string
 }
 
-export type BasemapProvider = 'OSM' | 'XYZ' | 'WMS' | 'WMTS' | 'BING' | 'BHUVAN'
+export type BasemapProvider = 'OSM' | 'XYZ' | 'WMS' | 'WMTS' | 'BING' | 'BHUVAN' | 'ARCGIS'
 
 export interface BasemapConfig {
   id: number
   name: string
   provider: BasemapProvider
   url_template: string
+  api_key?: string
   attribution: string
   is_active: boolean
   is_default: boolean

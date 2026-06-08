@@ -161,6 +161,7 @@ export default function TerrainPage() {
   const [featuresLoaded, setFeaturesLoaded] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
   const [cesiumError, setCesiumError] = useState<string | null>(null)
+  const [autoArcGisTerrain, setAutoArcGisTerrain] = useState(false)
 
   // Tool results
   const [clickedElev, setClickedElev] = useState<ClickedElev | null>(null)
@@ -340,6 +341,29 @@ export default function TerrainPage() {
       viewer.imageryLayers.addImageryProvider(providerOrPromise)
     }
   }, [ready, selectedBasemap, basemaps])
+
+  // When an ARCGIS basemap (with a token) is selected and no other terrain is
+  // configured, automatically use ArcGIS World Elevation for real 3D terrain.
+  // Reverts to flat ellipsoid when switching to a non-ARCGIS basemap.
+  useEffect(() => {
+    const viewer = viewerRef.current
+    if (!viewer || !ready || terrainCfg?.terrain_source !== 'none') return
+    const bm = basemaps.find((b: any) => b.id === selectedBasemap)
+    if (bm?.provider === 'ARCGIS' && bm?.api_key) {
+      Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(
+        'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer',
+        { token: bm.api_key },
+      ).then((tp) => {
+        if (!viewer.isDestroyed()) {
+          viewer.terrainProvider = tp
+          setAutoArcGisTerrain(true)
+        }
+      }).catch(() => {})
+    } else {
+      viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider()
+      setAutoArcGisTerrain(false)
+    }
+  }, [ready, selectedBasemap, basemaps, terrainCfg?.terrain_source])
 
   // Install click handler based on active tool
   useEffect(() => {
@@ -542,6 +566,7 @@ export default function TerrainPage() {
   const terrainLabel =
     terrainCfg?.terrain_source === 'ion' ? 'Cesium ION' :
     terrainCfg?.terrain_source === 'local' ? 'Local Server' :
+    autoArcGisTerrain ? 'ArcGIS Elevation' :
     'Ellipsoid (flat)'
 
   // ── Export helpers ──────────────────────────────────────────────────────────
@@ -852,7 +877,7 @@ export default function TerrainPage() {
         </Button>
 
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
-          <Tag color={terrainCfg?.terrain_source === 'none' ? 'default' : 'blue'}>
+          <Tag color={autoArcGisTerrain ? 'green' : terrainCfg?.terrain_source === 'none' ? 'default' : 'blue'}>
             Terrain: {terrainLabel}
           </Tag>
           {!ready && <Spin size="small" />}
@@ -1026,9 +1051,9 @@ export default function TerrainPage() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#666' }}>
               <InfoCircleOutlined />
               <span>
-                Terrain: <strong style={{ color: '#888' }}>{terrainLabel}</strong>
-                {terrainCfg?.terrain_source === 'none' && (
-                  <> — flat (no elevation data). Set up a terrain server for real DEM.</>
+                Terrain: <strong style={{ color: autoArcGisTerrain ? '#52c41a' : '#888' }}>{terrainLabel}</strong>
+                {terrainCfg?.terrain_source === 'none' && !autoArcGisTerrain && (
+                  <> — flat (no elevation data). Select an ArcGIS basemap or set up a terrain server.</>
                 )}
               </span>
             </div>

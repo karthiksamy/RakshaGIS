@@ -98,40 +98,72 @@ convert_to_terrain() {
     exit 1
   fi
 
-  echo "==> Merging ${raw_count} SRTM tiles into a single VRT…"
   mkdir -p "${OUTPUT_DIR}"
+
+  # ── Step 1: Build merged VRT (just an XML descriptor — no overflow risk) ────
+  echo "==> Merging ${raw_count} SRTM tiles into a single VRT…"
   local merged="${TERRAIN_DIR}/india_dem_merged.vrt"
+  local lowres="${TERRAIN_DIR}/india_dem_lowres.tif"
 
-  # Prefer locally installed GDAL (faster, no image pull needed); fall back to Docker.
-  if command -v gdalbuildvrt &>/dev/null; then
-    gdalbuildvrt "${merged}" "${SRTM_DIR}"/*.tif
-  else
-    docker run --rm -v "${TERRAIN_DIR}:/data" ghcr.io/osgeo/gdal:ubuntu-small-latest \
-      gdalbuildvrt /data/india_dem_merged.vrt /data/srtm_raw/*.tif
-  fi
+  # Prefer locally installed GDAL (faster, no Docker image pull).
+  _gdal_run() {
+    if command -v "$1" &>/dev/null; then
+      "$@"
+    else
+      # Fall back to Docker GDAL if local tools missing
+      local cmd="$1"; shift
+      docker run --rm -v "${TERRAIN_DIR}:/data" ghcr.io/osgeo/gdal:ubuntu-small-latest \
+        "$cmd" "$@"
+    fi
+  }
 
-  echo "==> Converting VRT → quantized-mesh terrain tiles using ctb-tile…"
-  echo "    This will take 1–3 hours for full India coverage at zoom 0–14."
-  echo "    Output: ${OUTPUT_DIR}"
+  _gdal_run gdalbuildvrt "${merged}" "${SRTM_DIR}"/*.tif
+
+  # ── Step 2: Low-resolution raster for zoom 0-7 ──────────────────────────────
+  # ctb-tile reads the FULL source raster for every output tile it writes.
+  # A full India VRT (≈30 000 × 36 000 px) triggers a 32-bit integer overflow
+  # inside older GDAL builds used in ctb-tile images.  Downsampling to 5 %
+  # (≈1 500 × 1 800 px) removes the overflow for low zoom levels.
+  echo "==> Creating low-resolution DEM for zoom levels 0-7…"
+  _gdal_run gdal_translate -outsize 5% 5% -of GTiff \
+    -co COMPRESS=LZW -co TILED=YES \
+    "${merged}" "${lowres}"
+
+  # ── Step 3: ctb-tile — two passes to stay under 32-bit GDAL limits ──────────
+  # tumgis/ctb-quantized-mesh: TU Munich maintained image (ctb-tile + GDAL).
   echo ""
-
-  # tumgis/ctb-quantized-mesh is a maintained image from TU Munich with ctb-tile + GDAL.
+  echo "==> Pass 1/2 — zoom 0-7 from low-res DEM (~5 min)…"
   docker run --rm \
     -v "${TERRAIN_DIR}:/data" \
     tumgis/ctb-quantized-mesh \
-    ctb-tile \
-      -f Mesh \
-      -C \
+    ctb-tile -f Mesh -C \
       -o /data/tilesets/terrain \
-      -z 0-14 \
-      /data/india_dem_merged.vrt
+      -z 0-7 \
+      /data/india_dem_lowres.tif
+
+  echo ""
+  echo "==> Pass 2/2 — zoom 8-14 from individual tiles (~1-3 h)…"
+  echo "    Processing ${raw_count} tiles one at a time to stay within GDAL limits."
+  local n=0
+  for tif_path in "${SRTM_DIR}"/*.tif; do
+    [[ -f "${tif_path}" ]] || continue
+    local tif_name; tif_name=$(basename "${tif_path}")
+    n=$((n + 1))
+    echo "    [${n}/${raw_count}] ${tif_name}…"
+    docker run --rm \
+      -v "${TERRAIN_DIR}:/data" \
+      tumgis/ctb-quantized-mesh \
+      ctb-tile -f Mesh -C \
+        -o /data/tilesets/terrain \
+        -z 8-14 \
+        "/data/srtm_raw/${tif_name}"
+  done
 
   echo ""
   echo "==> Terrain tile generation complete."
   echo "    Tile count: $(find "${OUTPUT_DIR}" -name "*.terrain" | wc -l)"
   echo ""
   echo "==> Next steps:"
-  echo "    Terrain tiles stored at : ${OUTPUT_DIR}"
   echo "    1. Start terrain server:  docker compose --profile terrain up -d terrain-server"
   echo "    2. Ensure .env has:       TERRAIN_TILE_URL=/terrain-tiles"
   echo "    3. Restart web:           docker compose restart web"

@@ -410,84 +410,96 @@ class ElevationLookupView(APIView):
     Body:    {"locations": [{"lat": 12.97, "lon": 77.59}, ...]}
     Returns: {"results": [{"lat": ..., "lon": ..., "elevation": ...}]}
 
-    Reads elevation from local SRTM GeoTIFF files (no internet required).
-    Source: DATA_DIR/terrain/india_dem_merged.vrt (built by setup_terrain.sh).
-    Falls back to the individual srtm_raw/*.tif tiles if the VRT doesn't exist yet.
-    Used in the 3D viewer when quantized-mesh terrain tiles are not yet available.
+    Queries elevation directly from individual SRTM GeoTIFF tiles — no VRT merge,
+    no internet required after initial download.  Avoids the GDAL integer overflow
+    that occurs when ReadAsArray is called on a very large merged VRT
+    (nSrcXSize=30000, nSrcYSize=36000 → overflow with 32-bit internal buffers).
+    Each tile file is opened once and cached per worker process.
     """
     permission_classes = [permissions.IsAuthenticated]
 
-    _ds = None          # module-level cache; opened once per worker process
-    _ds_path = None
+    # Per-process tile cache: path_str -> (ds, gt, band, nodata) or None
+    _tile_cache: dict = {}
 
-    def _open_dataset(self):
+    @classmethod
+    def _srtm_dir(cls):
         from django.conf import settings
         from pathlib import Path
+        return Path(getattr(settings, 'DATA_DIR', '/data')) / 'terrain' / 'srtm_raw'
+
+    @classmethod
+    def _open_tile(cls, path_str: str):
         from osgeo import gdal
+        if path_str not in cls._tile_cache:
+            ds = gdal.Open(path_str)
+            if ds is None:
+                cls._tile_cache[path_str] = None
+            else:
+                band = ds.GetRasterBand(1)
+                cls._tile_cache[path_str] = (ds, ds.GetGeoTransform(), band, band.GetNoDataValue())
+        return cls._tile_cache[path_str]
 
-        data_dir = Path(getattr(settings, 'DATA_DIR', '/data'))
-        vrt_path  = data_dir / 'terrain' / 'india_dem_merged.vrt'
-        srtm_dir  = data_dir / 'terrain' / 'srtm_raw'
+    @classmethod
+    def _sample(cls, lat: float, lon: float) -> float:
+        srtm_dir = cls._srtm_dir()
 
-        target = str(vrt_path)
+        # CGIAR 5°×5° tile naming: srtm_CC_RR.tif
+        # col 1 = -180°, each 5° wide eastward
+        # row 1 = 60°N, each 5° tall going south
+        col = int((lon + 180) / 5) + 1
+        row = int((60 - lat) / 5) + 1
+        primary = srtm_dir / f'srtm_{col:02d}_{row:02d}.tif'
 
-        # Auto-build VRT from raw tiles if the VRT is missing
-        if not vrt_path.exists():
-            tif_files = sorted(srtm_dir.glob('*.tif'))
-            if not tif_files:
-                return None  # SRTM data not yet downloaded
-            vrt_path.parent.mkdir(parents=True, exist_ok=True)
-            gdal.BuildVRT(str(vrt_path), [str(f) for f in tif_files])
+        candidates = [primary] if primary.exists() else list(srtm_dir.glob('*.tif'))
 
-        if ElevationLookupView._ds_path != target:
-            ElevationLookupView._ds = gdal.Open(target)
-            ElevationLookupView._ds_path = target
+        for path in candidates:
+            if not path.exists():
+                continue
+            entry = cls._open_tile(str(path))
+            if entry is None:
+                continue
+            ds, gt, band, nodata = entry
+            x_min, x_res, _, y_max, _, y_res = gt   # y_res is negative
+            x_max = x_min + x_res * ds.RasterXSize
+            y_min = y_max + y_res * ds.RasterYSize
 
-        return ElevationLookupView._ds
+            if not (x_min <= lon < x_max and y_min <= lat < y_max):
+                continue
+
+            px = int((lon - x_min) / x_res)
+            py = int((lat - y_max) / y_res)
+            if not (0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize):
+                continue
+
+            try:
+                arr = band.ReadAsArray(px, py, 1, 1)
+                if arr is not None:
+                    v = float(arr[0][0])
+                    if nodata is None or v != nodata:
+                        return v
+            except Exception:
+                pass
+
+        return 0.0
 
     def post(self, request):
-        from osgeo import gdal
-
         locations = request.data.get('locations', [])
         if not locations:
             return Response({'results': []})
 
-        locations = locations[:500]
-
-        ds = self._open_dataset()
-        if ds is None:
+        srtm_dir = self._srtm_dir()
+        if not srtm_dir.exists() or not any(srtm_dir.glob('*.tif')):
             return Response(
                 {'error': 'SRTM elevation data not available. '
-                          'Run ./setup_terrain.sh --download to fetch the DEM files.'},
+                          'Run ./setup_terrain.sh --download first.'},
                 status=503,
             )
 
-        gt = ds.GetGeoTransform()   # (x_min, x_res, 0, y_max, 0, -y_res)
-        band = ds.GetRasterBand(1)
-        nodata = band.GetNoDataValue()
-        raster_w = ds.RasterXSize
-        raster_h = ds.RasterYSize
-
-        results = []
-        for loc in locations:
-            lat = float(loc.get('lat', 0))
-            lon = float(loc.get('lon', 0))
-            px = int((lon - gt[0]) / gt[1])
-            py = int((lat - gt[3]) / gt[5])
-
-            elev = 0.0
-            if 0 <= px < raster_w and 0 <= py < raster_h:
-                try:
-                    val = band.ReadAsArray(px, py, 1, 1)
-                    if val is not None:
-                        v = float(val[0][0])
-                        if nodata is None or v != nodata:
-                            elev = v
-                except Exception:
-                    pass
-
-            results.append({'lat': lat, 'lon': lon, 'elevation': elev})
-
+        results = [
+            {'lat': loc['lat'], 'lon': loc['lon'],
+             'elevation': self._sample(float(loc['lat']), float(loc['lon']))}
+            for loc in locations[:500]
+        ]
         return Response({'results': results})
 
 

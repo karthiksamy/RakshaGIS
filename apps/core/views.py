@@ -404,6 +404,93 @@ class DroneDatasetViewSet(viewsets.ModelViewSet):
         })
 
 
+class ElevationLookupView(APIView):
+    """
+    POST /api/core/elevation/
+    Body:    {"locations": [{"lat": 12.97, "lon": 77.59}, ...]}
+    Returns: {"results": [{"lat": ..., "lon": ..., "elevation": ...}]}
+
+    Reads elevation from local SRTM GeoTIFF files (no internet required).
+    Source: DATA_DIR/terrain/india_dem_merged.vrt (built by setup_terrain.sh).
+    Falls back to the individual srtm_raw/*.tif tiles if the VRT doesn't exist yet.
+    Used in the 3D viewer when quantized-mesh terrain tiles are not yet available.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    _ds = None          # module-level cache; opened once per worker process
+    _ds_path = None
+
+    def _open_dataset(self):
+        from django.conf import settings
+        from pathlib import Path
+        from osgeo import gdal
+
+        data_dir = Path(getattr(settings, 'DATA_DIR', '/data'))
+        vrt_path  = data_dir / 'terrain' / 'india_dem_merged.vrt'
+        srtm_dir  = data_dir / 'terrain' / 'srtm_raw'
+
+        target = str(vrt_path)
+
+        # Auto-build VRT from raw tiles if the VRT is missing
+        if not vrt_path.exists():
+            tif_files = sorted(srtm_dir.glob('*.tif'))
+            if not tif_files:
+                return None  # SRTM data not yet downloaded
+            vrt_path.parent.mkdir(parents=True, exist_ok=True)
+            gdal.BuildVRT(str(vrt_path), [str(f) for f in tif_files])
+
+        if ElevationLookupView._ds_path != target:
+            ElevationLookupView._ds = gdal.Open(target)
+            ElevationLookupView._ds_path = target
+
+        return ElevationLookupView._ds
+
+    def post(self, request):
+        from osgeo import gdal
+
+        locations = request.data.get('locations', [])
+        if not locations:
+            return Response({'results': []})
+
+        locations = locations[:500]
+
+        ds = self._open_dataset()
+        if ds is None:
+            return Response(
+                {'error': 'SRTM elevation data not available. '
+                          'Run ./setup_terrain.sh --download to fetch the DEM files.'},
+                status=503,
+            )
+
+        gt = ds.GetGeoTransform()   # (x_min, x_res, 0, y_max, 0, -y_res)
+        band = ds.GetRasterBand(1)
+        nodata = band.GetNoDataValue()
+        raster_w = ds.RasterXSize
+        raster_h = ds.RasterYSize
+
+        results = []
+        for loc in locations:
+            lat = float(loc.get('lat', 0))
+            lon = float(loc.get('lon', 0))
+            px = int((lon - gt[0]) / gt[1])
+            py = int((lat - gt[3]) / gt[5])
+
+            elev = 0.0
+            if 0 <= px < raster_w and 0 <= py < raster_h:
+                try:
+                    val = band.ReadAsArray(px, py, 1, 1)
+                    if val is not None:
+                        v = float(val[0][0])
+                        if nodata is None or v != nodata:
+                            elev = v
+                except Exception:
+                    pass
+
+            results.append({'lat': lat, 'lon': lon, 'elevation': elev})
+
+        return Response({'results': results})
+
+
 class TerrainConfigView(APIView):
     """Return terrain / Cesium configuration (read-only, authenticated)."""
     permission_classes = [permissions.IsAuthenticated]

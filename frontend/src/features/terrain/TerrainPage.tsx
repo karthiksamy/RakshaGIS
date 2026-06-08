@@ -343,12 +343,14 @@ export default function TerrainPage() {
         const carto = Cesium.Cartographic.fromCartesian(cart)
         const lat = Cesium.Math.toDegrees(carto.latitude)
         const lon = Cesium.Math.toDegrees(carto.longitude)
-        // sampleTerrainMostDetailed requires a CesiumTerrainProvider (needs availability).
-        // EllipsoidTerrainProvider has no availability — fall back to the globe-picked height.
-        const tp = viewer.terrainProvider
-        const elev = (tp as any).availability
-          ? (await Cesium.sampleTerrainMostDetailed(tp, [Cesium.Cartographic.fromDegrees(lon, lat)]))[0].height ?? carto.height ?? 0
-          : carto.height ?? 0
+        let elev: number
+        if (hasRealTerrain(viewer)) {
+          const tp = viewer.terrainProvider
+          elev = (await Cesium.sampleTerrainMostDetailed(tp, [Cesium.Cartographic.fromDegrees(lon, lat)]))[0].height ?? 0
+        } else {
+          const res = await apiElevation([{ lat, lon }])
+          elev = res[0] ?? 0
+        }
         setClickedElev({ lat, lon, elev })
         setPanelOpen(true)
       }, Cesium.ScreenSpaceEventType.LEFT_CLICK)
@@ -1017,6 +1019,23 @@ export default function TerrainPage() {
   )
 }
 
+// ── Elevation fallback (Open-Elevation via Django proxy) ─────────────────────
+// Used when local terrain tiles are unavailable (EllipsoidTerrainProvider).
+
+async function apiElevation(locs: { lat: number; lon: number }[]): Promise<number[]> {
+  try {
+    const res = await api.post('/core/elevation/', { locations: locs })
+    const results: any[] = res.data?.results ?? []
+    return results.map((r: any) => r.elevation ?? 0)
+  } catch {
+    return locs.map(() => 0)
+  }
+}
+
+function hasRealTerrain(viewer: Cesium.Viewer): boolean {
+  return !!(viewer.terrainProvider as any).availability
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 async function buildElevationProfile(
@@ -1060,16 +1079,22 @@ async function buildElevationProfile(
     geoDist.push(geoDist[i - 1] + d)
   }
 
-  const tp = viewer.terrainProvider
-  const sampled = (tp as any).availability
-    ? await Cesium.sampleTerrainMostDetailed(tp, positions)
-    : positions  // EllipsoidTerrainProvider: heights remain 0 (no DEM data)
+  let elevs: number[]
+  if (hasRealTerrain(viewer)) {
+    const sampled = await Cesium.sampleTerrainMostDetailed(viewer.terrainProvider, positions)
+    elevs = sampled.map(c => (c as Cesium.Cartographic).height ?? 0)
+  } else {
+    elevs = await apiElevation(positions.map(c => ({
+      lat: Cesium.Math.toDegrees(c.latitude),
+      lon: Cesium.Math.toDegrees(c.longitude),
+    })))
+  }
 
-  return sampled.map((c, i) => ({
+  return positions.map((c, i) => ({
     dist: geoDist[i],
-    elev: (c as Cesium.Cartographic).height ?? 0,
-    lat: Cesium.Math.toDegrees(positions[i].latitude),
-    lon: Cesium.Math.toDegrees(positions[i].longitude),
+    elev: elevs[i] ?? 0,
+    lat: Cesium.Math.toDegrees(c.latitude),
+    lon: Cesium.Math.toDegrees(c.longitude),
   }))
 }
 
@@ -1097,13 +1122,17 @@ async function computeSlopeStats(
     }
   }
 
-  const tp = viewer.terrainProvider
-  const sampled = (tp as any).availability
-    ? await Cesium.sampleTerrainMostDetailed(tp, positions)
-    : positions  // EllipsoidTerrainProvider: heights remain 0 (no DEM data)
-
   // Raw elevation grid for GeoTIFF export (degrees bbox)
-  const elevGrid = sampled.map(c => (c as Cesium.Cartographic).height ?? 0)
+  let elevGrid: number[]
+  if (hasRealTerrain(viewer)) {
+    const sampled = await Cesium.sampleTerrainMostDetailed(viewer.terrainProvider, positions)
+    elevGrid = sampled.map(c => (c as Cesium.Cartographic).height ?? 0)
+  } else {
+    elevGrid = await apiElevation(positions.map(c => ({
+      lat: Cesium.Math.toDegrees(c.latitude),
+      lon: Cesium.Math.toDegrees(c.longitude),
+    })))
+  }
   const bbox: [number, number, number, number] = [
     Cesium.Math.toDegrees(minLonRad), Cesium.Math.toDegrees(minLatRad),
     Cesium.Math.toDegrees(maxLonRad), Cesium.Math.toDegrees(maxLatRad),

@@ -102,17 +102,23 @@ convert_to_terrain() {
   mkdir -p "${OUTPUT_DIR}"
   local merged="${TERRAIN_DIR}/india_dem_merged.vrt"
 
-  docker run --rm -v "${TERRAIN_DIR}:/data" ghcr.io/osgeo/gdal:ubuntu-small-latest \
-    gdalbuildvrt /data/india_dem_merged.vrt /data/srtm_raw/*.tif
+  # Prefer locally installed GDAL (faster, no image pull needed); fall back to Docker.
+  if command -v gdalbuildvrt &>/dev/null; then
+    gdalbuildvrt "${merged}" "${SRTM_DIR}"/*.tif
+  else
+    docker run --rm -v "${TERRAIN_DIR}:/data" ghcr.io/osgeo/gdal:ubuntu-small-latest \
+      gdalbuildvrt /data/india_dem_merged.vrt /data/srtm_raw/*.tif
+  fi
 
   echo "==> Converting VRT → quantized-mesh terrain tiles using ctb-tile…"
   echo "    This will take 1–3 hours for full India coverage at zoom 0–14."
   echo "    Output: ${OUTPUT_DIR}"
   echo ""
 
+  # tumgis/ctb-quantized-mesh is a maintained image from TU Munich with ctb-tile + GDAL.
   docker run --rm \
     -v "${TERRAIN_DIR}:/data" \
-    tumblr/ctb-tile:latest \
+    tumgis/ctb-quantized-mesh \
     ctb-tile \
       -f Mesh \
       -C \

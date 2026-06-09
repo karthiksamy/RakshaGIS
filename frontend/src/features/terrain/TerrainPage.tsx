@@ -10,7 +10,7 @@ import {
   LineChartOutlined, AreaChartOutlined,
   AimOutlined, ReloadOutlined, GlobalOutlined, InfoCircleOutlined,
   CloseOutlined, ColumnHeightOutlined, ExportOutlined,
-  FileImageOutlined, FilePdfOutlined, FileTextOutlined,
+  FileImageOutlined, FilePdfOutlined, FileTextOutlined, SyncOutlined,
 } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 import api from '@/services/api'
@@ -162,6 +162,7 @@ export default function TerrainPage() {
   const [panelOpen, setPanelOpen] = useState(false)
   const [cesiumError, setCesiumError] = useState<string | null>(null)
   const [autoArcGisTerrain, setAutoArcGisTerrain] = useState(false)
+  const [arcgisTerrainLoading, setArcgisTerrainLoading] = useState(false)
   const [terrainExaggeration, setTerrainExaggeration] = useState(2)
 
   // Tool results
@@ -263,15 +264,16 @@ export default function TerrainPage() {
         baseLayer: false as any,
         animation: false,
         baseLayerPicker: false,
-        fullscreenButton: false,
+        fullscreenButton: true,
         vrButton: false,
         geocoder: false,
-        homeButton: false,
+        homeButton: true,
         infoBox: false,
         sceneModePicker: true,
         selectionIndicator: false,
         timeline: false,
-        navigationHelpButton: false,
+        navigationHelpButton: true,
+        navigationInstructionsInitiallyVisible: false,
         creditContainer: document.createElement('div'),
       })
 
@@ -285,6 +287,18 @@ export default function TerrainPage() {
       viewer.scene.globe.depthTestAgainstTerrain = true
       viewer.scene.globe.enableLighting = false
       viewer.scene.verticalExaggeration = 2
+
+      // Override the home button to fly to India (prevents Ion default destination)
+      viewer.homeButton.viewModel.command.beforeExecute.addEventListener(
+        (e: any) => {
+          e.cancel = true
+          viewer.camera.flyTo({
+            destination: Cesium.Cartesian3.fromDegrees(82, 20, 3200000),
+            orientation: { heading: 0, pitch: Cesium.Math.toRadians(-50), roll: 0 },
+            duration: 2,
+          })
+        }
+      )
 
       // Fly to India with a tilted perspective so terrain looks 3D
       viewer.camera.flyTo({
@@ -348,28 +362,32 @@ export default function TerrainPage() {
     }
   }, [ready, selectedBasemap, basemaps])
 
-  // When an ARCGIS basemap (with a token) is selected and no other terrain is
-  // configured, automatically use ArcGIS World Elevation for real 3D terrain.
-  // Reverts to flat ellipsoid when switching to a non-ARCGIS basemap.
+  // When any ARCGIS basemap with a token exists and no other terrain is configured,
+  // automatically load ArcGIS World Elevation for real 3D terrain.
+  // This does NOT depend on which basemap is selected — the first available
+  // ARCGIS token is used as soon as the viewer is ready.
   useEffect(() => {
     const viewer = viewerRef.current
     if (!viewer || !ready || terrainCfg?.terrain_source !== 'none') return
-    const bm = basemaps.find((b: any) => b.id === selectedBasemap)
-    if (bm?.provider === 'ARCGIS' && bm?.api_key) {
+    const arcgisBm = basemaps.find((b: any) => b.provider === 'ARCGIS' && b.api_key)
+    if (arcgisBm) {
+      setArcgisTerrainLoading(true)
       Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(
         'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer',
-        { token: bm.api_key },
+        { token: arcgisBm.api_key },
       ).then((tp) => {
         if (!viewer.isDestroyed()) {
           viewer.terrainProvider = tp
           setAutoArcGisTerrain(true)
         }
-      }).catch(() => {})
+      }).catch((err) => {
+        console.warn('ArcGIS elevation terrain failed to load:', err)
+      }).finally(() => setArcgisTerrainLoading(false))
     } else {
       viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider()
       setAutoArcGisTerrain(false)
     }
-  }, [ready, selectedBasemap, basemaps, terrainCfg?.terrain_source])
+  }, [ready, basemaps, terrainCfg?.terrain_source])
 
   // Install click handler based on active tool
   useEffect(() => {
@@ -396,7 +414,9 @@ export default function TerrainPage() {
         let elev: number
         if (hasRealTerrain(viewer)) {
           const tp = viewer.terrainProvider
-          elev = (await Cesium.sampleTerrainMostDetailed(tp, [Cesium.Cartographic.fromDegrees(lon, lat)]))[0].height ?? 0
+          const sampled = await Cesium.sampleTerrainMostDetailed(tp, [Cesium.Cartographic.fromDegrees(lon, lat)])
+          const h = sampled[0]?.height
+          elev = (h != null && isFinite(h)) ? h : 0
         } else {
           const res = await apiElevation([{ lat, lon }])
           elev = res[0] ?? 0
@@ -905,8 +925,11 @@ export default function TerrainPage() {
         </Button>
 
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
-          <Tag color={autoArcGisTerrain ? 'green' : terrainCfg?.terrain_source === 'none' ? 'default' : 'blue'}>
-            Terrain: {terrainLabel}
+          <Tag
+            color={autoArcGisTerrain ? 'green' : arcgisTerrainLoading ? 'processing' : terrainCfg?.terrain_source === 'none' ? 'default' : 'blue'}
+            icon={arcgisTerrainLoading ? <SyncOutlined spin /> : undefined}
+          >
+            Terrain: {arcgisTerrainLoading ? 'Loading ArcGIS…' : terrainLabel}
           </Tag>
           {!ready && <Spin size="small" />}
         </div>
@@ -1106,7 +1129,9 @@ async function apiElevation(locs: { lat: number; lon: number }[]): Promise<numbe
 }
 
 function hasRealTerrain(viewer: Cesium.Viewer): boolean {
-  return !!(viewer.terrainProvider as any).availability
+  // EllipsoidTerrainProvider is the only "flat" provider — anything else has real elevation.
+  // Checking .availability was wrong: ArcGISTiledElevationTerrainProvider has no .availability.
+  return !(viewer.terrainProvider instanceof Cesium.EllipsoidTerrainProvider)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

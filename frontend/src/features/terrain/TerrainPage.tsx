@@ -251,7 +251,11 @@ export default function TerrainPage() {
     }
 
     const token = terrainCfg?.cesium_ion_token ?? ''
-    if (token) Cesium.Ion.defaultAccessToken = token
+    // Always override the default token. Cesium.js ships with an expiring built-in
+    // token; if we leave it unset, Cesium uses that token and calls api.cesium.com
+    // which returns 401. Setting any different value skips the credit-check request.
+    // We use '' (no Ion features) unless a real token is configured.
+    Cesium.Ion.defaultAccessToken = token || ''
 
     // Terrain provider
     let terrainProvider: Cesium.TerrainProvider = new Cesium.EllipsoidTerrainProvider()

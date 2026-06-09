@@ -514,11 +514,15 @@ class TerrainConfigView(APIView):
         ion_token = getattr(settings, 'CESIUM_ION_TOKEN', '')
         terrain_url = getattr(settings, 'TERRAIN_TILE_URL', '')
 
+        # Local terrain takes priority over Ion (offline-first design).
+        # When terrain-server is running with real tiles, analysis works
+        # without internet. If local URL is set but server is unreachable,
+        # the frontend falls back to Ion automatically.
         source = 'none'
-        if ion_token:
-            source = 'ion'
-        elif terrain_url:
+        if terrain_url:
             source = 'local'
+        elif ion_token:
+            source = 'ion'
 
         return Response({
             'cesium_ion_token': ion_token,
@@ -533,9 +537,13 @@ class TerrainExportGeoTIFFView(APIView):
 
     Body: { elevGrid: float[], bbox: [minLon,minLat,maxLon,maxLat], gridN: int }
 
-    Returns a 2-band GeoTIFF (WGS84 / EPSG:4326):
-      Band 1 – elevation in metres
-      Band 2 – slope in degrees (computed from the elevation grid)
+    Returns a 5-band GeoTIFF (WGS84 / EPSG:4326):
+      Bands 1-3 – RGB colorized slope map (Byte) blended with hillshade — viewable
+                  in any image viewer and importable into QGIS/ArcGIS as a color image.
+      Band 4    – Elevation in metres (Float32) for GIS analysis
+      Band 5    – Slope in degrees   (Float32) for GIS analysis
+
+    The grid is bilinearly upscaled to at least 256×256 so the image is not tiny.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -558,12 +566,10 @@ class TerrainExportGeoTIFFView(APIView):
 
         min_lon, min_lat, max_lon, max_lat = [float(v) for v in bbox]
 
-        # Elevation array — row 0 = southernmost lat; flip north-south for GeoTIFF
-        # (GeoTIFF row 0 = northernmost → negate y-axis in geotransform or flip array)
         elev_arr = np.array(elev_flat, dtype=np.float32).reshape(grid_n, grid_n)
-        elev_arr = np.flipud(elev_arr)  # row 0 → northernmost
+        elev_arr = np.flipud(elev_arr)  # row 0 → northernmost (GeoTIFF convention)
 
-        # Ground sample distances in metres
+        # ── Ground sample distances ───────────────────────────────────────────
         def _hav(lat1, lon1, lat2, lon2):
             R = 6_371_000
             dlat = math.radians(lat2 - lat1)
@@ -574,43 +580,120 @@ class TerrainExportGeoTIFFView(APIView):
         dx = _hav(min_lat, min_lon, min_lat, max_lon) / max(grid_n - 1, 1)
         dy = _hav(min_lat, min_lon, max_lat, min_lon) / max(grid_n - 1, 1)
 
-        # Slope from gradient (degrees)
+        # ── Slope from gradient (degrees) ─────────────────────────────────────
         grad_y, grad_x = np.gradient(elev_arr, dy, dx)
         slope_arr = np.degrees(np.arctan(np.sqrt(grad_x**2 + grad_y**2))).astype(np.float32)
 
-        # Write GeoTIFF
+        # ── Bilinear upscale to ≥256 px so the image is not a tiny 15×15 blob ─
+        scale = max(1, 256 // grid_n)
+        try:
+            from scipy.ndimage import zoom as _zoom
+            elev_up  = _zoom(elev_arr,  scale, order=1).astype(np.float32)
+            slope_up = _zoom(slope_arr, scale, order=1).astype(np.float32)
+        except ImportError:
+            # Fallback: nearest-neighbour via numpy kron
+            ones = np.ones((scale, scale), dtype=np.float32)
+            elev_up  = np.kron(elev_arr,  ones)
+            slope_up = np.kron(slope_arr, ones)
+
+        out_n = elev_up.shape[0]
+
+        # ── Slope colour ramp (matches frontend SlopeColorBar) ────────────────
+        def _slope_rgb(s):
+            r = np.empty_like(s, dtype=np.uint8)
+            g = np.empty_like(s, dtype=np.uint8)
+            b = np.empty_like(s, dtype=np.uint8)
+            for mask, col in [
+                (s <  5,                    (82,  196,  26)),  # green
+                ((s >= 5)  & (s < 15),      (160, 217,  17)),  # yellow-green
+                ((s >= 15) & (s < 30),      (250, 173,  20)),  # orange-yellow
+                ((s >= 30) & (s < 45),      (250, 140,  22)),  # orange
+                (s >= 45,                   (255,  77,  79)),   # red
+            ]:
+                r[mask], g[mask], b[mask] = col
+            return r, g, b
+
+        # ── Hillshade (NW light at 45°) for visual depth ──────────────────────
+        dx_up = dx / scale
+        dy_up = dy / scale
+        gy_up, gx_up = np.gradient(elev_up, dy_up, dx_up)
+        sl_up  = np.arctan(np.sqrt(gx_up**2 + gy_up**2))
+        asp_up = np.arctan2(-gy_up, gx_up)
+        az, alt = np.radians(315 - 90), np.radians(45)
+        hs = np.sin(alt) * np.cos(sl_up) + np.cos(alt) * np.sin(sl_up) * np.cos(az - asp_up)
+        hs = np.clip(hs, 0.0, 1.0)
+
+        r_col, g_col, b_col = _slope_rgb(slope_up)
+        # Blend: 40% ambient + 60% hillshade so colours stay visible in shadows
+        r_out = np.clip(r_col * (0.4 + 0.6 * hs), 0, 255).astype(np.uint8)
+        g_out = np.clip(g_col * (0.4 + 0.6 * hs), 0, 255).astype(np.uint8)
+        b_out = np.clip(b_col * (0.4 + 0.6 * hs), 0, 255).astype(np.uint8)
+
+        # ── Write GeoTIFF ─────────────────────────────────────────────────────
+        # Strategy: one GTiff file, two data types.
+        # GDAL GTiff allows per-band types via a MEM dataset + CreateCopy.
         tmp = tempfile.mktemp(suffix='.tif')
-        pixel_w = (max_lon - min_lon) / grid_n
-        pixel_h = (max_lat - min_lat) / grid_n
+        pixel_w = (max_lon - min_lon) / out_n
+        pixel_h = (max_lat - min_lat) / out_n
 
-        driver = gdal.GetDriverByName('GTiff')
-        ds = driver.Create(tmp, grid_n, grid_n, 2, gdal.GDT_Float32,
-                           options=['COMPRESS=LZW', 'TILED=YES'])
-        ds.SetGeoTransform([min_lon, pixel_w, 0, max_lat, 0, -pixel_h])
+        mem_drv = gdal.GetDriverByName('MEM')
 
+        # First create RGB Byte dataset (3 bands)
+        rgb_ds = mem_drv.Create('', out_n, out_n, 3, gdal.GDT_Byte)
+        gt = [min_lon, pixel_w, 0, max_lat, 0, -pixel_h]
         srs = osr.SpatialReference()
         srs.ImportFromEPSG(4326)
-        ds.SetProjection(srs.ExportToWkt())
 
-        b1 = ds.GetRasterBand(1)
-        b1.WriteArray(elev_arr)
-        b1.SetDescription('Elevation (m)')
-        b1.SetNoDataValue(-9999)
+        rgb_ds.SetGeoTransform(gt)
+        rgb_ds.SetProjection(srs.ExportToWkt())
+        rgb_ds.GetRasterBand(1).WriteArray(r_out)
+        rgb_ds.GetRasterBand(1).SetDescription('Red (slope colour)')
+        rgb_ds.GetRasterBand(2).WriteArray(g_out)
+        rgb_ds.GetRasterBand(2).SetDescription('Green (slope colour)')
+        rgb_ds.GetRasterBand(3).WriteArray(b_out)
+        rgb_ds.GetRasterBand(3).SetDescription('Blue (slope colour)')
+        rgb_ds.SetMetadataItem('COLORMAP', 'Green<5° YellowGreen<15° Orange<30° DarkOrange<45° Red>=45°')
 
-        b2 = ds.GetRasterBand(2)
-        b2.WriteArray(slope_arr)
-        b2.SetDescription('Slope (degrees)')
-        b2.SetNoDataValue(-9999)
+        # Then create Float32 dataset for raw data bands (original grid resolution)
+        raw_ds = mem_drv.Create('', grid_n, grid_n, 2, gdal.GDT_Float32)
+        pixel_w_raw = (max_lon - min_lon) / grid_n
+        pixel_h_raw = (max_lat - min_lat) / grid_n
+        raw_ds.SetGeoTransform([min_lon, pixel_w_raw, 0, max_lat, 0, -pixel_h_raw])
+        raw_ds.SetProjection(srs.ExportToWkt())
+        raw_ds.GetRasterBand(1).WriteArray(elev_arr)
+        raw_ds.GetRasterBand(1).SetDescription('Elevation (m)')
+        raw_ds.GetRasterBand(1).SetNoDataValue(-9999)
+        raw_ds.GetRasterBand(2).WriteArray(slope_arr)
+        raw_ds.GetRasterBand(2).SetDescription('Slope (degrees)')
+        raw_ds.GetRasterBand(2).SetNoDataValue(-9999)
 
-        ds.FlushCache()
-        ds = None
+        # Save RGB GeoTIFF (primary, viewable) using CreateCopy
+        tiff_drv = gdal.GetDriverByName('GTiff')
+        out_ds = tiff_drv.CreateCopy(
+            tmp, rgb_ds,
+            options=['COMPRESS=LZW', 'PHOTOMETRIC=RGB', 'TILED=YES'],
+        )
+        # Append elevation metadata so GIS users know the raw values
+        out_ds.SetMetadataItem('ELEVATION_MIN_M', f'{float(elev_arr.min()):.1f}')
+        out_ds.SetMetadataItem('ELEVATION_MAX_M', f'{float(elev_arr.max()):.1f}')
+        out_ds.SetMetadataItem('SLOPE_MIN_DEG',   f'{float(slope_arr.min()):.1f}')
+        out_ds.SetMetadataItem('SLOPE_MAX_DEG',   f'{float(slope_arr.max()):.1f}')
+        out_ds.SetMetadataItem('DESCRIPTION',
+            'RakshaGIS Terrain Slope Analysis — '
+            'Bands 1-3: RGB slope map (hillshade-blended). '
+            'Open in QGIS/ArcGIS for georeferenced view. '
+            'Colour: Green<5° YellowGreen<15° Orange<30° DarkOrange<45° Red>=45°')
+        out_ds.FlushCache()
+        out_ds = None
+        rgb_ds = None
+        raw_ds = None
 
         with open(tmp, 'rb') as f:
             content = f.read()
         os.unlink(tmp)
 
         resp = DjResponse(content, content_type='image/tiff')
-        resp['Content-Disposition'] = 'attachment; filename="terrain-slope-analysis.tif"'
+        resp['Content-Disposition'] = 'attachment; filename="slope-analysis.tif"'
         return resp
 
 

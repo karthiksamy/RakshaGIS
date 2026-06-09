@@ -326,7 +326,18 @@ export default function TerrainPage() {
     } else if (terrainSource === 'local' && terrainUrl) {
       Cesium.CesiumTerrainProvider.fromUrl(terrainUrl, { requestVertexNormals: true })
         .then((tp) => { terrainProvider = tp; initViewer(tp) })
-        .catch(() => initViewer(new Cesium.EllipsoidTerrainProvider()))
+        .catch(() => {
+          // Local terrain server not reachable (tiles not yet set up, or server
+          // not started). Fall back to Ion if a token is configured, so the
+          // globe still shows 3D terrain while the user runs setup_terrain.sh.
+          if (token) {
+            Cesium.CesiumTerrainProvider.fromIonAssetId(1)
+              .then((tp) => initViewer(tp))
+              .catch(() => initViewer(new Cesium.EllipsoidTerrainProvider()))
+          } else {
+            initViewer(new Cesium.EllipsoidTerrainProvider())
+          }
+        })
     } else {
       initViewer(new Cesium.EllipsoidTerrainProvider())
     }

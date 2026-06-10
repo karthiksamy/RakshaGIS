@@ -1420,8 +1420,10 @@ if command -v node &> /dev/null && [[ -d "$SCRIPT_DIR/frontend" ]]; then
     [[ -f "node_modules/vite/dist/node/cli.js" ]] && _VITE_OK=true
     if [[ "$(cat "$NPM_HASH_FILE" 2>/dev/null)" != "$NPM_HASH" ]] || \
        [[ ! -d node_modules ]] || [[ "$_VITE_OK" == false ]]; then
-      [[ "$_VITE_OK" == false && -d node_modules ]] && \
-        echo "    node_modules incomplete (vite/dist/node/cli.js missing) — reinstalling..."
+      if [[ "$_VITE_OK" == false && -d node_modules ]]; then
+        echo "    node_modules has stale absolute paths (vite/dist/node/cli.js missing) — removing and reinstalling..."
+        rm -rf node_modules
+      fi
       echo "    Installing npm dependencies..."
       npm install
       echo "$NPM_HASH" > "$NPM_HASH_FILE"

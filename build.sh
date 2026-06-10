@@ -90,7 +90,225 @@ usage() {
   echo "                      Requires internet once. Import takes 2-4 hours."
   echo "  --port PORT         Host port for the web UI nginx (default: 80)."
   echo "                      Use when port 80 is already occupied by another project."
+  echo "  --uninstall         Remove all RakshaGIS containers, networks, and built images."
+  echo "                      Prompts before deleting data directory or .env."
   echo "  -h, --help          Show this help"
+  echo ""
+}
+
+# ── Uninstall ─────────────────────────────────────────────────────────────────
+# Helper: stop a specific Docker Compose profile and remove its containers.
+_uninstall_profile() {
+  local profile="$1"
+  docker compose --profile "$profile" down --remove-orphans 2>/dev/null || true
+}
+
+# Helper: delete a directory (tries direct rm, falls back to sudo).
+_rm_dir() {
+  local dir="$1"
+  if [[ -d "$dir" ]]; then
+    rm -rf "$dir" 2>/dev/null || sudo rm -rf "$dir" 2>/dev/null \
+      && echo "    ✓ Deleted: $dir" \
+      || echo "    ⚠ Could not delete $dir — remove it manually."
+  else
+    echo "    – Directory not found: $dir (nothing to delete)"
+  fi
+}
+
+uninstall_rakshagis() {
+  print_banner
+  echo -e "${RED}${BOLD}⚠  RakshaGIS — Step-by-Step Uninstall${RESET}"
+  echo ""
+  echo "  You will be asked about each component individually."
+  echo "  Answer 'n' to keep a component; 'y' to remove it."
+  echo ""
+  echo -e "  ${BOLD}Images removed:${RESET}  ONLY rakshagis:web and rakshagis:print-service"
+  echo -e "  ${BOLD}Images kept:${RESET}     postgres · redis · nginx · onlyoffice · ALL others"
+  echo -e "  ${GREEN}Other Docker projects on this host will NOT be affected.${RESET}"
+  echo ""
+  read -rp "  Start uninstall wizard? [y/N]: " _start
+  if [[ "${_start,,}" != "y" ]]; then
+    echo "  Aborted. Nothing was changed."
+    exit 0
+  fi
+
+  # Read DATA_DIR from .env (needed for data deletion steps)
+  local _data_dir
+  _data_dir=$(grep "^DATA_DIR=" "${SCRIPT_DIR}/.env" 2>/dev/null \
+              | cut -d= -f2- | tr -d '\r"'"'"' ')
+
+  local _removed_components=()
+
+  # ── [1] OSM offline tile server ──────────────────────────────────────────────
+  echo ""
+  echo -e "${BOLD}[1/5] OSM Offline Tile Server${RESET}"
+  echo "      Containers: rakshagis-osm-tiles-1"
+  echo "      Data:       ${_data_dir}/tiles/  (~15-20 GB — India OSM tile cache)"
+  read -rp "      Remove OSM tile server and data? [y/N]: " _r
+  if [[ "${_r,,}" == "y" ]]; then
+    echo "    Stopping osm-tiles container…"
+    _uninstall_profile osm
+    read -rp "      Delete tile data directory (${_data_dir}/tiles)? [y/N]: " _rd
+    if [[ "${_rd,,}" == "y" ]]; then
+      _rm_dir "${_data_dir}/tiles"
+    else
+      echo "      Data kept."
+    fi
+    _removed_components+=("OSM tile server")
+  else
+    echo "      Kept."
+  fi
+
+  # ── [2] Terrain elevation server ─────────────────────────────────────────────
+  echo ""
+  echo -e "${BOLD}[2/5] Terrain Elevation Server (SRTM / Cesium 3D)${RESET}"
+  echo "      Containers: rakshagis-terrain-server-1"
+  echo "      Data:       ${_data_dir}/terrain/  (SRTM tiles + quantized-mesh output)"
+  read -rp "      Remove terrain server and data? [y/N]: " _r
+  if [[ "${_r,,}" == "y" ]]; then
+    echo "    Stopping terrain-server container…"
+    _uninstall_profile terrain
+    read -rp "      Delete terrain data directory (${_data_dir}/terrain)? [y/N]: " _rd
+    if [[ "${_rd,,}" == "y" ]]; then
+      _rm_dir "${_data_dir}/terrain"
+    else
+      echo "      Data kept."
+    fi
+    _removed_components+=("Terrain elevation server")
+  else
+    echo "      Kept."
+  fi
+
+  # ── [3] OnlyOffice document server ───────────────────────────────────────────
+  echo ""
+  echo -e "${BOLD}[3/5] OnlyOffice Document Server${RESET}"
+  echo "      Containers: rakshagis-onlyoffice-1"
+  echo "      Data:       ${_data_dir}/onlyoffice/"
+  echo "      Image:      onlyoffice/documentserver  (third-party — kept)"
+  read -rp "      Remove OnlyOffice container and its data? [y/N]: " _r
+  if [[ "${_r,,}" == "y" ]]; then
+    echo "    Stopping onlyoffice container…"
+    docker compose stop onlyoffice 2>/dev/null || true
+    docker compose rm -f onlyoffice 2>/dev/null || true
+    read -rp "      Delete OnlyOffice data (${_data_dir}/onlyoffice)? [y/N]: " _rd
+    if [[ "${_rd,,}" == "y" ]]; then
+      _rm_dir "${_data_dir}/onlyoffice"
+    else
+      echo "      Data kept."
+    fi
+    _removed_components+=("OnlyOffice")
+  else
+    echo "      Kept."
+  fi
+
+  # ── [4] Monitoring (Prometheus + Grafana) ────────────────────────────────────
+  echo ""
+  echo -e "${BOLD}[4/5] Monitoring — Prometheus + Grafana${RESET}"
+  echo "      Containers: rakshagis-prometheus-1, rakshagis-grafana-1"
+  echo "      Data:       ${_data_dir}/prometheus/  ${_data_dir}/grafana/"
+  read -rp "      Remove monitoring stack and data? [y/N]: " _r
+  if [[ "${_r,,}" == "y" ]]; then
+    echo "    Stopping monitoring containers…"
+    _uninstall_profile monitoring
+    read -rp "      Delete monitoring data? [y/N]: " _rd
+    if [[ "${_rd,,}" == "y" ]]; then
+      _rm_dir "${_data_dir}/prometheus"
+      _rm_dir "${_data_dir}/grafana"
+    else
+      echo "      Data kept."
+    fi
+    _removed_components+=("Monitoring")
+  else
+    echo "      Kept."
+  fi
+
+  # ── [5] RakshaGIS core ───────────────────────────────────────────────────────
+  echo ""
+  echo -e "${BOLD}[5/5] RakshaGIS Core Application${RESET}"
+  echo "      Containers: web, celery, nginx, db, redis, pg_tileserv, print-service"
+  echo "      Images:     rakshagis:web, rakshagis:print-service  (project-built — WILL be deleted)"
+  echo "      Data:       ${_data_dir}/postgres   — database"
+  echo "                  ${_data_dir}/media      — uploaded files"
+  echo "                  ${_data_dir}/staticfiles"
+  echo "                  ${_data_dir}/models     — AI model files"
+  read -rp "      Remove core application? [y/N]: " _r
+  if [[ "${_r,,}" == "y" ]]; then
+    echo "    Stopping all remaining containers…"
+    docker compose \
+      --profile docker-ollama --profile docker-ollama-gpu \
+      --profile localai --profile localai-gpu \
+      --profile llamacpp --profile llamacpp-gpu \
+      --profile anythingllm --profile anythingllm-gpu \
+      down --remove-orphans 2>/dev/null || true
+
+    echo "    Removing project-built images (rakshagis:* only)…"
+    # Safety: ONLY remove images with the rakshagis: prefix — never touch third-party images.
+    for img in rakshagis:web rakshagis:print-service; do
+      if [[ "$img" != rakshagis:* ]]; then
+        echo "      ⚠ SKIPPED (safety): $img is not a rakshagis: image"
+        continue
+      fi
+      if docker image inspect "$img" &>/dev/null 2>&1; then
+        docker rmi "$img" 2>/dev/null \
+          && echo "      ✓ Removed: $img" \
+          || echo "      ⚠ Could not remove $img (container still using it?)"
+      else
+        echo "      – Not present: $img"
+      fi
+    done
+
+    # Stale project networks
+    for net in $(docker network ls --filter "name=rakshagis_" --format "{{.Name}}" 2>/dev/null); do
+      docker network rm "$net" 2>/dev/null && echo "      ✓ Removed network: $net" || true
+    done
+
+    # Data subdirectories
+    echo ""
+    read -rp "      Delete database (${_data_dir}/postgres)? [y/N]: " _rd
+    [[ "${_rd,,}" == "y" ]] && _rm_dir "${_data_dir}/postgres" || echo "      Kept."
+
+    read -rp "      Delete uploaded files (${_data_dir}/media)? [y/N]: " _rd
+    [[ "${_rd,,}" == "y" ]] && _rm_dir "${_data_dir}/media" || echo "      Kept."
+
+    read -rp "      Delete AI models (${_data_dir}/models) — can be re-downloaded? [y/N]: " _rd
+    [[ "${_rd,,}" == "y" ]] && _rm_dir "${_data_dir}/models" || echo "      Kept."
+
+    read -rp "      Delete remaining data dir (${_data_dir})? [y/N]: " _rd
+    [[ "${_rd,,}" == "y" ]] && _rm_dir "${_data_dir}" || echo "      Kept."
+
+    # .env
+    if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+      read -rp "      Remove .env configuration file? [y/N]: " _del_env
+      if [[ "${_del_env,,}" == "y" ]]; then
+        rm -f "${SCRIPT_DIR}/.env"
+        echo "      ✓ .env removed"
+      else
+        echo "      .env kept."
+      fi
+    fi
+
+    _removed_components+=("RakshaGIS core")
+  else
+    echo "      Kept."
+  fi
+
+  # ── Summary ──────────────────────────────────────────────────────────────────
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════╗"
+  echo "║            RakshaGIS Uninstall Complete                 ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  if [[ ${#_removed_components[@]} -eq 0 ]]; then
+    echo "║  Nothing was removed.                                   ║"
+  else
+    echo "║  Removed components:                                    ║"
+    for c in "${_removed_components[@]}"; do
+      printf "║    ✓ %-51s║\n" "$c"
+    done
+    echo "╠══════════════════════════════════════════════════════════╣"
+    echo "║  Third-party images (postgres, redis, nginx…) kept.    ║"
+    echo "║  Other Docker projects on this host are unaffected.    ║"
+  fi
+  echo "╚══════════════════════════════════════════════════════════╝"
   echo ""
 }
 
@@ -127,6 +345,8 @@ while [[ $# -gt 0 ]]; do
       IMPORT_OSM=true; shift ;;
     --port)
       HOST_PORT="$2"; shift 2 ;;
+    --uninstall)
+      uninstall_rakshagis; exit 0 ;;
     -h|--help)
       usage; exit 0 ;;
     *)

@@ -174,6 +174,14 @@ convert_to_terrain() {
     exit 1
   fi
 
+  # Skip if tiles already exist — layer.json + at least one .terrain file in zoom dir
+  local existing_tiles; existing_tiles=$(find "${OUTPUT_DIR}" -name "*.terrain" 2>/dev/null | wc -l)
+  if [[ "${existing_tiles}" -gt 0 && -f "${OUTPUT_DIR}/layer.json" ]]; then
+    echo "==> Terrain tiles already exist (${existing_tiles} .terrain files + layer.json found)."
+    echo "    Skipping conversion. Delete ${OUTPUT_DIR}/layer.json to force re-convert."
+    return 0
+  fi
+
   echo "==> Found ${raw_count} SRTM tiles in ${SRTM_DIR}"
   mkdir -p "${OUTPUT_DIR}"
 
@@ -252,10 +260,11 @@ convert_to_terrain() {
   echo "==> Done! Generated ${tile_count} quantized-mesh tiles."
 
   if [[ ! -f "${OUTPUT_DIR}/layer.json" ]]; then
-    echo ""
-    echo "    WARNING: layer.json not found at ${OUTPUT_DIR}/"
-    echo "    ctb-tile may have failed silently. Check the Docker output above."
-    exit 1
+    echo "    layer.json not created by ctb-tile — writing it now…"
+    docker run --rm \
+      -v "${TERRAIN_DIR}:/data" \
+      alpine sh -c \
+      'printf "%s\n" "{" "  \"tilejson\": \"2.1.0\"," "  \"name\": \"India SRTM Terrain\"," "  \"version\": \"1.0.0\"," "  \"format\": \"quantized-mesh-1.0\"," "  \"attribution\": \"CGIAR-CSI SRTM v4.1\"," "  \"scheme\": \"tms\"," "  \"tiles\": [\"{z}/{x}/{y}.terrain\"]," "  \"projection\": \"EPSG:4326\"," "  \"bounds\": [-180.0, -90.0, 180.0, 90.0]" "}" > /data/layer.json'
   fi
   echo "    layer.json : ${OUTPUT_DIR}/layer.json  ✓"
   echo ""

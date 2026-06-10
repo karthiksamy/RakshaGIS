@@ -617,7 +617,7 @@ echo ""
 echo -e "  ${BOLD}[2] India Terrain Elevation Server (Cesium 3D)${RESET}"
 echo "      SRTM elevation → quantized-mesh tiles for 3D terrain in Cesium."
 echo "      Download : ~2-6 GB  |  Convert : 30-60 min  |  Disk : ~10 GB"
-if [[ -n "$(find "$DATA_DIR/terrain/tilesets/terrain" -name "*.terrain" 2>/dev/null | head -1)" ]]; then
+if [[ -n "$(find "$DATA_DIR/terrain" -name "*.terrain" 2>/dev/null | head -1)" ]]; then
   echo -e "      ${GREEN}✓ Terrain tiles already present — terrain server will be started.${RESET}"
   OPT_TERRAIN=true; OPT_TERRAIN_SKIP_DOWNLOAD=true
 else
@@ -724,7 +724,7 @@ echo ">>> Creating data directories..."
 _CORE_SUBDIRS="postgres redis staticfiles media logs backups images certbot/conf certbot/www models/ollama models/localai models/llamacpp models/anythingllm"
 [[ "$OPT_MONITORING" == true ]] && _CORE_SUBDIRS="$_CORE_SUBDIRS prometheus grafana"
 [[ "$OPT_OSM" == true ]]        && _CORE_SUBDIRS="$_CORE_SUBDIRS tiles/osm-data tiles/tile-cache"
-[[ "$OPT_TERRAIN" == true ]]    && _CORE_SUBDIRS="$_CORE_SUBDIRS terrain terrain/srtm_raw terrain/tilesets/terrain"
+[[ "$OPT_TERRAIN" == true ]]    && _CORE_SUBDIRS="$_CORE_SUBDIRS terrain terrain/srtm_raw"
 [[ "$OPT_ONLYOFFICE" == true ]] && _CORE_SUBDIRS="$_CORE_SUBDIRS onlyoffice/data onlyoffice/logs onlyoffice/cache"
 
 for sub in $_CORE_SUBDIRS; do

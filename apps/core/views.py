@@ -751,6 +751,482 @@ class TerrainExportGeoTIFFView(APIView):
         return resp
 
 
+class DEMAnalysisView(APIView):
+    """
+    POST /api/core/terrain/dem-analysis/
+
+    Unified DEM analysis engine.  Body:
+      { type: str, elevGrid: float[], bbox: [minLon,minLat,maxLon,maxLat], gridN: int, params: {} }
+
+    Supported types:
+      contours | aspect_map | curvature | viewshed | volume | cut_fill
+      flood    | landslide  | watershed | cross_section
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    # ── shared helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _setup(request):
+        import math, numpy as np
+        elev_flat = request.data.get('elevGrid', [])
+        bbox      = request.data.get('bbox', [])
+        grid_n    = int(request.data.get('gridN', 50))
+        params    = request.data.get('params', {})
+
+        if not elev_flat or len(elev_flat) != grid_n * grid_n or len(bbox) != 4:
+            raise ValueError('Invalid grid data')
+
+        min_lon, min_lat, max_lon, max_lat = [float(v) for v in bbox]
+        elev_arr = np.array(elev_flat, dtype=np.float32).reshape(grid_n, grid_n)
+
+        def _hav(la1, lo1, la2, lo2):
+            R = 6_371_000
+            a = math.sin(math.radians(la2-la1)/2)**2 + \
+                math.cos(math.radians(la1))*math.cos(math.radians(la2))*math.sin(math.radians(lo2-lo1)/2)**2
+            return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+        dx = _hav(min_lat, min_lon, min_lat, max_lon) / max(grid_n - 1, 1)
+        dy = _hav(min_lat, min_lon, max_lat, min_lon) / max(grid_n - 1, 1)
+
+        gy, gx      = np.gradient(elev_arr, dy, dx)
+        slope_arr   = np.degrees(np.arctan(np.sqrt(gx**2 + gy**2))).astype(np.float32)
+        asp_deg     = np.degrees(np.arctan2(gx, -gy))
+        asp_arr     = np.where(asp_deg < 0, asp_deg + 360, asp_deg).astype(np.float32)
+
+        return (elev_arr, slope_arr, asp_arr, gx, gy,
+                dx, dy, min_lon, min_lat, max_lon, max_lat, grid_n, params)
+
+    @staticmethod
+    def _to_png_b64(rgba_arr):
+        import io, base64
+        from PIL import Image
+        img = Image.fromarray(rgba_arr.astype('uint8'), 'RGBA')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+
+    # ── analysis methods ──────────────────────────────────────────────────────
+
+    def _contours(self, elev_arr, min_lon, min_lat, max_lon, max_lat, params):
+        import json, numpy as np
+        from osgeo import gdal, osr, ogr
+
+        ny, nx  = elev_arr.shape
+        relief  = float(elev_arr.max() - elev_arr.min())
+        default_ivl = 1
+        for nice in [1,2,5,10,20,25,50,100,200,500]:
+            if relief / nice <= 20:
+                default_ivl = nice; break
+        interval     = float(params.get('interval', default_ivl))
+        index_factor = int(params.get('index_factor', 5))
+
+        elev_flip = np.flipud(elev_arr)
+        pw = (max_lon - min_lon) / max(nx - 1, 1)
+        ph = (max_lat - min_lat) / max(ny - 1, 1)
+
+        mem_drv = gdal.GetDriverByName('MEM')
+        rds = mem_drv.Create('', nx, ny, 1, gdal.GDT_Float32)
+        rds.SetGeoTransform([min_lon - pw/2, pw, 0, max_lat + ph/2, 0, -ph])
+        srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
+        rds.SetProjection(srs.ExportToWkt())
+        rds.GetRasterBand(1).WriteArray(elev_flip)
+
+        ods  = ogr.GetDriverByName('Memory').CreateDataSource('c')
+        olyr = ods.CreateLayer('c', srs, ogr.wkbLineString)
+        olyr.CreateField(ogr.FieldDefn('ELEV', ogr.OFTReal))
+        gdal.ContourGenerate(rds.GetRasterBand(1), interval, 0, [], 0, 0, olyr, -1,
+                             olyr.GetLayerDefn().GetFieldIndex('ELEV'))
+
+        features = []
+        for feat in olyr:
+            elv  = feat.GetField('ELEV')
+            geom = feat.GetGeometryRef()
+            if not geom: continue
+            is_idx = int(round(elv / interval)) % index_factor == 0
+            features.append({'type': 'Feature',
+                'geometry': json.loads(geom.ExportToJson()),
+                'properties': {'elevation': elv, 'label': f'{int(elv)} m',
+                    'is_index': is_idx,
+                    'color': '#ffd700' if is_idx else '#88ccff',
+                    'width': 2.5 if is_idx else 1.2}})
+        rds = None; ods = None
+
+        return {'type': 'contours',
+                'geojson': {'type': 'FeatureCollection', 'features': features},
+                'stats': {'interval_m': interval, 'count': len(features),
+                          'index_every': index_factor,
+                          'min_elev_m': round(float(elev_arr.min()), 1),
+                          'max_elev_m': round(float(elev_arr.max()), 1),
+                          'relief_m': round(relief, 1)}}
+
+    def _aspect_map(self, elev_arr, asp_arr, slope_arr, params):
+        import numpy as np
+        ny, nx = asp_arr.shape
+        rgba = np.zeros((ny, nx, 4), dtype=np.uint8)
+
+        # HSV-like colour wheel: 0°N=blue, 90°E=red, 180°S=yellow, 270°W=green
+        hue   = asp_arr / 360.0
+        h6    = hue * 6; hi = np.floor(h6).astype(int) % 6; f = h6 - np.floor(h6); q = 1 - f
+        maps  = [(1,f,0),(q,1,0),(0,1,f),(0,q,1),(f,0,1),(1,0,q)]
+        r = np.zeros((ny,nx)); g = np.zeros((ny,nx)); b = np.zeros((ny,nx))
+        for i,(rv,gv,bv) in enumerate(maps):
+            m = (hi == i)
+            r[m] = (rv if np.isscalar(rv) else rv[m]) * 255
+            g[m] = (gv if np.isscalar(gv) else gv[m]) * 255
+            b[m] = (bv if np.isscalar(bv) else bv[m]) * 255
+
+        rgba[:,:,0] = np.clip(r,0,255); rgba[:,:,1] = np.clip(g,0,255)
+        rgba[:,:,2] = np.clip(b,0,255); rgba[:,:,3] = 200
+        flat = slope_arr < 0.5
+        rgba[flat] = [160,160,160,80]
+
+        total = int((~flat).sum()) or 1
+        def pct(m): return round(float(m.sum())/total*100, 1)
+        A = asp_arr
+        stats = {
+            'N':  pct((A>=315)|(A<45)), 'NE': pct((A>=45)&(A<90)),
+            'E':  pct((A>=90)&(A<135)),'SE': pct((A>=135)&(A<180)),
+            'S':  pct((A>=180)&(A<225)),'SW': pct((A>=225)&(A<270)),
+            'W':  pct((A>=270)&(A<315)),'NW': pct((A>=315)&(A<360)),
+            'flat_pct': round(float(flat.sum())/flat.size*100,1),
+        }
+        dom = max(['N','NE','E','SE','S','SW','W','NW'], key=lambda k: stats[k])
+        stats['dominant'] = dom
+
+        return {'type': 'aspect_map', 'image': self._to_png_b64(rgba), 'stats': stats}
+
+    def _curvature(self, elev_arr, dx, dy, params):
+        import numpy as np
+        ny, nx = elev_arr.shape
+
+        # Second derivatives via central differences
+        Dxx = np.zeros_like(elev_arr); Dyy = np.zeros_like(elev_arr); Dxy = np.zeros_like(elev_arr)
+        Dxx[:,1:-1] = (elev_arr[:,:-2] - 2*elev_arr[:,1:-1] + elev_arr[:,2:]) / (dx**2)
+        Dxx[:,0]=Dxx[:,1]; Dxx[:,-1]=Dxx[:,-2]
+        Dyy[1:-1,:] = (elev_arr[:-2,:] - 2*elev_arr[1:-1,:] + elev_arr[2:,:]) / (dy**2)
+        Dyy[0,:]=Dyy[1,:]; Dyy[-1,:]=Dyy[-2,:]
+        Dxy[1:-1,1:-1] = (elev_arr[:-2,2:]-elev_arr[:-2,:-2]-elev_arr[2:,2:]+elev_arr[2:,:-2])/(4*dx*dy)
+        Dxy[0,:]=Dxy[1,:]; Dxy[-1,:]=Dxy[-2,:]; Dxy[:,0]=Dxy[:,1]; Dxy[:,-1]=Dxy[:,-2]
+
+        gy, gx = np.gradient(elev_arr, dy, dx)
+        p2 = gx**2; q2 = gy**2; pq = p2 + q2 + 1e-12
+
+        profile = -(Dxx*p2 + 2*Dxy*gx*gy + Dyy*q2) / (pq * np.sqrt(pq + 1))
+        plan    = (Dxx*q2 - 2*Dxy*gx*gy + Dyy*p2) / pq
+        total   = -(Dxx + Dyy)
+
+        ctype = params.get('curvature_type', 'total')
+        arr   = {'total': total, 'profile': profile, 'plan': plan}.get(ctype, total)
+
+        # Diverge: blue=concave(+), white=flat(0), red=convex(-)
+        mn = float(np.percentile(arr, 2)); mx = float(np.percentile(arr, 98))
+        norm = np.clip((arr - mn) / max(mx - mn, 1e-6), 0, 1)
+        rgba = np.zeros((ny, nx, 4), dtype=np.uint8)
+        rgba[:,:,0] = np.clip(np.where(norm>=0.5, 255, norm*2*255), 0, 255).astype(np.uint8)
+        rgba[:,:,1] = np.clip(255*(1-np.abs(norm-0.5)*2), 80, 255).astype(np.uint8)
+        rgba[:,:,2] = np.clip(np.where(norm<=0.5, 255, (1-norm)*2*255), 0, 255).astype(np.uint8)
+        rgba[:,:,3] = 200
+
+        return {'type': 'curvature', 'image': self._to_png_b64(rgba),
+                'stats': {'type': ctype,
+                          'min': round(float(arr.min()),4), 'max': round(float(arr.max()),4),
+                          'mean': round(float(arr.mean()),4),
+                          'concave_pct': round(float((arr>0).sum())/arr.size*100, 1),
+                          'convex_pct':  round(float((arr<0).sum())/arr.size*100, 1)}}
+
+    def _viewshed(self, elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params):
+        import numpy as np
+        ny, nx = elev_arr.shape
+        obs_lat = float(params.get('observer_lat', (min_lat+max_lat)/2))
+        obs_lon = float(params.get('observer_lon', (min_lon+max_lon)/2))
+        obs_h   = float(params.get('observer_height', 2.0))
+
+        obs_xi = int(np.clip((obs_lon-min_lon)/(max_lon-min_lon)*(nx-1), 0, nx-1))
+        obs_yi = int(np.clip((obs_lat-min_lat)/(max_lat-min_lat)*(ny-1), 0, ny-1))
+        obs_e  = float(elev_arr[obs_yi, obs_xi]) + obs_h
+
+        tgt_y = np.arange(ny)[:,None].repeat(nx,axis=1).astype(float)
+        tgt_x = np.arange(nx)[None,:].repeat(ny,axis=0).astype(float)
+        visible = np.ones((ny,nx), dtype=bool)
+
+        for step in range(1, int(max(ny,nx)*1.5)+1):
+            n_steps = np.maximum(np.abs(tgt_y-obs_yi), np.abs(tgt_x-obs_xi))
+            frac    = np.where(n_steps>0, step/n_steps, 1.0)
+            in_path = (frac>0.0) & (frac<1.0)
+            if not in_path.any(): break
+
+            sy = np.round(obs_yi + frac*(tgt_y-obs_yi)).astype(int).clip(0,ny-1)
+            sx = np.round(obs_xi + frac*(tgt_x-obs_xi)).astype(int).clip(0,nx-1)
+
+            terrain_h = elev_arr[sy, sx].astype(float)
+            required  = obs_e + frac*(elev_arr.astype(float) - obs_e)
+            visible  &= ~(in_path & (terrain_h > required + 0.5))
+
+        rgba = np.zeros((ny,nx,4), dtype=np.uint8)
+        rgba[visible]  = [80,210,100,180]
+        rgba[~visible] = [210,70,50,140]
+        rgba[obs_yi,obs_xi] = [255,255,0,255]
+
+        vis_pct = round(float(visible.sum())/(ny*nx)*100, 1)
+        return {'type': 'viewshed', 'image': self._to_png_b64(rgba),
+                'stats': {'observer_lat': obs_lat, 'observer_lon': obs_lon,
+                          'observer_height_m': obs_h,
+                          'observer_elev_m': round(obs_e - obs_h, 1),
+                          'visible_pct': vis_pct,
+                          'not_visible_pct': round(100-vis_pct,1),
+                          'visible_cells': int(visible.sum())}}
+
+    def _volume(self, elev_arr, dx, dy, params):
+        import numpy as np
+        ref = float(params.get('reference_elevation', float(elev_arr.min())))
+        cell_area = dx * dy
+        diff = elev_arr.astype(float) - ref
+
+        cut_vol  = float(diff[diff>0].sum()) * cell_area
+        fill_vol = float((-diff[diff<0]).sum()) * cell_area
+        cut_area  = float((diff>0).sum()) * cell_area
+        fill_area = float((diff<0).sum()) * cell_area
+
+        max_diff = float(np.abs(diff).max()) or 1.0
+        rgba = np.zeros((*elev_arr.shape, 4), dtype=np.uint8)
+        cut  = diff > 0; fill = diff < 0
+        ic = np.clip(diff/max_diff, 0, 1); fi = np.clip(-diff/max_diff, 0, 1)
+        rgba[cut,  0] = np.clip(180+75*ic[cut],  0,255).astype(np.uint8)
+        rgba[cut,  1] = np.clip(100-70*ic[cut],  0,255).astype(np.uint8)
+        rgba[cut,  3] = 190
+        rgba[fill, 2] = np.clip(180+75*fi[fill], 0,255).astype(np.uint8)
+        rgba[fill, 1] = np.clip(80+80*fi[fill],  0,255).astype(np.uint8)
+        rgba[fill, 3] = 190
+        rgba[diff==0] = [255,255,255,80]
+
+        return {'type': 'volume', 'image': self._to_png_b64(rgba),
+                'stats': {'reference_elevation_m': round(ref,1),
+                          'cut_volume_m3':  round(cut_vol,1),
+                          'fill_volume_m3': round(fill_vol,1),
+                          'net_volume_m3':  round(cut_vol-fill_vol,1),
+                          'cut_area_m2':    round(cut_area,1),
+                          'fill_area_m2':   round(fill_area,1),
+                          'cut_area_ha':    round(cut_area/10000,3),
+                          'fill_area_ha':   round(fill_area/10000,3)}}
+
+    def _flood(self, elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params):
+        import numpy as np
+        from collections import deque
+        ny, nx = elev_arr.shape
+        water_level = float(params.get('water_level', float(elev_arr.min())+5.0))
+
+        # Seed point
+        if params.get('seed_lat') is not None:
+            sy = int(np.clip((float(params['seed_lat'])-min_lat)/(max_lat-min_lat)*(ny-1), 0, ny-1))
+            sx = int(np.clip((float(params['seed_lon'])-min_lon)/(max_lon-min_lon)*(nx-1), 0, nx-1))
+        else:
+            idx = int(np.argmin(elev_arr)); sy, sx = idx//nx, idx%nx
+
+        flooded = np.zeros((ny,nx), dtype=bool)
+        if elev_arr[sy,sx] <= water_level:
+            q = deque([(sy,sx)]); flooded[sy,sx] = True
+            while q:
+                y,x = q.popleft()
+                for dy2,dx2 in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    ny2,nx2 = y+dy2, x+dx2
+                    if 0<=ny2<ny and 0<=nx2<nx and not flooded[ny2,nx2]:
+                        if elev_arr[ny2,nx2] <= water_level:
+                            flooded[ny2,nx2]=True; q.append((ny2,nx2))
+
+        depth    = np.where(flooded, water_level - elev_arr, 0).astype(np.float32)
+        max_depth = float(depth.max()) or 1.0
+        nd = depth/max_depth
+
+        rgba = np.zeros((ny,nx,4), dtype=np.uint8)
+        rgba[flooded, 0] = np.clip(20 +80*(1-nd[flooded]), 0,255).astype(np.uint8)
+        rgba[flooded, 1] = np.clip(80 +80*(1-nd[flooded]), 0,255).astype(np.uint8)
+        rgba[flooded, 2] = np.clip(180+75*(1-nd[flooded]), 0,255).astype(np.uint8)
+        rgba[flooded, 3] = 210
+        rgba[sy,sx] = [255,200,0,255]
+
+        cell_area = dx*dy
+        fa = float(flooded.sum())*cell_area
+        return {'type': 'flood', 'image': self._to_png_b64(rgba),
+                'stats': {'water_level_m': water_level,
+                          'max_depth_m':    round(float(depth.max()),2),
+                          'avg_depth_m':    round(float(depth[flooded].mean()) if flooded.any() else 0, 2),
+                          'flooded_area_m2': round(fa,1),
+                          'flooded_area_ha': round(fa/10000,2),
+                          'flooded_pct':    round(float(flooded.sum())/(ny*nx)*100,1)}}
+
+    def _landslide(self, elev_arr, slope_arr, dx, dy, params):
+        import numpy as np
+        ny, nx = elev_arr.shape
+
+        Dxx = np.zeros_like(elev_arr); Dyy = np.zeros_like(elev_arr)
+        Dxx[:,1:-1] = (elev_arr[:,:-2]-2*elev_arr[:,1:-1]+elev_arr[:,2:])/(dx**2)
+        Dxx[:,0]=Dxx[:,1]; Dxx[:,-1]=Dxx[:,-2]
+        Dyy[1:-1,:] = (elev_arr[:-2,:]-2*elev_arr[1:-1,:]+elev_arr[2:,:])/(dy**2)
+        Dyy[0,:]=Dyy[1,:]; Dyy[-1,:]=Dyy[-2,:]
+        lap = Dxx+Dyy
+        lap_n = (lap-lap.min()) / max(float(lap.max()-lap.min()), 1e-6) * 100
+
+        elev_n  = (elev_arr-elev_arr.min()) / max(float(elev_arr.max()-elev_arr.min()), 1) * 100
+        s_score = np.clip(slope_arr/45.0*100, 0, 100)
+        risk    = np.clip(0.65*s_score + 0.25*lap_n + 0.10*elev_n, 0, 100).astype(np.float32)
+
+        norm = risk/100.0
+        rgba = np.zeros((ny,nx,4), dtype=np.uint8)
+        rgba[:,:,0] = np.clip(255*np.minimum(norm*2,1),    0,255).astype(np.uint8)
+        rgba[:,:,1] = np.clip(255*(1-np.maximum(norm*2-1,0)),0,255).astype(np.uint8)
+        rgba[:,:,2] = 0; rgba[:,:,3] = 200
+
+        def pct(m): return round(float(m.sum())/risk.size*100,1)
+        return {'type': 'landslide', 'image': self._to_png_b64(rgba),
+                'stats': {'low_pct':      pct(risk<25),
+                          'moderate_pct': pct((risk>=25)&(risk<50)),
+                          'high_pct':     pct((risk>=50)&(risk<75)),
+                          'very_high_pct':pct(risk>=75),
+                          'avg_score':    round(float(risk.mean()),1),
+                          'note': 'Model: slope 65% + curvature 25% + elevation 10%'}}
+
+    def _watershed(self, elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params):
+        import numpy as np
+        ny, nx = elev_arr.shape
+
+        # Pit fill
+        filled = elev_arr.copy().astype(np.float64)
+        for _ in range(40):
+            pad = np.pad(filled, 1, mode='edge')
+            nbr_min = np.minimum.reduce([pad[:-2,:-2],pad[:-2,1:-1],pad[:-2,2:],
+                                         pad[1:-1,:-2],              pad[1:-1,2:],
+                                         pad[2:,:-2], pad[2:,1:-1], pad[2:,2:]])
+            pit = filled < nbr_min
+            if not pit.any(): break
+            filled[pit] = nbr_min[pit]+0.001
+
+        # D8 flow direction
+        ddy = [-1,-1,-1,0,0,1,1,1]
+        ddx = [-1,0,1,-1,1,-1,0,1]
+        dists = [1.414,1,1.414,1,1,1.414,1,1.414]
+        drops = np.full((8,ny,nx),-np.inf)
+        for i,(dy2,dx2,ds) in enumerate(zip(ddy,ddx,dists)):
+            y0=max(0,-dy2); y1=ny+min(0,-dy2)
+            x0=max(0,-dx2); x1=nx+min(0,-dx2)
+            ny0=max(0,dy2);  ny1=ny+min(0,dy2)
+            nx0=max(0,dx2);  nx1=nx+min(0,dx2)
+            drops[i,y0:y1,x0:x1] = (filled[y0:y1,x0:x1]-filled[ny0:ny1,nx0:nx1])/ds
+
+        flow_dir = np.argmax(drops,axis=0).astype(np.int8)
+        flow_dir[drops.max(axis=0)<=0] = -1
+
+        # Flow accumulation
+        accum = np.ones((ny,nx), dtype=np.int32)
+        for flat_idx in np.argsort(filled.ravel())[::-1]:
+            y,x = int(flat_idx//nx), int(flat_idx%nx)
+            d = int(flow_dir[y,x])
+            if d<0: continue
+            ny2,nx2 = y+ddy[d], x+ddx[d]
+            if 0<=ny2<ny and 0<=nx2<nx:
+                accum[ny2,nx2] += accum[y,x]
+
+        # Pour point
+        if params.get('pour_lat') is not None:
+            py = int(np.clip((float(params['pour_lat'])-min_lat)/(max_lat-min_lat)*(ny-1),0,ny-1))
+            px = int(np.clip((float(params['pour_lon'])-min_lon)/(max_lon-min_lon)*(nx-1),0,nx-1))
+        else:
+            fi = int(np.argmax(accum)); py,px = fi//nx, fi%nx
+
+        # Upstream BFS
+        reverse = {0:7,1:6,2:5,3:4,4:3,5:2,6:1,7:0}
+        ws = np.zeros((ny,nx), dtype=bool); ws[py,px]=True
+        q  = [(py,px)]
+        while q:
+            y,x = q.pop()
+            for i,(dy2,dx2) in enumerate(zip(ddy,ddx)):
+                ny2,nx2 = y+dy2, x+dx2
+                if 0<=ny2<ny and 0<=nx2<nx and not ws[ny2,nx2]:
+                    if int(flow_dir[ny2,nx2]) == reverse.get(i,-1):
+                        ws[ny2,nx2]=True; q.append((ny2,nx2))
+
+        rgba = np.zeros((ny,nx,4), dtype=np.uint8)
+        rgba[ws]  = [100,180,255,100]
+        thresh = int(np.percentile(accum[ws],85)) if ws.any() else 99999
+        streams = ws & (accum>thresh)
+        rgba[streams] = [20,80,220,230]
+        rgba[py,px] = [255,50,50,255]
+
+        cell_area = dx*dy; wsa = float(ws.sum())*cell_area
+        return {'type': 'watershed', 'image': self._to_png_b64(rgba),
+                'stats': {'area_m2':  round(wsa,1), 'area_ha': round(wsa/10000,2),
+                          'area_km2': round(wsa/1e6,3),
+                          'pour_lat': round(float(min_lat+py/(ny-1)*(max_lat-min_lat)),6),
+                          'pour_lon': round(float(min_lon+px/(nx-1)*(max_lon-min_lon)),6)}}
+
+    def _cross_section(self, elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params):
+        import numpy as np, math
+        ny, nx = elev_arr.shape
+        transects = params.get('transects', [])
+        if not transects:
+            mid_lat = (min_lat+max_lat)/2; mid_lon = (min_lon+max_lon)/2
+            transects = [
+                {'start':{'lat':min_lat,'lon':mid_lon},'end':{'lat':max_lat,'lon':mid_lon},'label':'N–S'},
+                {'start':{'lat':mid_lat,'lon':min_lon},'end':{'lat':mid_lat,'lon':max_lon},'label':'E–W'},
+            ]
+        n_pts = int(params.get('sample_count', 100))
+        profiles = []
+        for tr in transects:
+            s,e = tr['start'], tr['end']
+            lats = np.linspace(float(s['lat']),float(e['lat']),n_pts)
+            lons = np.linspace(float(s['lon']),float(e['lon']),n_pts)
+            rows = np.clip((lats-min_lat)/(max_lat-min_lat)*(ny-1),0,ny-1).astype(int)
+            cols = np.clip((lons-min_lon)/(max_lon-min_lon)*(nx-1),0,nx-1).astype(int)
+            elevs = elev_arr[rows, cols]
+            dlat  = (float(e['lat'])-float(s['lat']))*111320
+            dlon  = (float(e['lon'])-float(s['lon']))*111320*math.cos(math.radians(float(s['lat'])))
+            total = float(math.sqrt(dlat**2+dlon**2))
+            dists = np.linspace(0,total,n_pts)
+            profiles.append({'label':tr.get('label',f'Section {len(profiles)+1}'),
+                'length_m': round(total,1),
+                'points':[{'dist':round(float(d),1),'elev':round(float(el),2),
+                            'lat':round(float(la),6),'lon':round(float(lo),6)}
+                           for d,el,la,lo in zip(dists,elevs,lats,lons)],
+                'stats':{'min_m':round(float(elevs.min()),1),'max_m':round(float(elevs.max()),1),
+                         'relief_m':round(float(elevs.max()-elevs.min()),1)}})
+        return {'type':'cross_section','profiles':profiles,'stats':{'count':len(profiles)}}
+
+    # ── dispatch ──────────────────────────────────────────────────────────────
+
+    def post(self, request):
+        analysis_type = request.data.get('type','')
+        try:
+            (elev_arr, slope_arr, asp_arr, gx, gy,
+             dx, dy, min_lon, min_lat, max_lon, max_lat, grid_n, params) = self._setup(request)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=400)
+
+        dispatch = {
+            'contours':     lambda: self._contours(elev_arr, min_lon, min_lat, max_lon, max_lat, params),
+            'aspect_map':   lambda: self._aspect_map(elev_arr, asp_arr, slope_arr, params),
+            'curvature':    lambda: self._curvature(elev_arr, dx, dy, params),
+            'viewshed':     lambda: self._viewshed(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'volume':       lambda: self._volume(elev_arr, dx, dy, params),
+            'cut_fill':     lambda: self._volume(elev_arr, dx, dy, params),
+            'flood':        lambda: self._flood(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'landslide':    lambda: self._landslide(elev_arr, slope_arr, dx, dy, params),
+            'watershed':    lambda: self._watershed(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'cross_section':lambda: self._cross_section(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+        }
+        fn = dispatch.get(analysis_type)
+        if not fn:
+            return Response({'error': f'Unknown type: {analysis_type}'}, status=400)
+
+        try:
+            result = fn()
+        except Exception as exc:
+            import traceback
+            return Response({'error': str(exc), 'trace': traceback.format_exc()}, status=500)
+
+        result['bbox'] = [min_lon, min_lat, max_lon, max_lat]
+        return Response(result)
+
+
 # Mapnik export endpoints
 from django.http import HttpResponse, JsonResponse
 from rest_framework.decorators import api_view, permission_classes

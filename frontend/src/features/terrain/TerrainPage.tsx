@@ -7,7 +7,7 @@ import {
 } from 'antd'
 import type { MenuProps } from 'antd'
 import {
-  LineChartOutlined, AreaChartOutlined,
+  LineChartOutlined, AreaChartOutlined, RadarChartOutlined,
   AimOutlined, ReloadOutlined, GlobalOutlined, InfoCircleOutlined,
   CloseOutlined, ColumnHeightOutlined, ExportOutlined,
   FileImageOutlined, FilePdfOutlined, FileTextOutlined, SyncOutlined,
@@ -15,6 +15,7 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import api from '@/services/api'
 import ElevationChart from './ElevationChart'
+import DEMAnalysisPanel, { type DEMLayer } from './DEMAnalysisPanel'
 
 const { Text } = Typography
 
@@ -174,6 +175,8 @@ export default function TerrainPage() {
   const [profileBuilding, setProfileBuilding] = useState(false)
   const [slopeBuilding, setSlopeBuilding] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [panelTab, setPanelTab] = useState<'analysis' | 'dem'>('analysis')
+  const demLayerRefsRef = useRef<Map<string, Cesium.ImageryLayer | Cesium.GeoJsonDataSource>>(new Map())
 
   // Feature extrusion height (0 = drape flat on the terrain; >0 = raise as a volume).
   // Default 0 so parcels render as proper shapes clamped to the ground.
@@ -586,6 +589,48 @@ export default function TerrainPage() {
     viewer.scene.verticalExaggeration = terrainExaggeration
   }, [terrainExaggeration, ready])
 
+  const handleDemOverlay = useCallback((layer: DEMLayer) => {
+    const viewer = viewerRef.current
+    if (!viewer) return
+    const [minLon, minLat, maxLon, maxLat] = layer.bbox
+    const rect = Cesium.Rectangle.fromDegrees(minLon, minLat, maxLon, maxLat)
+
+    if (layer.type === 'image' && layer.imageData) {
+      const provider = new Cesium.SingleTileImageryProvider({ url: layer.imageData, rectangle: rect })
+      const il = viewer.imageryLayers.addImageryProvider(provider)
+      il.alpha = 0.75
+      demLayerRefsRef.current.set(layer.id, il)
+      viewer.camera.flyTo({ destination: rect, duration: 1.5 })
+    } else if (layer.type === 'geojson' && layer.geojson) {
+      Cesium.GeoJsonDataSource.load(layer.geojson, {
+        clampToGround: true,
+        stroke: Cesium.Color.CYAN,
+        fill: Cesium.Color.CYAN.withAlpha(0.2),
+        strokeWidth: 1.5,
+      }).then(ds => {
+        ds.name = `dem-${layer.id}`
+        viewer.dataSources.add(ds)
+        demLayerRefsRef.current.set(layer.id, ds)
+        viewer.camera.flyTo({ destination: rect, duration: 1.5 })
+      })
+    }
+    message.success(`Overlay "${layer.label}" added to globe`)
+  }, [])
+
+  const handleClearDemOverlays = useCallback(() => {
+    const viewer = viewerRef.current
+    if (!viewer) return
+    demLayerRefsRef.current.forEach((ref) => {
+      if (ref instanceof Cesium.ImageryLayer) {
+        viewer.imageryLayers.remove(ref, true)
+      } else {
+        viewer.dataSources.remove(ref as Cesium.GeoJsonDataSource, true)
+      }
+    })
+    demLayerRefsRef.current.clear()
+    message.info('DEM overlays cleared')
+  }, [])
+
   function clearAll() {
     const viewer = viewerRef.current
     if (!viewer) return
@@ -605,6 +650,7 @@ export default function TerrainPage() {
     profileWaypointsRef.current = []
     slopeWaypointsRef.current = []
     setActiveTool('none')
+    handleClearDemOverlays()
   }
 
   function flyToIndia() {
@@ -1234,6 +1280,18 @@ export default function TerrainPage() {
           </Button>
         </Tooltip>
 
+        <Tooltip title="DEM analysis tools: contours, viewshed, flood, landslide risk, watershed…">
+          <Button
+            size="small"
+            icon={<RadarChartOutlined />}
+            type={panelOpen && panelTab === 'dem' ? 'primary' : 'default'}
+            onClick={() => { setPanelOpen(true); setPanelTab('dem') }}
+            disabled={!ready}
+          >
+            DEM Tools
+          </Button>
+        </Tooltip>
+
         <Divider type="vertical" style={{ borderColor: '#2a2a3e', height: 20 }} />
 
         <Tooltip title="Feature extrusion height (m)">
@@ -1296,14 +1354,47 @@ export default function TerrainPage() {
         {/* Right analysis panel */}
         {panelOpen && (
           <div style={{
-            position: 'absolute', top: 8, right: 8, width: 360,
-            background: 'rgba(13,13,31,0.95)', border: '1px solid #1a1a2e',
+            position: 'absolute', top: 8, right: 8, width: 360, maxHeight: 'calc(100% - 16px)',
+            overflowY: 'auto', overflowX: 'hidden',
+            background: 'rgba(13,13,31,0.97)', border: '1px solid #1a1a2e',
             borderRadius: 8, padding: 12, backdropFilter: 'blur(4px)',
           }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-              <Text style={{ color: '#4fc3f7', fontWeight: 600, fontSize: 13 }}>Analysis</Text>
+            {/* Panel header with tabs */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: 2 }}>
+                <button
+                  onClick={() => setPanelTab('analysis')}
+                  style={{
+                    background: panelTab === 'analysis' ? 'rgba(79,195,247,0.15)' : 'transparent',
+                    border: `1px solid ${panelTab === 'analysis' ? '#4fc3f7' : '#2a2a3e'}`,
+                    borderRadius: 4, padding: '2px 10px', cursor: 'pointer',
+                    color: panelTab === 'analysis' ? '#4fc3f7' : '#666', fontSize: 11, fontWeight: 600,
+                  }}
+                >Analysis</button>
+                <button
+                  onClick={() => setPanelTab('dem')}
+                  style={{
+                    background: panelTab === 'dem' ? 'rgba(250,140,22,0.15)' : 'transparent',
+                    border: `1px solid ${panelTab === 'dem' ? '#fa8c16' : '#2a2a3e'}`,
+                    borderRadius: 4, padding: '2px 10px', cursor: 'pointer',
+                    color: panelTab === 'dem' ? '#fa8c16' : '#666', fontSize: 11, fontWeight: 600,
+                  }}
+                >DEM Tools</button>
+              </div>
               <Button size="small" type="text" icon={<CloseOutlined />} onClick={() => setPanelOpen(false)} />
             </div>
+
+            {/* DEM Analysis panel */}
+            {panelTab === 'dem' && (
+              <DEMAnalysisPanel
+                gridData={slopeGridData}
+                onOverlay={handleDemOverlay}
+                onClearOverlays={handleClearDemOverlays}
+              />
+            )}
+
+            {/* Analysis tab content */}
+            {panelTab === 'analysis' && (<>
 
             {/* Elevation query result */}
             {clickedElev && activeTool !== 'profile' && activeTool !== 'slope' && (
@@ -1449,6 +1540,7 @@ export default function TerrainPage() {
                 )}
               </span>
             </div>
+            </>)}
           </div>
         )}
       </div>

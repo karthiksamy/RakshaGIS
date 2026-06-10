@@ -186,6 +186,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'backups.rotate_old_backups',
         'schedule': crontab(hour=3, minute=0),
     },
+    # Scan published survey areas for spatial overlaps (twice daily)
+    'run-encroachment-scan': {
+        'task': 'apps.workflow.tasks.run_encroachment_scan',
+        'schedule': crontab(hour='6,14', minute=0),
+    },
 }
 
 # Email (set EMAIL_BACKEND to smtp for production; console for local dev)

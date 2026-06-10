@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from django.db.models import Count, Q, Max
+from django.db.models import Count, Q, Max, Prefetch
 from django.db.models.functions import TruncMonth
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
@@ -10,6 +10,24 @@ from rest_framework.views import APIView
 from apps.accounts.models import Organisation, User
 from apps.survey_projects.models import GISFeature, SurveyArea, SurveyProject
 from apps.workflow.models import WorkflowStep
+
+# SLA thresholds in days for each workflow transition
+SLA_DAYS = {
+    'draft_to_submit':    14,   # DRAFT → SUBMITTED
+    'submit_to_review':   5,    # SUBMITTED → UNDER_REVIEW
+    'review_to_approve':  7,    # UNDER_REVIEW → APPROVED
+    'approve_to_publish': 3,    # APPROVED → PUBLISHED
+}
+
+
+def _sla_status(days, limit):
+    if days is None:
+        return None
+    if days <= limit * 0.7:
+        return 'OK'
+    if days <= limit:
+        return 'WARNING'
+    return 'OVERDUE'
 
 
 class DashboardStatsView(APIView):
@@ -306,4 +324,133 @@ class GlobalSearchView(APIView):
                 }
                 for u in matched_users
             ],
+        })
+
+
+class SLAReportView(APIView):
+    """
+    GET /api/dashboard/sla/
+    Returns per-survey-area SLA breakdown: days in each workflow state vs. configured limits.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        status_filter = request.query_params.get('status')
+        page_size = min(int(request.query_params.get('page_size', 200)), 500)
+
+        if user.is_superadmin:
+            projects = SurveyProject.objects.all()
+        elif user.organisation:
+            org_ids = user.organisation.get_subtree_ids()
+            projects = SurveyProject.objects.filter(organisation_id__in=org_ids)
+        else:
+            return Response({'results': [], 'sla_days': SLA_DAYS, 'summary': {}})
+
+        area_qs = (
+            SurveyArea.objects
+            .filter(project__in=projects)
+            .select_related('project__organisation', 'assigned_to')
+            .prefetch_related(
+                Prefetch(
+                    'workflow_steps',
+                    queryset=WorkflowStep.objects.order_by('timestamp')
+                                .select_related('actor'),
+                )
+            )
+            .order_by('-created_at')
+        )
+        if status_filter:
+            area_qs = area_qs.filter(status=status_filter)
+
+        area_qs = area_qs[:page_size]
+
+        now = timezone.now()
+        results = []
+        summary = {'OK': 0, 'WARNING': 0, 'OVERDUE': 0, 'total': 0}
+
+        for area in area_qs:
+            steps = list(area.workflow_steps.all())
+
+            def _first_ts(actions):
+                for s in steps:
+                    if s.action in actions:
+                        return s.timestamp
+                return None
+
+            def _last_actor(actions):
+                actor = None
+                for s in steps:
+                    if s.action in actions:
+                        actor = s.actor
+                return actor.get_full_name() if actor else None
+
+            forward_at  = _first_ts(['FORWARD', 'RE_FORWARD'])
+            check_at    = _first_ts(['CHECK'])
+            approve_at  = _first_ts(['APPROVE'])
+            publish_at  = _first_ts(['PUBLISH'])
+
+            # Days spent in each state (still counting if not yet transitioned)
+            end_draft    = forward_at  or (now if area.status == 'DRAFT'         else None)
+            end_submit   = check_at    or (now if area.status == 'SUBMITTED'     else None)
+            end_review   = approve_at  or (now if area.status == 'UNDER_REVIEW'  else None)
+            end_approved = publish_at  or (now if area.status == 'APPROVED'      else None)
+
+            draft_days    = (end_draft    - area.created_at).days if end_draft                else None
+            submit_days   = (end_submit   - forward_at).days      if forward_at and end_submit else None
+            review_days   = (end_review   - check_at).days        if check_at   and end_review else None
+            approved_days = (end_approved - approve_at).days      if approve_at and end_approved else None
+
+            sla_draft    = _sla_status(draft_days,    SLA_DAYS['draft_to_submit'])
+            sla_submit   = _sla_status(submit_days,   SLA_DAYS['submit_to_review'])
+            sla_review   = _sla_status(review_days,   SLA_DAYS['review_to_approve'])
+            sla_approved = _sla_status(approved_days, SLA_DAYS['approve_to_publish'])
+
+            all_statuses = [s for s in [sla_draft, sla_submit, sla_review, sla_approved] if s]
+            if 'OVERDUE' in all_statuses:
+                overall = 'OVERDUE'
+            elif 'WARNING' in all_statuses:
+                overall = 'WARNING'
+            elif all_statuses:
+                overall = 'OK'
+            else:
+                overall = 'OK'
+
+            summary[overall] = summary.get(overall, 0) + 1
+            summary['total'] += 1
+
+            # Current state actor
+            current_actor = _last_actor(['FORWARD', 'RE_FORWARD', 'CHECK', 'APPROVE', 'PUBLISH'])
+
+            results.append({
+                'area_id':       area.id,
+                'area_name':     area.name,
+                'project_id':    area.project_id,
+                'project_number': area.project.project_number,
+                'org':           area.project.organisation.name,
+                'status':        area.status,
+                'assigned_to':   area.assigned_to.get_full_name() if area.assigned_to else None,
+                'last_actor':    current_actor,
+                'created_at':    area.created_at.isoformat(),
+                # Days in each state
+                'draft_days':    draft_days,
+                'submit_days':   submit_days,
+                'review_days':   review_days,
+                'approved_days': approved_days,
+                # SLA status per state
+                'sla_draft':     sla_draft,
+                'sla_submit':    sla_submit,
+                'sla_review':    sla_review,
+                'sla_approved':  sla_approved,
+                'overall_sla':   overall,
+            })
+
+        # Sort: overdue first, then warning, then ok
+        order = {'OVERDUE': 0, 'WARNING': 1, 'OK': 2}
+        results.sort(key=lambda r: order.get(r['overall_sla'], 3))
+
+        return Response({
+            'results':  results,
+            'sla_days': SLA_DAYS,
+            'summary':  summary,
         })

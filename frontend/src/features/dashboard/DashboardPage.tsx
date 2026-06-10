@@ -1,12 +1,15 @@
-import { useQuery } from '@tanstack/react-query'
-import { Card, Col, Row, Statistic, Table, Tag, Typography, Progress, Space, Badge, Timeline, Spin } from 'antd'
+import { useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Card, Col, Row, Statistic, Table, Tag, Typography, Progress, Space, Badge, Timeline, Spin, Button, List, message } from 'antd'
 import {
   FolderOutlined, EnvironmentOutlined, TeamOutlined, BankOutlined,
   CheckCircleOutlined, ClockCircleOutlined, SyncOutlined, ArrowUpOutlined,
+  AlertOutlined, WarningOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import { useTranslation } from 'react-i18next'
+import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '@/app/store'
 import api from '@/services/api'
 
@@ -130,6 +133,148 @@ function StatusBarChart({ stats }: { stats?: { draft: number; submitted: number;
         )
       })}
     </div>
+  )
+}
+
+interface EncroachmentItem {
+  report_id: number
+  area_id: number
+  area_name: string
+  project_number: string
+  disputes: { boundary_org: string; overlap_sqm: number }[]
+}
+interface EncroachmentSummary {
+  total: number
+  total_overlap_sqm: number
+  items: EncroachmentItem[]
+}
+
+function EncroachmentWidget() {
+  const navigate = useNavigate()
+  const qc = useQueryClient()
+  const [expanded, setExpanded] = useState(false)
+
+  const { data, isLoading } = useQuery<EncroachmentSummary>({
+    queryKey: ['encroachment-summary'],
+    queryFn: () => api.get('/workflow/encroachment-summary/').then(r => r.data),
+    refetchInterval: 120_000,
+  })
+
+  const ack = useMutation({
+    mutationFn: (report_ids?: number[]) =>
+      api.post('/workflow/encroachment-summary/', report_ids ? { report_ids } : { all: true }),
+    onSuccess: () => {
+      message.success('Acknowledged')
+      qc.invalidateQueries({ queryKey: ['encroachment-summary'] })
+    },
+  })
+
+  if (isLoading) return null
+  const count = data?.total ?? 0
+
+  return (
+    <Card
+      size="small"
+      style={{
+        background: count > 0 ? '#1a0a0a' : '#0e1a2e',
+        border: `1px solid ${count > 0 ? '#7f1d1d' : '#1a3050'}`,
+        marginTop: 16,
+      }}
+      title={
+        <Space>
+          <AlertOutlined style={{ color: count > 0 ? '#ef4444' : '#555' }} />
+          <span style={{ color: count > 0 ? '#f87171' : '#888', fontSize: 13 }}>
+            Encroachment Alerts
+          </span>
+          {count > 0 && <Tag color="error">{count} unacknowledged</Tag>}
+        </Space>
+      }
+      extra={
+        count > 0 && (
+          <Space size={6}>
+            <Button size="small" danger onClick={() => ack.mutate(undefined)} loading={ack.isPending}>
+              Acknowledge All
+            </Button>
+            <Button size="small" type="link" onClick={() => setExpanded(e => !e)}>
+              {expanded ? 'Collapse' : 'Expand'}
+            </Button>
+          </Space>
+        )
+      }
+    >
+      {count === 0 ? (
+        <div style={{ padding: '8px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <CheckCircleOutlined style={{ color: '#22c55e' }} />
+          <span style={{ color: '#555', fontSize: 12 }}>No boundary encroachments detected</span>
+        </div>
+      ) : (
+        <>
+          <Row gutter={16} style={{ marginBottom: expanded ? 12 : 0 }}>
+            <Col>
+              <Statistic
+                title={<span style={{ color: '#888', fontSize: 11 }}>Affected Areas</span>}
+                value={count}
+                valueStyle={{ color: '#ef4444', fontSize: 22 }}
+                prefix={<WarningOutlined />}
+              />
+            </Col>
+            <Col>
+              <Statistic
+                title={<span style={{ color: '#888', fontSize: 11 }}>Total Overlap</span>}
+                value={(data!.total_overlap_sqm / 10000).toFixed(2)}
+                suffix="ha"
+                valueStyle={{ color: '#f87171', fontSize: 22 }}
+              />
+            </Col>
+          </Row>
+          {expanded && (
+            <List
+              size="small"
+              dataSource={data!.items}
+              renderItem={(item: EncroachmentItem) => (
+                <List.Item
+                  style={{ borderBottom: '1px solid #2a1212', padding: '8px 0' }}
+                  actions={[
+                    <Button
+                      key="view"
+                      size="small"
+                      type="link"
+                      style={{ color: '#4fc3f7', fontSize: 11 }}
+                      onClick={() => navigate(`/projects/${item.area_id}`)}
+                    >
+                      View
+                    </Button>,
+                    <Button
+                      key="ack"
+                      size="small"
+                      danger
+                      onClick={() => ack.mutate([item.report_id])}
+                      loading={ack.isPending}
+                    >
+                      Ack
+                    </Button>,
+                  ]}
+                >
+                  <div>
+                    <div>
+                      <span style={{ color: '#f87171', fontWeight: 500, fontSize: 12 }}>{item.area_name}</span>
+                      <span style={{ color: '#666', fontSize: 11, marginLeft: 8 }}>{item.project_number}</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>
+                      {item.disputes.map((d, i) => (
+                        <span key={i} style={{ marginRight: 8 }}>
+                          {d.boundary_org}: {(d.overlap_sqm / 10000).toFixed(4)} ha
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </List.Item>
+              )}
+            />
+          )}
+        </>
+      )}
+    </Card>
   )
 }
 
@@ -373,6 +518,7 @@ export default function DashboardPage() {
           <Title level={4} style={{ color: '#4fc3f7', marginBottom: 16 }}>
             Survey Progress Dashboard (Admin View)
           </Title>
+          <EncroachmentWidget />
           <Row gutter={[16, 16]}>
             {/* Status Distribution Bar Chart */}
             <Col xs={24} md={12}>

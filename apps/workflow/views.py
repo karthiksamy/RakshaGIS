@@ -588,3 +588,67 @@ class MapActivityLogViewSet(viewsets.ModelViewSet):
         response = HttpResponse(buf.read(), content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="map_activity_audit.csv"'
         return response
+
+
+class EncroachmentSummaryView(APIView):
+    """
+    GET  /api/workflow/encroachment-summary/  — list of active unacknowledged dispute reports
+    POST /api/workflow/encroachment-summary/  — acknowledge all (body: {area_ids: [...]})
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _base_qs(self, user):
+        qs = DisputeReport.objects.filter(
+            status=DisputeReport.HAS_DISPUTES, acknowledged=False
+        ).select_related('survey_area__project__organisation').order_by('-checked_at')
+        if not user.is_superadmin and user.organisation:
+            org_ids = user.organisation.get_subtree_ids()
+            qs = qs.filter(survey_area__project__organisation_id__in=org_ids)
+        elif not user.is_superadmin:
+            qs = qs.none()
+        return qs
+
+    def get(self, request):
+        qs = self._base_qs(request.user)
+        total = qs.count()
+        items = []
+        seen_projects = set()
+        for r in qs[:50]:
+            pid = r.survey_area.project_id
+            items.append({
+                'report_id':      r.id,
+                'survey_area_id': r.survey_area_id,
+                'survey_area':    r.survey_area.name,
+                'project_id':     pid,
+                'project_number': r.survey_area.project.project_number,
+                'org':            r.survey_area.project.organisation.name,
+                'dispute_count':  len(r.disputes),
+                'total_overlap_sqm': round(
+                    sum(float(d.get('overlap_sqm') or 0) for d in r.disputes), 2
+                ),
+                'overlapping_orgs': list({d.get('target_org', '') for d in r.disputes if d.get('target_org')}),
+                'checked_at':     r.checked_at.isoformat(),
+                'is_duplicate':   pid in seen_projects,
+            })
+            seen_projects.add(pid)
+
+        total_overlap = sum(i['total_overlap_sqm'] for i in items)
+        return Response({
+            'total': total,
+            'total_overlap_sqm': round(total_overlap, 2),
+            'items': items,
+        })
+
+    def post(self, request):
+        """Acknowledge selected reports (or all if area_ids omitted)."""
+        area_ids = request.data.get('area_ids')
+        qs = self._base_qs(request.user)
+        if area_ids:
+            qs = qs.filter(survey_area_id__in=area_ids)
+        now = timezone.now()
+        updated = qs.update(
+            acknowledged=True,
+            acknowledged_by=request.user,
+            acknowledged_at=now,
+        )
+        return Response({'acknowledged': updated})

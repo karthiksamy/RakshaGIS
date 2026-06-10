@@ -25,6 +25,11 @@ RUN useradd --create-home --home-dir /app --uid 1000 raksha 2>/dev/null || \
 
 WORKDIR /app
 
+# Prevent pip from installing packages to the user site (/app/.local).
+# The project bind-mounts .:/app, so without this any `pip install --user`
+# run inside the container persists on the host and shadows system packages.
+ENV PYTHONNOUSERSITE=1
+
 # Install Python dependencies first (layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

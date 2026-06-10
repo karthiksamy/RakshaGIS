@@ -11,7 +11,7 @@ import {
   BellOutlined, DashboardOutlined, BarChartOutlined, AuditOutlined,
   CheckCircleOutlined, SearchOutlined, BgColorsOutlined, EyeOutlined, EnvironmentOutlined,
   ShareAltOutlined, ImportOutlined, CompassOutlined, SafetyOutlined, CloudServerOutlined,
-  SafetyCertificateOutlined,
+  SafetyCertificateOutlined, ClockCircleOutlined,
 } from '@ant-design/icons'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
@@ -42,6 +42,7 @@ const ADMIN_NAV_ITEMS = [
   { key: '/users', icon: <TeamOutlined />, label: 'Users' },
   { key: '/organisations', icon: <BankOutlined />, label: 'Organisations' },
   { key: '/reports', icon: <BarChartOutlined />, label: 'Reports' },
+  { key: '/sla', icon: <ClockCircleOutlined />, label: 'SLA Tracker' },
   { key: '/audit', icon: <AuditOutlined />, label: 'Audit Logs' },
   { key: '/backups', icon: <SafetyOutlined />, label: 'Backups' },
   { key: '/qgis-sync', icon: <CheckCircleOutlined />, label: 'QGIS Sync' },

@@ -35,6 +35,7 @@ const ExternalDatabasePage   = lazy(() => import('@/features/admin/ExternalDatab
 const AccessRequestsPage = lazy(() => import('@/features/projects/AccessRequestsPage'))
 const ProvenanceVerifyPage = lazy(() => import('@/features/provenance/ProvenanceVerifyPage'))
 const DroneDatasetsPage = lazy(() => import('@/features/drone/DroneDatasetsPage'))
+const SLAPage            = lazy(() => import('@/features/sla/SLAPage'))
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const user = useAppStore((s) => s.user)
@@ -89,6 +90,7 @@ export default function AppRoutes() {
           <Route path="settings/ai-config"     element={<AIConfigPage />} />
           <Route path="settings/external-data" element={<ExternalDatabasePage />} />
           <Route path="settings/security"      element={<SecurityPage />} />
+          <Route path="sla" element={<SLAPage />} />
           <Route path="qgis-sync" element={<QGISSyncPage />} />
           <Route path="verify" element={<ProvenanceVerifyPage />} />
         </Route>

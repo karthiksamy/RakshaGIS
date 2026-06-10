@@ -28,6 +28,7 @@ const BoundaryExtractionPage = lazy(() => import('@/features/ai-vision/BoundaryE
 const BoundaryReviewPage = lazy(() => import('@/features/ai-vision/BoundaryReviewPage'))
 const BackupPage = lazy(() => import('@/features/backups/BackupPage'))
 const BrandingSettingsPage   = lazy(() => import('@/features/settings/BrandingSettingsPage'))
+const SecurityPage           = lazy(() => import('@/features/settings/SecurityPage'))
 const QGISSyncPage           = lazy(() => import('@/features/qgis-sync/QGISSyncPage'))
 const AIConfigPage           = lazy(() => import('@/features/ai-config/AIConfigPage'))
 const ExternalDatabasePage   = lazy(() => import('@/features/admin/ExternalDatabasePage'))
@@ -87,6 +88,7 @@ export default function AppRoutes() {
           <Route path="settings/branding"      element={<BrandingSettingsPage />} />
           <Route path="settings/ai-config"     element={<AIConfigPage />} />
           <Route path="settings/external-data" element={<ExternalDatabasePage />} />
+          <Route path="settings/security"      element={<SecurityPage />} />
           <Route path="qgis-sync" element={<QGISSyncPage />} />
           <Route path="verify" element={<ProvenanceVerifyPage />} />
         </Route>

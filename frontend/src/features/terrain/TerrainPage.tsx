@@ -11,6 +11,7 @@ import {
   AimOutlined, ReloadOutlined, GlobalOutlined, InfoCircleOutlined,
   CloseOutlined, ColumnHeightOutlined, ExportOutlined,
   FileImageOutlined, FilePdfOutlined, FileTextOutlined, SyncOutlined,
+  UploadOutlined, SplitCellsOutlined,
 } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 import api from '@/services/api'
@@ -177,6 +178,27 @@ export default function TerrainPage() {
   const [exporting, setExporting] = useState(false)
   const [panelTab, setPanelTab] = useState<'analysis' | 'dem'>('analysis')
   const demLayerRefsRef = useRef<Map<string, Cesium.ImageryLayer | Cesium.GeoJsonDataSource>>(new Map())
+  const gpxDataSourceRef = useRef<Cesium.CustomDataSource | null>(null)
+  const gpxFileInputRef = useRef<HTMLInputElement>(null)
+  const [gpxLoaded, setGpxLoaded] = useState(false)
+  const [gpxName, setGpxName] = useState<string | null>(null)
+
+  // ── LiDAR point cloud ──────────────────────────────────────────────────────
+  const lidarFileInputRef = useRef<HTMLInputElement>(null)
+  const lidarPointsRef = useRef<Cesium.PointPrimitiveCollection | null>(null)
+  const [lidarLoaded, setLidarLoaded] = useState(false)
+  const [lidarName, setLidarName] = useState<string | null>(null)
+  const [lidarUploading, setLidarUploading] = useState(false)
+
+  // ── Reference grid (for change detection) ─────────────────────────────────
+  const [referenceGrid, setReferenceGrid] = useState<SlopeGridData | null>(null)
+
+  // ── Comparison slider ──────────────────────────────────────────────────────
+  const [splitMode, setSplitMode] = useState(false)
+  const [splitPos, setSplitPos] = useState(0.5)         // 0–1 fraction from left
+  const [splitRightId, setSplitRightId] = useState<number | null>(null)
+  const splitDragging = useRef(false)
+  const splitRightLayerRef = useRef<Cesium.ImageryLayer | null>(null)
 
   // Feature extrusion height (0 = drape flat on the terrain; >0 = raise as a volume).
   // Default 0 so parcels render as proper shapes clamped to the ground.
@@ -380,6 +402,50 @@ export default function TerrainPage() {
       viewer.imageryLayers.addImageryProvider(providerOrPromise)
     }
   }, [ready, selectedBasemap, basemaps])
+
+  // Comparison slider effect — applies Cesium SplitDirection to imagery layers
+  useEffect(() => {
+    const viewer = viewerRef.current
+    if (!viewer || !ready) return
+
+    // Remove previous right-side comparison layer
+    if (splitRightLayerRef.current) {
+      viewer.imageryLayers.remove(splitRightLayerRef.current, true)
+      splitRightLayerRef.current = null
+    }
+
+    if (!splitMode) {
+      // Reset all layers to no split
+      for (let i = 0; i < viewer.imageryLayers.length; i++) {
+        viewer.imageryLayers.get(i).splitDirection = Cesium.SplitDirection.NONE
+      }
+      viewer.scene.splitPosition = 0.5
+      return
+    }
+
+    // Left side — existing base imagery
+    for (let i = 0; i < viewer.imageryLayers.length; i++) {
+      viewer.imageryLayers.get(i).splitDirection = Cesium.SplitDirection.LEFT
+    }
+    viewer.scene.splitPosition = splitPos
+
+    // Right side — add second basemap layer
+    if (splitRightId !== null) {
+      const bm = basemaps.find((b: any) => b.id === splitRightId)
+      const provOrPromise = makeCesiumImagery(bm)
+      const attach = (provider: Cesium.ImageryProvider) => {
+        if (viewer.isDestroyed()) return
+        const layer = viewer.imageryLayers.addImageryProvider(provider, 0)
+        layer.splitDirection = Cesium.SplitDirection.RIGHT
+        splitRightLayerRef.current = layer
+      }
+      if (provOrPromise instanceof Promise) {
+        provOrPromise.then(attach).catch(() => {})
+      } else {
+        attach(provOrPromise)
+      }
+    }
+  }, [ready, splitMode, splitPos, splitRightId, basemaps])
 
   // When any ARCGIS basemap with a token exists and no other terrain is configured,
   // automatically load ArcGIS World Elevation for real 3D terrain.
@@ -651,7 +717,203 @@ export default function TerrainPage() {
     slopeWaypointsRef.current = []
     setActiveTool('none')
     handleClearDemOverlays()
+    // Remove GPX data source
+    if (gpxDataSourceRef.current) {
+      viewer.dataSources.remove(gpxDataSourceRef.current)
+      gpxDataSourceRef.current = null
+    }
+    setGpxLoaded(false)
+    setGpxName(null)
+    // Remove LiDAR point cloud
+    if (lidarPointsRef.current) {
+      viewer.scene.primitives.remove(lidarPointsRef.current)
+      lidarPointsRef.current = null
+    }
+    setLidarLoaded(false)
+    setLidarName(null)
   }
+
+  const handleGpxImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const viewer = viewerRef.current
+    if (!viewer) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      try {
+        const xml = new DOMParser().parseFromString(reader.result as string, 'text/xml')
+        const ns = 'http://www.topografix.com/GPX/1/1'
+        const ds = new Cesium.CustomDataSource(`gpx-${file.name}`)
+
+        // Helper: parse <ele> child text
+        const getEle = (node: Element) => {
+          const el = node.getElementsByTagNameNS(ns, 'ele')[0] ?? node.getElementsByTagName('ele')[0]
+          return el ? parseFloat(el.textContent || '0') : 0
+        }
+        const getName = (node: Element) => {
+          const n = node.getElementsByTagNameNS(ns, 'name')[0] ?? node.getElementsByTagName('name')[0]
+          return n?.textContent?.trim() || null
+        }
+
+        // Tracks → polylines
+        const trksegs = [...xml.getElementsByTagNameNS(ns, 'trkseg'), ...xml.getElementsByTagName('trkseg')]
+        trksegs.forEach((seg, si) => {
+          const pts = [...seg.getElementsByTagNameNS(ns, 'trkpt'), ...seg.getElementsByTagName('trkpt')]
+          if (pts.length < 2) return
+          const positions = pts.map(p => {
+            const lat = parseFloat(p.getAttribute('lat') || '0')
+            const lon = parseFloat(p.getAttribute('lon') || '0')
+            const ele = getEle(p)
+            return Cesium.Cartesian3.fromDegrees(lon, lat, ele > 0 ? ele : undefined)
+          })
+          ds.entities.add({
+            name: `Track segment ${si + 1}`,
+            polyline: {
+              positions,
+              width: 3,
+              material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.2, color: Cesium.Color.DEEPSKYBLUE }),
+              clampToGround: true,
+            },
+          })
+        })
+
+        // Routes → polylines (orange)
+        const rtepts = [...xml.getElementsByTagNameNS(ns, 'rte'), ...xml.getElementsByTagName('rte')]
+        rtepts.forEach((rte, ri) => {
+          const pts = [...rte.getElementsByTagNameNS(ns, 'rtept'), ...rte.getElementsByTagName('rtept')]
+          if (pts.length < 2) return
+          const positions = pts.map(p => {
+            const lat = parseFloat(p.getAttribute('lat') || '0')
+            const lon = parseFloat(p.getAttribute('lon') || '0')
+            const ele = getEle(p)
+            return Cesium.Cartesian3.fromDegrees(lon, lat, ele > 0 ? ele : undefined)
+          })
+          ds.entities.add({
+            name: getName(rte) || `Route ${ri + 1}`,
+            polyline: {
+              positions,
+              width: 3,
+              material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.2, color: Cesium.Color.ORANGE }),
+              clampToGround: true,
+            },
+          })
+        })
+
+        // Waypoints → pins
+        const wpts = [...xml.getElementsByTagNameNS(ns, 'wpt'), ...xml.getElementsByTagName('wpt')]
+        wpts.forEach(wpt => {
+          const lat = parseFloat(wpt.getAttribute('lat') || '0')
+          const lon = parseFloat(wpt.getAttribute('lon') || '0')
+          const ele = getEle(wpt)
+          const label = getName(wpt) || 'Waypoint'
+          ds.entities.add({
+            name: label,
+            position: Cesium.Cartesian3.fromDegrees(lon, lat, ele > 0 ? ele : undefined),
+            billboard: {
+              image: '/cesium/marker.png',
+              width: 24, height: 24,
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            },
+            label: {
+              text: label,
+              font: '11px sans-serif',
+              fillColor: Cesium.Color.WHITE,
+              outlineColor: Cesium.Color.BLACK,
+              outlineWidth: 2,
+              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+              verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+              pixelOffset: new Cesium.Cartesian2(0, -28),
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            },
+          })
+        })
+
+        if (ds.entities.values.length === 0) {
+          message.warning('No tracks, routes or waypoints found in GPX file')
+          return
+        }
+
+        // Remove previous GPX layer if any
+        if (gpxDataSourceRef.current) viewer.dataSources.remove(gpxDataSourceRef.current)
+        viewer.dataSources.add(ds)
+        gpxDataSourceRef.current = ds
+        setGpxLoaded(true)
+        setGpxName(file.name)
+        viewer.zoomTo(ds)
+        message.success(`GPX imported: ${ds.entities.values.length} features from ${file.name}`)
+      } catch {
+        message.error('Failed to parse GPX file')
+      }
+    }
+    reader.readAsText(file)
+    // Reset input so same file can be re-imported
+    e.target.value = ''
+  }, [])
+
+  const handleLidarUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const viewer = viewerRef.current
+    if (!viewer) return
+    e.target.value = ''
+
+    setLidarUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await api.post('/core/terrain/lidar-upload/', fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      const { points, dem, point_count, min_lon, max_lon, min_lat, max_lat,
+              min_elev, max_elev } = res.data
+
+      // Remove previous LiDAR layer
+      if (lidarPointsRef.current) viewer.scene.primitives.remove(lidarPointsRef.current)
+
+      const collection = new Cesium.PointPrimitiveCollection()
+      const xs: number[] = points.x
+      const ys: number[] = points.y
+      const zs: number[] = points.z
+      const ints: number[] = points.i
+      const elevRange = max_elev - min_elev || 1
+
+      for (let idx = 0; idx < xs.length; idx++) {
+        // Height-based colour: blue (low) → green → yellow → red (high)
+        const t = (zs[idx] - min_elev) / elevRange
+        const r = t < 0.5 ? 0 : Math.min(1, (t - 0.5) * 4)
+        const g = t < 0.25 ? t * 4 : t < 0.75 ? 1 : (1 - t) * 4
+        const b = t < 0.25 ? 1 : Math.max(0, 1 - t * 4)
+        const bright = 0.5 + ints[idx] / 255 * 0.5
+        collection.add({
+          position: Cesium.Cartesian3.fromDegrees(xs[idx], ys[idx], zs[idx]),
+          color: new Cesium.Color(r * bright, g * bright, b * bright, 1),
+          pixelSize: 2,
+        })
+      }
+      viewer.scene.primitives.add(collection)
+      lidarPointsRef.current = collection
+
+      // Fly to point cloud extent
+      viewer.camera.flyTo({
+        destination: Cesium.Rectangle.fromDegrees(min_lon, min_lat, max_lon, max_lat),
+        duration: 1.5,
+      })
+
+      setLidarLoaded(true)
+      setLidarName(file.name)
+      message.success(`LiDAR: ${point_count.toLocaleString()} points loaded from ${file.name}`)
+
+      // If DEM derived, load it as the slope grid for DEM analysis
+      if (dem) {
+        setSlopeGridData(dem)
+        message.info('DEM derived from point cloud — DEM Analysis tools are now available')
+      }
+    } catch (err: any) {
+      message.error(err?.response?.data?.error || 'LiDAR upload failed')
+    } finally {
+      setLidarUploading(false)
+    }
+  }, [])
 
   function flyToIndia() {
     viewerRef.current?.camera.flyTo({
@@ -1117,10 +1379,10 @@ export default function TerrainPage() {
       const url = URL.createObjectURL(res.data)
       const a = document.createElement('a')
       a.href = url
-      a.download = `slope-analysis-${new Date().toISOString().slice(0, 10)}.tif`
+      a.download = `terrain-analysis-${new Date().toISOString().slice(0, 10)}.zip`
       a.click()
       URL.revokeObjectURL(url)
-      message.success({ content: 'GeoTIFF exported (Band 1: elevation m, Band 2: slope°)', key: 'gtiff' })
+      message.success({ content: 'GeoTIFF exported — ZIP contains visualization.tif (RGB) + analysis.tif (Float32)', key: 'gtiff' })
     } catch {
       message.error({ content: 'GeoTIFF export failed', key: 'gtiff' })
     } finally {
@@ -1292,6 +1554,86 @@ export default function TerrainPage() {
           </Button>
         </Tooltip>
 
+        <Tooltip title={gpxLoaded ? `GPX loaded: ${gpxName} — click to replace` : 'Import GPX track/route/waypoints onto 3D globe'}>
+          <Button
+            size="small"
+            icon={<UploadOutlined />}
+            type={gpxLoaded ? 'primary' : 'default'}
+            onClick={() => gpxFileInputRef.current?.click()}
+            disabled={!ready}
+          >
+            GPX
+          </Button>
+        </Tooltip>
+        <input
+          ref={gpxFileInputRef}
+          type="file"
+          accept=".gpx"
+          style={{ display: 'none' }}
+          onChange={handleGpxImport}
+        />
+
+        <Tooltip title={lidarLoaded ? `LiDAR: ${lidarName} — click to reload` : 'Upload .las / .laz point cloud — displays in 3D and derives DEM'}>
+          <Button
+            size="small"
+            icon={<UploadOutlined />}
+            type={lidarLoaded ? 'primary' : 'default'}
+            loading={lidarUploading}
+            onClick={() => lidarFileInputRef.current?.click()}
+            disabled={!ready}
+          >
+            LiDAR
+          </Button>
+        </Tooltip>
+        <input
+          ref={lidarFileInputRef}
+          type="file"
+          accept=".las,.laz"
+          style={{ display: 'none' }}
+          onChange={handleLidarUpload}
+        />
+
+        <Tooltip title={referenceGrid
+          ? 'Reference DEM set — used by Change Detection analysis'
+          : 'Set current slope grid as reference DEM for Change Detection'}>
+          <Button
+            size="small"
+            type={referenceGrid ? 'primary' : 'default'}
+            style={referenceGrid ? { borderColor: '#a855f7', background: '#a855f722' } : {}}
+            onClick={() => {
+              if (slopeGridData) {
+                setReferenceGrid(slopeGridData)
+                message.success('Reference DEM saved — load a new GeoTIFF to compare')
+              } else {
+                message.warning('Run slope analysis first to generate a DEM grid')
+              }
+            }}
+            disabled={!ready}
+          >
+            {referenceGrid ? 'Ref Set' : 'Set Ref'}
+          </Button>
+        </Tooltip>
+
+        <Tooltip title={splitMode ? 'Exit comparison mode' : 'Split-screen compare two basemaps side-by-side'}>
+          <Button
+            size="small"
+            icon={<SplitCellsOutlined />}
+            type={splitMode ? 'primary' : 'default'}
+            onClick={() => {
+              if (splitMode) {
+                setSplitMode(false)
+                setSplitRightId(null)
+                setSplitPos(0.5)
+              } else {
+                setSplitMode(true)
+              }
+            }}
+            disabled={!ready}
+          >
+            Compare
+          </Button>
+        </Tooltip>
+
         <Divider type="vertical" style={{ borderColor: '#2a2a3e', height: 20 }} />
 
         <Tooltip title="Feature extrusion height (m)">
@@ -1337,6 +1679,77 @@ export default function TerrainPage() {
       <div style={{ flex: 1, display: 'flex', position: 'relative', overflow: 'hidden' }}>
         {/* Cesium container */}
         <div ref={containerRef} style={{ flex: 1, height: '100%' }} />
+
+        {/* ── Comparison slider overlay ── */}
+        {splitMode && (
+          <div
+            style={{
+              position: 'absolute', top: 0, bottom: 0,
+              left: `${splitPos * 100}%`,
+              width: 4, background: 'rgba(255,255,255,0.85)',
+              cursor: 'ew-resize', zIndex: 20,
+              boxShadow: '0 0 6px rgba(0,0,0,0.6)',
+              transform: 'translateX(-2px)',
+            }}
+            onMouseDown={e => {
+              e.preventDefault()
+              splitDragging.current = true
+              const onMove = (me: MouseEvent) => {
+                if (!splitDragging.current) return
+                const container = containerRef.current
+                if (!container) return
+                const rect = container.getBoundingClientRect()
+                const frac = Math.max(0.05, Math.min(0.95, (me.clientX - rect.left) / rect.width))
+                setSplitPos(frac)
+                const viewer = viewerRef.current
+                if (viewer) viewer.scene.splitPosition = frac
+              }
+              const onUp = () => {
+                splitDragging.current = false
+                window.removeEventListener('mousemove', onMove)
+                window.removeEventListener('mouseup', onUp)
+              }
+              window.addEventListener('mousemove', onMove)
+              window.addEventListener('mouseup', onUp)
+            }}
+          >
+            {/* Drag handle icon */}
+            <div style={{
+              position: 'absolute', top: '50%', left: '50%',
+              transform: 'translate(-50%,-50%)',
+              background: 'white', borderRadius: 12,
+              padding: '4px 6px', fontSize: 12, color: '#333',
+              pointerEvents: 'none', whiteSpace: 'nowrap', lineHeight: 1,
+            }}>
+              ◀ ▶
+            </div>
+          </div>
+        )}
+
+        {/* Comparison right-side basemap selector (bottom-center) */}
+        {splitMode && (
+          <div style={{
+            position: 'absolute', bottom: 48, left: `${splitPos * 100 + 2}%`,
+            background: 'rgba(10,12,28,0.9)', border: '1px solid #2a2a4a',
+            borderRadius: 6, padding: '4px 8px', zIndex: 20,
+            maxWidth: 200,
+          }}>
+            <div style={{ color: '#888', fontSize: 9, marginBottom: 2 }}>RIGHT SIDE</div>
+            <select
+              value={splitRightId ?? ''}
+              onChange={e => setSplitRightId(e.target.value ? Number(e.target.value) : null)}
+              style={{
+                background: '#0a0c1c', color: '#e0e0e0', border: '1px solid #2a2a4a',
+                borderRadius: 4, fontSize: 11, padding: '2px 4px', width: '100%',
+              }}
+            >
+              <option value="">— none —</option>
+              {(basemaps as any[]).filter((b: any) => b.id !== selectedBasemap).map((b: any) => (
+                <option key={b.id} value={b.id}>{b.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* Active tool hint */}
         {activeTool !== 'none' && (
@@ -1388,6 +1801,7 @@ export default function TerrainPage() {
             {panelTab === 'dem' && (
               <DEMAnalysisPanel
                 gridData={slopeGridData}
+                referenceGrid={referenceGrid}
                 onOverlay={handleDemOverlay}
                 onClearOverlays={handleClearDemOverlays}
               />
@@ -1517,7 +1931,7 @@ export default function TerrainPage() {
                     </Tooltip>
                   )}
                   {slopeGridData && (
-                    <Tooltip title="Slope analysis as GeoTIFF raster (Band 1: elevation m, Band 2: slope°)">
+                    <Tooltip title="Export as ZIP: terrain-visualization.tif (RGB, opens in any viewer) + terrain-analysis.tif (Float32 elevation/slope/aspect)">
                       <Button
                         size="small" icon={<ExportOutlined />}
                         loading={exporting} onClick={exportGeoTIFF}

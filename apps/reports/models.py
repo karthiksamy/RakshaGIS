@@ -13,14 +13,16 @@ class ReportSchedule(models.Model):
         (MONTHLY, 'Monthly'),
     ]
 
-    STATUS_SUMMARY = 'STATUS_SUMMARY'
-    FEATURE_EXPORT = 'FEATURE_EXPORT'
-    ACTIVITY_LOG = 'ACTIVITY_LOG'
+    STATUS_SUMMARY   = 'STATUS_SUMMARY'
+    FEATURE_EXPORT   = 'FEATURE_EXPORT'
+    ACTIVITY_LOG     = 'ACTIVITY_LOG'
+    TERRAIN_SUMMARY  = 'TERRAIN_SUMMARY'
 
     REPORT_TYPE_CHOICES = [
-        (STATUS_SUMMARY, 'Project Status Summary'),
-        (FEATURE_EXPORT, 'Feature Data Export'),
-        (ACTIVITY_LOG, 'User Activity Log'),
+        (STATUS_SUMMARY,  'Project Status Summary'),
+        (FEATURE_EXPORT,  'Feature Data Export'),
+        (ACTIVITY_LOG,    'User Activity Log'),
+        (TERRAIN_SUMMARY, 'Terrain Analysis Summary'),
     ]
 
     name = models.CharField(max_length=200)

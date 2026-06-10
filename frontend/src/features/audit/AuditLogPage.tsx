@@ -1,7 +1,10 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Table, Tabs, Tag, Typography, Select, DatePicker, Space, Row, Col, Tooltip } from 'antd'
-import { CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
+import { Table, Tabs, Tag, Typography, Select, DatePicker, Space, Row, Col, Tooltip, Input } from 'antd'
+import {
+  CheckCircleOutlined, CloseCircleOutlined,
+  EditOutlined, DeleteOutlined, PlusCircleOutlined, ExportOutlined,
+} from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
@@ -136,6 +139,191 @@ function ExportAuditTab() {
   )
 }
 
+const ACTION_COLOR: Record<string, string> = {
+  CREATE: 'green', UPDATE: 'blue', DELETE: 'red',
+}
+const ACTION_ICON: Record<string, React.ReactNode> = {
+  CREATE: <PlusCircleOutlined />,
+  UPDATE: <EditOutlined />,
+  DELETE: <DeleteOutlined />,
+}
+const MAP_ACTION_COLOR: Record<string, string> = {
+  CREATE_FEATURE: 'green', EDIT_FEATURE: 'blue', DELETE_FEATURE: 'red',
+  SUBMIT_AREA: 'purple', APPROVE_AREA: 'cyan', PUBLISH_AREA: 'gold',
+  IMPORT_GIS: 'orange', EXPORT_MAP: 'lime',
+  VIEW_MAP: 'default', TOOL_CHANGE: 'default', SELECT_AREA: 'geekblue',
+  LOCK_FEATURE: 'volcano', RETURN_AREA: 'magenta',
+}
+
+function WorkflowAuditTab() {
+  const user = useAppStore(s => s.user)
+  const isSuperAdmin = user?.role === 'SUPERADMIN'
+  const [actionFilter, setActionFilter] = useState('')
+  const [search, setSearch] = useState('')
+  const { data, isLoading } = useQuery<{ results: any[] }>({
+    queryKey: ['workflow-audit', actionFilter],
+    queryFn: () => api.get(`/workflow/audit/${actionFilter ? `?action=${actionFilter}` : ''}`).then(r => r.data),
+  })
+
+  const rows = (data?.results ?? []).filter(r =>
+    !search || r.model_name?.toLowerCase().includes(search.toLowerCase()) ||
+    r.object_repr?.toLowerCase().includes(search.toLowerCase()) ||
+    r.user_name?.toLowerCase().includes(search.toLowerCase()),
+  )
+
+  return (
+    <div>
+      <Row gutter={8} style={{ marginBottom: 10 }}>
+        <Col>
+          <Select
+            value={actionFilter} onChange={setActionFilter}
+            style={{ width: 140 }} placeholder="All actions" allowClear
+            options={[
+              { value: 'CREATE', label: 'Create' },
+              { value: 'UPDATE', label: 'Update' },
+              { value: 'DELETE', label: 'Delete' },
+            ]}
+          />
+        </Col>
+        <Col flex="auto">
+          <Input.Search
+            placeholder="Filter by model, object or user…"
+            value={search} onChange={e => setSearch(e.target.value)}
+            size="small" allowClear style={{ maxWidth: 280 }}
+          />
+        </Col>
+        {isSuperAdmin && (
+          <Col>
+            <Text style={{ color: '#666', fontSize: 11 }}>All organisations visible (superadmin)</Text>
+          </Col>
+        )}
+      </Row>
+      <Table
+        dataSource={rows}
+        rowKey="id"
+        loading={isLoading}
+        size="small"
+        pagination={{ pageSize: 25 }}
+        columns={[
+          {
+            title: 'Action', dataIndex: 'action', width: 90,
+            render: (v) => (
+              <Tag icon={ACTION_ICON[v]} color={ACTION_COLOR[v] || 'default'} style={{ fontSize: 10 }}>
+                {v}
+              </Tag>
+            ),
+          },
+          { title: 'Model', dataIndex: 'model_name', width: 130,
+            render: v => <Text style={{ color: '#4fc3f7', fontSize: 11 }}>{v}</Text> },
+          { title: 'Object', dataIndex: 'object_repr', ellipsis: true,
+            render: v => <Text style={{ fontSize: 11 }}>{v || '—'}</Text> },
+          { title: 'User', dataIndex: 'user_name', width: 140,
+            render: v => <Text style={{ color: '#aaa', fontSize: 11 }}>{v || '—'}</Text> },
+          { title: 'IP', dataIndex: 'ip_address', width: 120,
+            render: v => <Text style={{ color: '#666', fontSize: 10 }}>{v || '—'}</Text> },
+          {
+            title: 'Time', dataIndex: 'timestamp', width: 150,
+            render: v => <Text style={{ fontSize: 11, color: '#888' }}>{dayjs(v).format('DD MMM YY HH:mm:ss')}</Text>,
+          },
+        ]}
+        expandable={{
+          expandedRowRender: (r: any) => (
+            <pre style={{ fontSize: 10, color: '#888', margin: 0, whiteSpace: 'pre-wrap' }}>
+              {JSON.stringify(r.changes, null, 2)}
+            </pre>
+          ),
+          rowExpandable: (r: any) => r.changes && Object.keys(r.changes).length > 0,
+        }}
+      />
+    </div>
+  )
+}
+
+function MapActivityTab() {
+  const [actionFilter, setActionFilter] = useState('')
+  const [dateRange, setDateRange] = useState<[any, any] | null>(null)
+  const params: Record<string, string> = {}
+  if (actionFilter) params.action = actionFilter
+  if (dateRange?.[0]) params.timestamp_after  = dateRange[0].toISOString()
+  if (dateRange?.[1]) params.timestamp_before = dateRange[1].toISOString()
+
+  const { data, isLoading } = useQuery<{ results: any[] }>({
+    queryKey: ['map-activity', actionFilter, dateRange],
+    queryFn: () => api.get('/workflow/map-activity/', { params }).then(r => r.data),
+  })
+
+  const actionOptions = [
+    'VIEW_MAP','SELECT_AREA','TOOL_CHANGE',
+    'CREATE_FEATURE','EDIT_FEATURE','DELETE_FEATURE','LOCK_FEATURE',
+    'IMPORT_GIS','EXPORT_MAP',
+    'SUBMIT_AREA','RETURN_AREA','APPROVE_AREA','PUBLISH_AREA',
+  ].map(v => ({ value: v, label: v.replace(/_/g, ' ') }))
+
+  return (
+    <div>
+      <Row gutter={8} style={{ marginBottom: 10 }}>
+        <Col>
+          <Select
+            value={actionFilter} onChange={setActionFilter}
+            style={{ width: 180 }} placeholder="All actions" allowClear
+            options={actionOptions}
+          />
+        </Col>
+        <Col>
+          <RangePicker
+            size="small"
+            onChange={(vals) => setDateRange(vals as [any, any] | null)}
+            style={{ width: 240 }}
+          />
+        </Col>
+        <Col>
+          <Tooltip title="Export CSV">
+            <a
+              href="/api/workflow/map-activity/export/"
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: '#4fc3f7', fontSize: 12 }}
+            >
+              <ExportOutlined /> Export CSV
+            </a>
+          </Tooltip>
+        </Col>
+      </Row>
+      <Table
+        dataSource={data?.results ?? []}
+        rowKey="id"
+        loading={isLoading}
+        size="small"
+        pagination={{ pageSize: 25 }}
+        columns={[
+          {
+            title: 'Action', dataIndex: 'action', width: 140,
+            render: (v, r: any) => (
+              <Tag color={MAP_ACTION_COLOR[v] || 'default'} style={{ fontSize: 10 }}>
+                {r.action_display || v}
+              </Tag>
+            ),
+          },
+          { title: 'User', dataIndex: 'user_name', width: 130,
+            render: v => <Text style={{ color: '#aaa', fontSize: 11 }}>{v || '—'}</Text> },
+          { title: 'Project', dataIndex: 'project_name', width: 140, ellipsis: true,
+            render: v => <Text style={{ color: '#4fc3f7', fontSize: 11 }}>{v || '—'}</Text> },
+          { title: 'Area', dataIndex: 'survey_area_name', width: 130, ellipsis: true,
+            render: v => <Text style={{ fontSize: 11 }}>{v || '—'}</Text> },
+          { title: 'Layer', dataIndex: 'layer_name', width: 110, ellipsis: true,
+            render: v => <Text style={{ color: '#888', fontSize: 10 }}>{v || '—'}</Text> },
+          { title: 'IP', dataIndex: 'ip_address', width: 115,
+            render: v => <Text style={{ color: '#555', fontSize: 10 }}>{v || '—'}</Text> },
+          {
+            title: 'Time', dataIndex: 'timestamp', width: 150,
+            render: v => <Text style={{ fontSize: 11, color: '#888' }}>{dayjs(v).format('DD MMM YY HH:mm:ss')}</Text>,
+          },
+        ]}
+      />
+    </div>
+  )
+}
+
 function SessionsTab() {
   const { data, isLoading } = useQuery<{ results: SessionItem[] }>({
     queryKey: ['my-sessions'],
@@ -178,8 +366,10 @@ export default function AuditLogPage() {
   const isSuperAdmin = user?.role === 'SUPERADMIN'
 
   const tabs = [
-    { key: 'sessions', label: 'My Sessions', children: <SessionsTab /> },
-    { key: 'exports', label: 'Export Audit', children: <ExportAuditTab /> },
+    { key: 'sessions',  label: 'My Sessions',      children: <SessionsTab /> },
+    { key: 'exports',   label: 'Export Audit',      children: <ExportAuditTab /> },
+    { key: 'workflow',  label: 'Workflow CRUD',      children: <WorkflowAuditTab /> },
+    { key: 'map',       label: 'Map Activity',       children: <MapActivityTab /> },
     ...(isSuperAdmin ? [{ key: 'logins', label: 'Login Audit', children: <LoginAuditTab /> }] : []),
   ]
 

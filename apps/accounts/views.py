@@ -114,21 +114,29 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         target = self.get_object()
-        if target.role in User.ADMIN_ROLES:
-            raise PermissionDenied('Cannot delete an admin user.')
+        # Admins (any role) cannot delete their own account
+        if target.pk == request.user.pk and request.user.role in User.ADMIN_ROLES:
+            raise PermissionDenied('Admins cannot delete their own account.')
         return super().destroy(request, *args, **kwargs)
 
     def partial_update(self, request, *args, **kwargs):
         target = self.get_object()
-        if target.role in User.ADMIN_ROLES and not request.data.get('is_active', True):
-            raise PermissionDenied('Cannot deactivate an admin user.')
+        data = request.data
+        # Admins cannot deactivate themselves
+        if target.pk == request.user.pk and request.user.role in User.ADMIN_ROLES:
+            if 'is_active' in data and not data.get('is_active'):
+                raise PermissionDenied('Admins cannot deactivate their own account.')
+            # Admins cannot demote their own role
+            if 'role' in data and data.get('role') != request.user.role:
+                raise PermissionDenied('Admins cannot change their own role.')
         return super().partial_update(request, *args, **kwargs)
 
     @action(detail=True, methods=['post'], url_path='force-logout')
     def force_logout(self, request, pk=None):
         target = self.get_object()
-        if target.role in User.ADMIN_ROLES:
-            raise PermissionDenied('Cannot force-logout an admin user.')
+        # Admins cannot force-logout themselves
+        if target.pk == request.user.pk and request.user.role in User.ADMIN_ROLES:
+            raise PermissionDenied('Admins cannot force-logout their own account.')
         target.is_active = False
         target.save(update_fields=['is_active'])
         return Response({'detail': 'User logged out and deactivated.'})

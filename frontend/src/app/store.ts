@@ -20,7 +20,7 @@ interface AppState {
   sidebarOpen: boolean
   setSidebarOpen: (open: boolean) => void
 
-  mapTool: 'pan' | 'identify' | 'measure' | 'buffer' | 'box_select' | 'select_location' | 'coord_picker'
+  mapTool: 'pan' | 'identify' | 'measure' | 'measure_area' | 'buffer' | 'box_select' | 'select_location' | 'coord_picker'
     | 'draw_point' | 'draw_line' | 'draw_polygon'
     | 'vertex_tool' | 'edit_features'
     | 'move_feature' | 'copy_move' | 'rotate_feature' | 'scale_feature' | 'simplify_feature'

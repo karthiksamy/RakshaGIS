@@ -37,13 +37,13 @@ import { shiftKeyOnly } from 'ol/events/condition'
 import {
   Tooltip, Button, Select as AntSelect, Space, Drawer, Descriptions, Tag,
   Slider, InputNumber, message, Modal, Input, ColorPicker, Popover, Divider, Switch,
-  Tabs, Badge, Form, Radio, Collapse, Segmented, Dropdown, Checkbox, AutoComplete, Spin,
+  Tabs, Badge, Form, Radio, Collapse, Segmented, Dropdown, Checkbox, AutoComplete, Spin, Popconfirm,
 } from 'antd'
 import {
   DragOutlined, AimOutlined, EditOutlined, InfoCircleOutlined,
   RadiusSettingOutlined, ColumnHeightOutlined,
   ZoomInOutlined, ZoomOutOutlined, GlobalOutlined,
-  BarsOutlined, ColumnWidthOutlined, RadiusUpleftOutlined,
+  BarsOutlined, ColumnWidthOutlined, RadiusUpleftOutlined, RadarChartOutlined,
   PlusOutlined, DeleteOutlined, CloseOutlined,
   UndoOutlined, PrinterOutlined, TableOutlined,
   EnvironmentOutlined, BookOutlined, CheckCircleOutlined,
@@ -59,6 +59,7 @@ import {
   CloudServerOutlined, BankOutlined, HighlightOutlined, CommentOutlined, CheckOutlined, BarChartOutlined,
   WifiOutlined, SyncOutlined, MenuOutlined,
   CodeOutlined, ToolOutlined, ScanOutlined, LineChartOutlined,
+  PlayCircleOutlined, PauseCircleOutlined, StepForwardOutlined,
 } from '@ant-design/icons'
 import TileWMS from 'ol/source/TileWMS'
 import HeatmapLayer from 'ol/layer/Heatmap'
@@ -226,8 +227,9 @@ const SELECT_TOOLS = [
 ]
 
 const MEASURE_TOOLS = [
-  { key: 'measure', icon: <ColumnWidthOutlined />,  label: 'Measure Distance/Area', desc: 'Draw a line to measure distance or area' },
-  { key: 'buffer',  icon: <RadiusUpleftOutlined />, label: 'Buffer Analysis',       desc: 'Create buffer zones around features' },
+  { key: 'measure',      icon: <ColumnWidthOutlined />,  label: 'Measure Distance', desc: 'Draw a line to measure geodesic distance and bearing' },
+  { key: 'measure_area', icon: <RadarChartOutlined />,   label: 'Measure Area',     desc: 'Draw a polygon to measure area (hectares / km²)' },
+  { key: 'buffer',       icon: <RadiusUpleftOutlined />, label: 'Buffer Analysis',  desc: 'Create buffer zones around features' },
 ]
 
 const DRAW_TOOLS = [
@@ -266,7 +268,8 @@ const TOOL_ACTIVITY_LABEL: Record<string, string> = {
   box_select:       'Box Selecting',
   select_location:  'Selecting by Polygon',
   coord_picker:     'Picking Coordinates',
-  measure:          'Measuring',
+  measure:          'Measuring Distance',
+  measure_area:     'Measuring Area',
   buffer:           'Buffer Analysis',
   draw_point:       'Drawing Point',
   draw_line:        'Drawing Line',
@@ -457,6 +460,197 @@ function _geomFlatCoords(geom: any): number[][] {
   if (t === 'MultiPolygon') return (geom as any).getCoordinates().flat(2)
   if (t === 'MultiLineString') return (geom as any).getCoordinates().flat()
   return []
+}
+
+// ── Time-series animation floating panel ─────────────────────────────────────
+
+interface TimelinePanelProps {
+  surveyAreas: { id: number; name: string }[]
+  timelineAreaId: number | null
+  setTimelineAreaId: (id: number | null) => void
+  timelineDate: string | null
+  setTimelineDate: (d: string | null) => void
+  timelinePlaying: boolean
+  setTimelinePlaying: (p: boolean) => void
+  timelineDates: string[]
+  setTimelineDates: (d: string[]) => void
+  timelineFeatures: any[]
+  setTimelineFeatures: (f: any[]) => void
+  timelineLoading: boolean
+  setTimelineLoading: (l: boolean) => void
+  timelineTimerRef: React.MutableRefObject<ReturnType<typeof setInterval> | null>
+  onClose: () => void
+}
+
+function TimelinePanel({
+  surveyAreas, timelineAreaId, setTimelineAreaId,
+  timelineDate, setTimelineDate,
+  timelinePlaying, setTimelinePlaying,
+  timelineDates, setTimelineDates,
+  timelineFeatures, setTimelineFeatures,
+  timelineLoading, setTimelineLoading,
+  timelineTimerRef, onClose,
+}: TimelinePanelProps) {
+  const loadHistory = React.useCallback(async (areaId: number) => {
+    setTimelineLoading(true)
+    try {
+      const res = await api.get(`/projects/survey-areas/${areaId}/history/`, {
+        params: { page_size: 500 },
+      })
+      const features: any[] = res.data.results ?? res.data
+      setTimelineFeatures(features)
+      // Collect unique dates sorted ascending
+      const dateSet = new Set<string>()
+      features.forEach((f: any) => {
+        const d = f.changed_at ?? f.created_at
+        if (d) dateSet.add(d.slice(0, 10))
+      })
+      const sorted = Array.from(dateSet).sort()
+      setTimelineDates(sorted)
+      setTimelineDate(sorted[0] ?? null)
+    } catch {
+      // silent
+    } finally {
+      setTimelineLoading(false)
+    }
+  }, [setTimelineLoading, setTimelineFeatures, setTimelineDates, setTimelineDate])
+
+  React.useEffect(() => {
+    if (timelineAreaId) loadHistory(timelineAreaId)
+  }, [timelineAreaId, loadHistory])
+
+  // Auto-advance playback
+  React.useEffect(() => {
+    if (!timelinePlaying || timelineDates.length === 0) {
+      if (timelineTimerRef.current) clearInterval(timelineTimerRef.current)
+      return
+    }
+    timelineTimerRef.current = setInterval(() => {
+      setTimelineDate(prev => {
+        const idx = prev ? timelineDates.indexOf(prev) : -1
+        if (idx >= timelineDates.length - 1) {
+          setTimelinePlaying(false)
+          return prev
+        }
+        return timelineDates[idx + 1]
+      })
+    }, 800)
+    return () => { if (timelineTimerRef.current) clearInterval(timelineTimerRef.current) }
+  }, [timelinePlaying, timelineDates, setTimelineDate, setTimelinePlaying, timelineTimerRef])
+
+  const dateIdx = timelineDate ? timelineDates.indexOf(timelineDate) : -1
+
+  // Features visible at current date
+  const visibleFeatures = timelineFeatures.filter((f: any) => {
+    const d = (f.changed_at ?? f.created_at ?? '').slice(0, 10)
+    return d <= (timelineDate ?? '')
+  })
+  const newToday = timelineFeatures.filter((f: any) => {
+    const d = (f.changed_at ?? f.created_at ?? '').slice(0, 10)
+    return d === timelineDate
+  })
+
+  const CHANGE_COLOR: Record<string, string> = {
+    CREATE: '#22c55e', MODIFY: '#3b82f6', DELETE: '#ef4444',
+    TRANSFER_OUT: '#f59e0b', TRANSFER_IN: '#8b5cf6',
+  }
+
+  return (
+    <div style={{
+      position: 'absolute', bottom: 60, left: '50%', transform: 'translateX(-50%)',
+      width: 480, background: 'rgba(8,10,24,0.97)', border: '1px solid #1a2a4a',
+      borderRadius: 10, padding: 12, zIndex: 30, boxShadow: '0 4px 24px rgba(0,0,0,0.7)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+        <HistoryOutlined style={{ color: '#4fc3f7', fontSize: 16 }} />
+        <span style={{ color: '#4fc3f7', fontWeight: 600, fontSize: 13, flex: 1 }}>Time-series Animation</span>
+        <Button size="small" type="text" onClick={onClose} icon={<CloseOutlined />} style={{ color: '#666' }} />
+      </div>
+
+      <div style={{ marginBottom: 8 }}>
+        <AntSelect
+          size="small" style={{ width: '100%' }}
+          placeholder="Select survey area…"
+          value={timelineAreaId}
+          onChange={id => { setTimelineAreaId(id); setTimelineDate(null); setTimelineDates([]) }}
+          options={surveyAreas.map((a: any) => ({ value: a.id, label: a.name }))}
+          showSearch filterOption={(q, o) => (o?.label as string || '').toLowerCase().includes(q.toLowerCase())}
+        />
+      </div>
+
+      {timelineLoading && (
+        <div style={{ textAlign: 'center', padding: 8 }}>
+          <Spin size="small" /> <span style={{ color: '#888', fontSize: 11 }}>Loading history…</span>
+        </div>
+      )}
+
+      {timelineDates.length > 0 && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+            <Button
+              size="small" shape="circle"
+              icon={timelinePlaying ? <PauseCircleOutlined /> : <PlayCircleOutlined />}
+              type="primary"
+              onClick={() => setTimelinePlaying(!timelinePlaying)}
+            />
+            <Button
+              size="small" shape="circle"
+              icon={<StepForwardOutlined />}
+              onClick={() => {
+                const next = dateIdx < timelineDates.length - 1 ? timelineDates[dateIdx + 1] : timelineDates[0]
+                setTimelineDate(next)
+              }}
+            />
+            <span style={{ color: '#4fc3f7', fontSize: 12, fontWeight: 600, minWidth: 90 }}>
+              {timelineDate || '—'}
+            </span>
+            <span style={{ color: '#888', fontSize: 11, flex: 1, textAlign: 'right' }}>
+              {dateIdx + 1} / {timelineDates.length} days
+            </span>
+          </div>
+
+          <Slider
+            min={0} max={timelineDates.length - 1}
+            value={dateIdx >= 0 ? dateIdx : 0}
+            onChange={(v: number) => { setTimelineDate(timelineDates[v]); setTimelinePlaying(false) }}
+            tooltip={{ formatter: (v?: number) => timelineDates[v ?? 0] ?? '' }}
+            style={{ margin: '0 4px 8px' }}
+          />
+
+          <div style={{ display: 'flex', gap: 12, fontSize: 11, color: '#888', marginBottom: 6 }}>
+            <span style={{ color: '#e0e0e0' }}>{visibleFeatures.length} features visible</span>
+            {newToday.length > 0 && (
+              <span style={{ color: '#22c55e' }}>+{newToday.length} new today</span>
+            )}
+          </div>
+
+          {newToday.length > 0 && (
+            <div style={{ maxHeight: 100, overflowY: 'auto', fontSize: 10 }}>
+              {newToday.slice(0, 8).map((f: any, i: number) => (
+                <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'center',
+                                      padding: '2px 4px', borderBottom: '1px solid #111' }}>
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, display: 'inline-block',
+                                 background: CHANGE_COLOR[f.change_type ?? 'CREATE'] ?? '#888' }} />
+                  <span style={{ color: CHANGE_COLOR[f.change_type ?? 'CREATE'] ?? '#888', minWidth: 64 }}>
+                    {f.change_type ?? 'CREATE'}
+                  </span>
+                  <span style={{ color: '#aaa', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {f.layer_name || f.feature_id || `ID ${f.id}`}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {!timelineLoading && timelineAreaId && timelineDates.length === 0 && (
+        <div style={{ color: '#555', fontSize: 11, textAlign: 'center', padding: 8 }}>
+          No history records found for this area
+        </div>
+      )}
+    </div>
+  )
 }
 
 export default function MapPage() {
@@ -767,6 +961,20 @@ export default function MapPage() {
   const [enliCode, setEnliCode] = useState('')
   const [enliSearching, setEnliSearching] = useState(false)
   const [toolbarVisible, setToolbarVisible] = useState(false)
+  const [featureSearchOpen, setFeatureSearchOpen]   = useState(false)
+  const [featureSearchQuery, setFeatureSearchQuery] = useState('')
+  const [featureSearchResults, setFeatureSearchResults] = useState<any[]>([])
+  const [featureSearching, setFeatureSearching]     = useState(false)
+
+  // ── Time-series animation ──────────────────────────────────────────────────
+  const [timelineOpen, setTimelineOpen]         = useState(false)
+  const [timelineAreaId, setTimelineAreaId]     = useState<number | null>(null)
+  const [timelineDate, setTimelineDate]         = useState<string | null>(null)
+  const [timelinePlaying, setTimelinePlaying]   = useState(false)
+  const [timelineDates, setTimelineDates]       = useState<string[]>([])
+  const [timelineFeatures, setTimelineFeatures] = useState<any[]>([])
+  const [timelineLoading, setTimelineLoading]   = useState(false)
+  const timelineTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // Coordinate picker
   const [coordModalOpen, setCoordModalOpen] = useState(false)
@@ -3080,6 +3288,32 @@ export default function MapPage() {
       drawInteraction.current = draw
     }
 
+    if (mapTool === 'measure_area' && measureLayer.current) {
+      measureLayer.current.getSource()!.clear()
+      setMeasureResult(null)
+      const draw = new Draw({ source: measureLayer.current.getSource()!, type: 'Polygon' })
+      draw.on('drawstart', (e) => {
+        e.feature.getGeometry()!.on('change', () => {
+          const geom = e.feature.getGeometry() as Polygon
+          const area = getArea(geom)
+          const perim = getLength(new LineString((geom as Polygon).getLinearRing(0)!.getCoordinates()))
+          setMeasureResult(
+            `Area: ${(area / 10000).toFixed(3)} ha  (${(area / 1e6).toFixed(4)} km²)  |  Perimeter: ${(perim / 1000).toFixed(3)} km`
+          )
+        })
+      })
+      draw.on('drawend', (e) => {
+        const geom = e.feature.getGeometry() as Polygon
+        const area = getArea(geom)
+        const perim = getLength(new LineString((geom as Polygon).getLinearRing(0)!.getCoordinates()))
+        setMeasureResult(
+          `Area: ${(area / 10000).toFixed(3)} ha  (${(area / 1e6).toFixed(4)} km²)  |  Perimeter: ${(perim / 1000).toFixed(3)} km`
+        )
+      })
+      map.addInteraction(draw)
+      drawInteraction.current = draw
+    }
+
     // Vertex tool — edit vertices on all features in the project layer
     if (!isReadOnly && (mapTool === 'vertex_tool' || mapTool === 'edit_features') && projectLayer.current) {
       const src = projectLayer.current.getSource()!
@@ -3805,6 +4039,31 @@ export default function MapPage() {
     setBookmarks(updated)
     localStorage.setItem(BOOKMARKS_KEY, JSON.stringify(updated))
   }, [bookmarks])
+
+  // ── Feature search ──────────────────────────────────────────────────────────
+
+  const handleFeatureSearch = useCallback(async (q: string) => {
+    if (!q.trim()) { setFeatureSearchResults([]); return }
+    setFeatureSearching(true)
+    try {
+      const params: Record<string, string> = { search: q, page_size: '50' }
+      if (selectedProjectId) params.project = String(selectedProjectId)
+      const res = await api.get('/projects/features/', { params })
+      setFeatureSearchResults(res.data?.results ?? res.data ?? [])
+    } catch { setFeatureSearchResults([]) }
+    finally { setFeatureSearching(false) }
+  }, [selectedProjectId])
+
+  const handleZoomToFeature = useCallback((feat: any) => {
+    const map = mapInstance.current
+    if (!map || !feat.geometry) return
+    try {
+      const fmt = new GeoJSON()
+      const olFeat = fmt.readFeature(feat, { dataProjection: 'EPSG:4326', featureProjection: 'EPSG:3857' })
+      const extent = olFeat.getGeometry()?.getExtent()
+      if (extent) map.getView().fit(extent, { padding: [80, 80, 80, 80], duration: 700, maxZoom: 17 })
+    } catch { /* skip malformed */ }
+  }, [])
 
   // ── Layer management helpers ────────────────────────────────────────────────
 
@@ -5121,6 +5380,12 @@ export default function MapPage() {
                   <Tooltip title={<span><b>Georeferencer</b><br /><span style={{fontSize:11,color:'#aaa'}}>Georeference a scanned image</span></span>} placement="right">
                     <div style={btnStyle(georeferencerOpen)} onClick={() => setGeoreferencerOpen(true)}><ScanOutlined /></div>
                   </Tooltip>
+                  <Tooltip title={<span><b>Feature Search</b><br /><span style={{fontSize:11,color:'#aaa'}}>Search features by layer name, ID or attribute</span></span>} placement="right">
+                    <div style={btnStyle(featureSearchOpen)} onClick={() => setFeatureSearchOpen(o => !o)}><SearchOutlined /></div>
+                  </Tooltip>
+                  <Tooltip title={<span><b>Time-series Animation</b><br /><span style={{fontSize:11,color:'#aaa'}}>Play through feature history snapshots for selected area</span></span>} placement="right">
+                    <div style={btnStyle(timelineOpen)} onClick={() => setTimelineOpen(o => !o)}><HistoryOutlined /></div>
+                  </Tooltip>
                 </div>
               )}
 
@@ -5493,6 +5758,93 @@ export default function MapPage() {
             </Tooltip>
           )}
         </div>
+      )}
+
+      {/* Feature search floating panel */}
+      {featureSearchOpen && (
+        <div style={{
+          position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
+          width: 380, background: 'rgba(10,12,28,0.97)', border: '1px solid #2a2a4a',
+          borderRadius: 8, padding: 10, zIndex: 30, boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
+        }}>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+            <Input
+              size="small" placeholder="Search by layer name, feature ID or attribute…"
+              value={featureSearchQuery} autoFocus
+              onChange={e => setFeatureSearchQuery(e.target.value)}
+              onPressEnter={() => handleFeatureSearch(featureSearchQuery)}
+              prefix={<SearchOutlined style={{ color: '#555' }} />}
+              style={{ flex: 1 }}
+            />
+            <Button size="small" type="primary" loading={featureSearching}
+              onClick={() => handleFeatureSearch(featureSearchQuery)}>Search</Button>
+            <Button size="small" onClick={() => { setFeatureSearchOpen(false); setFeatureSearchResults([]); setFeatureSearchQuery('') }}>✕</Button>
+          </div>
+          {featureSearchResults.length > 0 && (
+            <div style={{ maxHeight: 260, overflowY: 'auto' }}>
+              {featureSearchResults.map((feat: any) => (
+                <div key={feat.id}
+                  onClick={() => handleZoomToFeature(feat)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px',
+                    borderRadius: 4, cursor: 'pointer', marginBottom: 2,
+                    background: 'rgba(255,255,255,0.03)',
+                    border: '1px solid #1a1a2e',
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = 'rgba(79,195,247,0.1)')}
+                  onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.03)')}
+                >
+                  <span style={{
+                    width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+                    background: feat.geometry_type === 'POINT' ? '#4fc3f7'
+                      : feat.geometry_type === 'LINE' ? '#52c41a' : '#fa8c16',
+                  }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ color: '#e0e0e0', fontSize: 12, fontWeight: 500,
+                                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {feat.layer_name || 'Unnamed'}
+                    </div>
+                    <div style={{ color: '#666', fontSize: 10 }}>
+                      ID: {feat.feature_id || feat.id}
+                      {feat.attributes && Object.keys(feat.attributes).length > 0 &&
+                        ` · ${Object.entries(feat.attributes).slice(0, 2).map(([k,v]) => `${k}: ${v}`).join(' · ')}`}
+                    </div>
+                  </div>
+                  <span style={{ color: '#4fc3f7', fontSize: 10, flexShrink: 0 }}>Zoom →</span>
+                </div>
+              ))}
+              {featureSearchResults.length === 50 && (
+                <div style={{ color: '#666', fontSize: 10, textAlign: 'center', padding: 4 }}>
+                  Showing first 50 results — refine your search
+                </div>
+              )}
+            </div>
+          )}
+          {!featureSearching && featureSearchQuery && featureSearchResults.length === 0 && (
+            <div style={{ color: '#666', fontSize: 11, textAlign: 'center', padding: 8 }}>No features found</div>
+          )}
+        </div>
+      )}
+
+      {/* Time-series animation panel */}
+      {timelineOpen && (
+        <TimelinePanel
+          surveyAreas={surveyAreas as any[]}
+          timelineAreaId={timelineAreaId}
+          setTimelineAreaId={setTimelineAreaId}
+          timelineDate={timelineDate}
+          setTimelineDate={setTimelineDate}
+          timelinePlaying={timelinePlaying}
+          setTimelinePlaying={setTimelinePlaying}
+          timelineDates={timelineDates}
+          setTimelineDates={setTimelineDates}
+          timelineFeatures={timelineFeatures}
+          setTimelineFeatures={setTimelineFeatures}
+          timelineLoading={timelineLoading}
+          setTimelineLoading={setTimelineLoading}
+          timelineTimerRef={timelineTimerRef}
+          onClose={() => setTimelineOpen(false)}
+        />
       )}
 
       {/* Live measure / draw feedback */}

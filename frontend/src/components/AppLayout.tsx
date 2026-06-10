@@ -60,6 +60,7 @@ const SETTINGS_NAV_ITEMS = [
   { key: '/settings/branding',       icon: <BgColorsOutlined />,    label: 'Branding'           },
   { key: '/settings/ai-config',      icon: <RobotOutlined />,       label: 'AI Config'          },
   { key: '/settings/external-data',  icon: <CloudServerOutlined />, label: 'External Data'      },
+  { key: '/settings/security',       icon: <SafetyOutlined />,      label: 'Security / 2FA'     },
 ]
 
 export default function AppLayout() {

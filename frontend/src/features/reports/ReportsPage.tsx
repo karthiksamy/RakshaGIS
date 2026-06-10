@@ -2,10 +2,11 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Button, Table, Tag, Modal, Form, Input, Select, Space, message,
-  Switch, Tooltip, Popconfirm, Typography, Row, Col,
+  Switch, Tooltip, Popconfirm, Typography, Row, Col, InputNumber,
 } from 'antd'
 import {
   PlusOutlined, EditOutlined, DeleteOutlined, SendOutlined, PlayCircleOutlined,
+  EnvironmentOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { useTranslation } from 'react-i18next'
@@ -25,6 +26,7 @@ interface ReportSchedule {
   organisation: number
   organisation_name: string
   is_active: boolean
+  filters: Record<string, any>
   last_sent: string | null
   next_run: string | null
 }
@@ -78,8 +80,11 @@ export default function ReportsPage() {
     onError: () => message.error('Failed to queue report'),
   })
 
+  const [reportType, setReportType] = useState<string>('')
+
   function openEdit(item: ReportSchedule) {
     setEditItem(item)
+    setReportType(item.report_type)
     form.setFieldsValue({
       name: item.name,
       report_type: item.report_type,
@@ -87,6 +92,7 @@ export default function ReportsPage() {
       recipients: item.recipients,
       organisation: item.organisation,
       is_active: item.is_active,
+      filters: item.filters,
     })
     setModalOpen(true)
   }
@@ -168,11 +174,15 @@ export default function ReportsPage() {
           <Row gutter={12}>
             <Col span={12}>
               <Form.Item name="report_type" label={t("reports.report_type")} rules={[{ required: true }]}>
-                <Select options={[
-                  { value: 'STATUS_SUMMARY', label: 'Project Status Summary' },
-                  { value: 'FEATURE_EXPORT', label: 'Feature Data Export' },
-                  { value: 'ACTIVITY_LOG', label: 'User Activity Log' },
-                ]} />
+                <Select
+                  onChange={(v: string) => setReportType(v)}
+                  options={[
+                    { value: 'STATUS_SUMMARY',  label: 'Project Status Summary' },
+                    { value: 'FEATURE_EXPORT',  label: 'Feature Data Export' },
+                    { value: 'ACTIVITY_LOG',    label: 'User Activity Log' },
+                    { value: 'TERRAIN_SUMMARY', label: '🗺 Terrain Analysis Summary (PDF)' },
+                  ]}
+                />
               </Form.Item>
             </Col>
             <Col span={12}>
@@ -199,6 +209,35 @@ export default function ReportsPage() {
           >
             <Input.TextArea rows={2} placeholder="user1@example.com, user2@example.com" />
           </Form.Item>
+
+          {reportType === 'TERRAIN_SUMMARY' && (
+            <>
+              <Form.Item
+                label={<><EnvironmentOutlined /> Watched Area Name</>}
+                name={['filters', 'area_name']}
+              >
+                <Input placeholder="e.g. AFS Sulur northern perimeter" />
+              </Form.Item>
+              <Form.Item label="Bounding Box (minLon, minLat, maxLon, maxLat)" style={{ marginBottom: 4 }}>
+                <Row gutter={4}>
+                  {(['minLon','minLat','maxLon','maxLat'] as const).map((k, i) => (
+                    <Col span={6} key={k}>
+                      <Form.Item name={['filters', 'bbox', i]} noStyle>
+                        <InputNumber
+                          placeholder={k} style={{ width: '100%' }}
+                          step={0.001} size="small"
+                        />
+                      </Form.Item>
+                    </Col>
+                  ))}
+                </Row>
+                <div style={{ fontSize: 10, color: '#888', marginTop: 3 }}>
+                  Leave blank to report on the whole organisation. PDF attached to email.
+                </div>
+              </Form.Item>
+            </>
+          )}
+
           <Form.Item name="is_active" label="Active" valuePropName="checked" initialValue={true}>
             <Switch />
           </Form.Item>

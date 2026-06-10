@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
 import {
   Button, InputNumber, Select, Spin, Tag, Tooltip,
-  Typography, Divider, Row, Col, Alert,
+  Typography, Divider, Row, Col, Alert, DatePicker, TimePicker,
 } from 'antd'
 import {
   AreaChartOutlined, CompassOutlined, LineChartOutlined,
@@ -9,7 +9,10 @@ import {
   RadarChartOutlined, ColumnWidthOutlined,
   AlertOutlined, WarningOutlined, GlobalOutlined,
   DownloadOutlined, CloseOutlined, PlayCircleOutlined,
+  DropboxOutlined, SunOutlined, CarOutlined,
+  DiffOutlined, RocketOutlined, WifiOutlined,
 } from '@ant-design/icons'
+import dayjs from 'dayjs'
 import api from '@/services/api'
 
 const { Text } = Typography
@@ -33,6 +36,7 @@ export interface DEMLayer {
 
 interface Props {
   gridData: SlopeGridData | null
+  referenceGrid: SlopeGridData | null
   onOverlay: (layer: DEMLayer) => void
   onClearOverlays: () => void
 }
@@ -58,8 +62,20 @@ const TOOLS = [
     desc: 'Risk index combining slope, curvature and elevation. Red=very high.' },
   { id: 'watershed',     label: 'Watershed',     icon: <NodeIndexOutlined />,   color: '#08979c',
     desc: 'Delineate drainage basin using D8 flow direction algorithm.' },
-  { id: 'cross_section', label: 'Cross Sections',icon: <ColumnWidthOutlined />, color: '#d46b08',
+  { id: 'cross_section',  label: 'Cross Sections', icon: <ColumnWidthOutlined />, color: '#d46b08',
     desc: 'N–S and E–W elevation cross-sections through the study area.' },
+  { id: 'twi',            label: 'TWI',            icon: <DropboxOutlined />,    color: '#0891b2',
+    desc: 'Topographic Wetness Index — ln(flow_acc × cell_area / tan(slope)). Identifies waterlogging-prone zones.' },
+  { id: 'solar_shadow',   label: 'Solar Shadow',   icon: <SunOutlined />,        color: '#d97706',
+    desc: 'Hillshade + shadow mask for a given date/time. Useful for LZ assessment and solar panel siting.' },
+  { id: 'trafficability',    label: 'Trafficability',    icon: <CarOutlined />,     color: '#16a34a',
+    desc: 'Off-road vehicle passability map combining slope and terrain roughness. Green=easy, Red=impassable.' },
+  { id: 'change_detection', label: 'Change Detect',    icon: <DiffOutlined />,    color: '#a855f7',
+    desc: 'Compare two DEMs (before/after) → cut/fill difference map. Load reference DEM first.' },
+  { id: 'lz_assessment',   label: 'LZ Assessment',    icon: <RocketOutlined />,  color: '#0ea5e9',
+    desc: 'Helicopter landing zone scoring: slope < 7°, clear radius, approach corridor. Green=excellent.' },
+  { id: 'rf_coverage',     label: 'RF Coverage',      icon: <WifiOutlined />,    color: '#f59e0b',
+    desc: 'Radio line-of-sight coverage with first Fresnel zone analysis. Green=clear LoS, Red=blocked.' },
 ]
 
 // ── stat row ────────────────────────────────────────────────────────────────
@@ -296,6 +312,110 @@ function WatershedParams({ params, setParams }: any) {
   )
 }
 
+function LZParams({ params, setParams }: any) {
+  return (
+    <>
+      <Row gutter={8}>
+        <Col span={8}>
+          <Text style={{ color: '#888', fontSize: 10 }}>Radius (m)</Text>
+          <InputNumber size="small" min={10} max={200} step={5}
+            value={params.radius_m ?? 30}
+            onChange={v => setParams((p: any) => ({ ...p, radius_m: v }))}
+            style={{ width: '100%' }} />
+        </Col>
+        <Col span={8}>
+          <Text style={{ color: '#888', fontSize: 10 }}>Approach dir°</Text>
+          <InputNumber size="small" min={0} max={359} step={5}
+            value={params.approach_deg ?? 270}
+            onChange={v => setParams((p: any) => ({ ...p, approach_deg: v }))}
+            style={{ width: '100%' }} />
+        </Col>
+        <Col span={8}>
+          <Text style={{ color: '#888', fontSize: 10 }}>Clear dist (m)</Text>
+          <InputNumber size="small" min={50} max={1000} step={50}
+            value={params.approach_m ?? 200}
+            onChange={v => setParams((p: any) => ({ ...p, approach_m: v }))}
+            style={{ width: '100%' }} />
+        </Col>
+      </Row>
+      <div style={{ fontSize: 9, color: '#555', marginTop: 4 }}>
+        Approach dir = direction helicopter arrives from (0°=N, 90°=E, 270°=W)
+      </div>
+    </>
+  )
+}
+
+function RFParams({ params, setParams }: any) {
+  return (
+    <>
+      <Row gutter={8} style={{ marginBottom: 4 }}>
+        <Col span={12}>
+          <Text style={{ color: '#888', fontSize: 10 }}>Tower Lat</Text>
+          <InputNumber size="small" step={0.001}
+            value={params.tower_lat}
+            onChange={v => setParams((p: any) => ({ ...p, tower_lat: v }))}
+            style={{ width: '100%' }} placeholder="auto (centre)" />
+        </Col>
+        <Col span={12}>
+          <Text style={{ color: '#888', fontSize: 10 }}>Tower Lon</Text>
+          <InputNumber size="small" step={0.001}
+            value={params.tower_lon}
+            onChange={v => setParams((p: any) => ({ ...p, tower_lon: v }))}
+            style={{ width: '100%' }} placeholder="auto (centre)" />
+        </Col>
+      </Row>
+      <Row gutter={8}>
+        <Col span={8}>
+          <Text style={{ color: '#888', fontSize: 10 }}>Height (m)</Text>
+          <InputNumber size="small" min={1} max={500}
+            value={params.tower_height_m ?? 30}
+            onChange={v => setParams((p: any) => ({ ...p, tower_height_m: v }))}
+            style={{ width: '100%' }} />
+        </Col>
+        <Col span={8}>
+          <Text style={{ color: '#888', fontSize: 10 }}>Freq (MHz)</Text>
+          <InputNumber size="small" min={1} max={6000}
+            value={params.freq_mhz ?? 150}
+            onChange={v => setParams((p: any) => ({ ...p, freq_mhz: v }))}
+            style={{ width: '100%' }} />
+        </Col>
+        <Col span={8}>
+          <Text style={{ color: '#888', fontSize: 10 }}>Rx height (m)</Text>
+          <InputNumber size="small" min={0.5} max={50} step={0.5}
+            value={params.rx_height_m ?? 2}
+            onChange={v => setParams((p: any) => ({ ...p, rx_height_m: v }))}
+            style={{ width: '100%' }} />
+        </Col>
+      </Row>
+    </>
+  )
+}
+
+function SolarParams({ params, setParams }: any) {
+  return (
+    <Row gutter={8}>
+      <Col span={14}>
+        <Text style={{ color: '#888', fontSize: 10 }}>Date</Text>
+        <DatePicker
+          size="small" style={{ width: '100%' }}
+          value={params.date ? dayjs(params.date) : dayjs('2024-06-21')}
+          onChange={d => setParams((p: any) => ({ ...p, date: d ? d.format('YYYY-MM-DD') : '2024-06-21' }))}
+          allowClear={false}
+        />
+      </Col>
+      <Col span={10}>
+        <Text style={{ color: '#888', fontSize: 10 }}>Time (UTC)</Text>
+        <TimePicker
+          size="small" style={{ width: '100%' }} format="HH:mm" minuteStep={15}
+          value={params.time ? dayjs(`2024-01-01 ${params.time}`) : dayjs('2024-01-01 12:00')}
+          onChange={t => setParams((p: any) => ({ ...p, time: t ? t.format('HH:mm') : '12:00' }))}
+          allowClear={false}
+        />
+      </Col>
+    </Row>
+  )
+}
+
 // ── result stats renderer ────────────────────────────────────────────────────
 
 function ResultStats({ result }: { result: any }) {
@@ -398,12 +518,102 @@ function ResultStats({ result }: { result: any }) {
     </div>
   )
 
+  if (result.type === 'twi') return (
+    <>
+      <StatRow label="TWI min (5th pct)"  value={s.twi_min}  color="#0891b2" />
+      <StatRow label="TWI mean"           value={s.twi_mean} />
+      <StatRow label="TWI max (95th pct)" value={s.twi_max}  color="#0891b2" />
+      <StatRow label="Waterlogging risk"  value={`${s.waterlogging_risk_pct}% of area`} color="#38bdf8" />
+      <StatRow label="Cell area"          value={`${s.cell_area_m2} m²`} />
+      <div style={{ fontSize: 9, color: '#555', marginTop: 4 }}>
+        Blue = high TWI (wet/waterlogged) · Brown = low TWI (dry/ridge)
+      </div>
+    </>
+  )
+
+  if (result.type === 'solar_shadow') return (
+    <>
+      <StatRow label="Date / Time"       value={`${s.date}  ${s.time} UTC`} color="#d97706" />
+      <StatRow label="Sun elevation"     value={`${s.sun_elevation_deg}°`}  color="#fbbf24" />
+      <StatRow label="Sun azimuth"       value={`${s.sun_azimuth_deg}°`} />
+      <StatRow label="Shadowed area"     value={`${s.shadowed_area_pct}%`}  color="#60a5fa" />
+      {s.sun_elevation_deg <= 0 && (
+        <div style={{ fontSize: 10, color: '#ef4444', marginTop: 4 }}>
+          Sun is below horizon at this date/time — entire area in shadow.
+        </div>
+      )}
+      <div style={{ fontSize: 9, color: '#555', marginTop: 4 }}>
+        Dark blue = shadow · Bright = direct sunlight
+      </div>
+    </>
+  )
+
+  if (result.type === 'trafficability') return (
+    <>
+      <StatRow label="Easy (0–8°)"      value={`${s.easy_pct}%`}       color="#22c55e" />
+      <StatRow label="Moderate (8–15°)" value={`${s.moderate_pct}%`}   color="#eab308" />
+      <StatRow label="Difficult (15–30°)" value={`${s.difficult_pct}%`} color="#f97316" />
+      <StatRow label="Impassable (>30°)" value={`${s.impassable_pct}%`} color="#ef4444" />
+      <StatRow label="Passable area"    value={`${s.passable_area_km2} km²`} color="#22c55e" />
+      <div style={{ fontSize: 9, color: '#555', marginTop: 4 }}>
+        Green=Easy · Yellow=Moderate · Orange=Difficult · Red=Impassable
+      </div>
+    </>
+  )
+
+  if (result.type === 'change_detection') return (
+    <>
+      <StatRow label="Cut volume"   value={`${s.cut_volume_m3.toLocaleString()} m³`}  color="#ef4444" />
+      <StatRow label="Fill volume"  value={`${s.fill_volume_m3.toLocaleString()} m³`} color="#3b82f6" />
+      <StatRow label="Net change"   value={`${s.net_change_m3 >= 0 ? '+' : ''}${s.net_change_m3.toLocaleString()} m³`}
+        color={s.net_change_m3 >= 0 ? '#3b82f6' : '#ef4444'} />
+      <StatRow label="Cut area"     value={`${s.cut_area_pct}%`}  color="#ef4444" />
+      <StatRow label="Fill area"    value={`${s.fill_area_pct}%`} color="#3b82f6" />
+      <StatRow label="Max cut"      value={`${s.max_cut_m} m`}  color="#f87171" />
+      <StatRow label="Max fill"     value={`${s.max_fill_m} m`} color="#60a5fa" />
+      <StatRow label="RMSE"         value={`${s.rmse_m} m`} />
+      <div style={{ fontSize: 9, color: '#555', marginTop: 4 }}>
+        Red=cut (material removed) · Blue=fill (material added)
+      </div>
+    </>
+  )
+
+  if (result.type === 'lz_assessment') return (
+    <>
+      <StatRow label="Excellent (≥80)" value={`${s.excellent_pct}%`}  color="#22c55e" />
+      <StatRow label="Good (60–79)"    value={`${s.good_pct}%`}       color="#84cc16" />
+      <StatRow label="Marginal (40–59)" value={`${s.marginal_pct}%`}  color="#eab308" />
+      <StatRow label="Unsuitable (<40)" value={`${s.unsuitable_pct}%`} color="#ef4444" />
+      <StatRow label="Candidate zones" value={s.candidate_zones}      color="#22c55e" />
+      <StatRow label="LZ radius"       value={`${s.lz_radius_m} m`} />
+      <StatRow label="Approach dir"    value={`${s.approach_dir_deg}°`} />
+      <div style={{ fontSize: 9, color: '#555', marginTop: 4 }}>
+        Green=Excellent · Yellow=Good/Marginal · Red=Unsuitable
+      </div>
+    </>
+  )
+
+  if (result.type === 'rf_coverage') return (
+    <>
+      <StatRow label="Clear LoS"       value={`${s.excellent_los_pct}%`}   color="#22c55e" />
+      <StatRow label="Minor Fresnel"   value={`${s.minor_fresnel_pct}%`}   color="#84cc16" />
+      <StatRow label="Partial Fresnel" value={`${s.partial_fresnel_pct}%`} color="#eab308" />
+      <StatRow label="No coverage"     value={`${s.no_coverage_pct}%`}     color="#ef4444" />
+      <StatRow label="Tower height"    value={`${s.tower_height_m} m`} />
+      <StatRow label="Frequency"       value={`${s.freq_mhz} MHz`} />
+      <StatRow label="Tower location"  value={`${s.tower_lat?.toFixed(4)}°, ${s.tower_lon?.toFixed(4)}°`} />
+      <div style={{ fontSize: 9, color: '#555', marginTop: 4 }}>
+        Green=Clear LoS · Yellow=Fresnel partial · Red=Blocked · Yellow dot=Tower
+      </div>
+    </>
+  )
+
   return null
 }
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export default function DEMAnalysisPanel({ gridData, onOverlay, onClearOverlays }: Props) {
+export default function DEMAnalysisPanel({ gridData, referenceGrid, onOverlay, onClearOverlays }: Props) {
   const [selected, setSelected]   = useState<string | null>(null)
   const [params, setParams]       = useState<Record<string, any>>({})
   const [loading, setLoading]     = useState(false)
@@ -415,14 +625,21 @@ export default function DEMAnalysisPanel({ gridData, onOverlay, onClearOverlays 
 
   const runAnalysis = useCallback(async () => {
     if (!gridData || !selected) return
+    if (selected === 'change_detection' && !referenceGrid) {
+      setError('Load a reference DEM first using "Set as Reference" in the toolbar.')
+      return
+    }
     setLoading(true); setError(null); setResult(null)
     try {
+      const extraParams = selected === 'change_detection' && referenceGrid
+        ? { ...params, grid2: referenceGrid.elevGrid }
+        : params
       const res = await api.post('/core/terrain/dem-analysis/', {
         type: selected,
         elevGrid: gridData.elevGrid,
         bbox:     gridData.bbox,
         gridN:    gridData.gridN,
-        params:   params,
+        params:   extraParams,
       })
       setResult(res.data)
     } catch (e: any) {
@@ -430,7 +647,7 @@ export default function DEMAnalysisPanel({ gridData, onOverlay, onClearOverlays 
     } finally {
       setLoading(false)
     }
-  }, [gridData, selected, params])
+  }, [gridData, referenceGrid, selected, params])
 
   const handleOverlay = useCallback(() => {
     if (!result) return
@@ -446,13 +663,42 @@ export default function DEMAnalysisPanel({ gridData, onOverlay, onClearOverlays 
     setOverlaid(prev => new Set([...prev, id]))
   }, [result, tool, onOverlay])
 
+  const datestamp = new Date().toISOString().slice(0, 10)
+
   const downloadImage = useCallback(() => {
     if (!result?.image) return
     const a = document.createElement('a')
     a.href = result.image
-    a.download = `dem-${result.type}-${new Date().toISOString().slice(0,10)}.png`
+    a.download = `dem-${result.type}-${datestamp}.png`
     a.click()
-  }, [result])
+  }, [result, datestamp])
+
+  const downloadGeoJSON = useCallback(() => {
+    if (!result?.geojson) return
+    const blob = new Blob([JSON.stringify(result.geojson, null, 2)], { type: 'application/json' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `dem-${result.type}-${datestamp}.geojson`
+    a.click()
+    URL.revokeObjectURL(a.href)
+  }, [result, datestamp])
+
+  const downloadCSV = useCallback(() => {
+    if (!result?.profiles) return
+    const rows: string[] = ['profile,point,distance_m,elevation_m']
+    result.profiles.forEach((p: any) => {
+      p.points.forEach((pt: any, i: number) => {
+        rows.push(`${p.label},${i + 1},${pt.dist.toFixed(1)},${pt.elev.toFixed(2)}`)
+      })
+    })
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `dem-cross-sections-${datestamp}.csv`
+    a.click()
+    URL.revokeObjectURL(a.href)
+  }, [result, datestamp])
+
 
   return (
     <div style={{ padding: '0 4px' }}>
@@ -494,13 +740,24 @@ export default function DEMAnalysisPanel({ gridData, onOverlay, onClearOverlays 
 
           {/* Parameters */}
           <div style={{ marginBottom: 8 }}>
-            {selected === 'contours'     && <ContourParams  params={params} setParams={setParams} />}
-            {selected === 'curvature'    && <CurvatureParams params={params} setParams={setParams} />}
-            {selected === 'viewshed'     && <ViewshedParams  params={params} setParams={setParams} />}
+            {selected === 'contours'          && <ContourParams   params={params} setParams={setParams} />}
+            {selected === 'curvature'         && <CurvatureParams params={params} setParams={setParams} />}
+            {selected === 'viewshed'          && <ViewshedParams  params={params} setParams={setParams} />}
             {(selected === 'volume' || selected === 'cut_fill') &&
-                                            <VolumeParams    params={params} setParams={setParams} />}
-            {selected === 'flood'        && <FloodParams     params={params} setParams={setParams} />}
-            {selected === 'watershed'    && <WatershedParams params={params} setParams={setParams} />}
+                                               <VolumeParams    params={params} setParams={setParams} />}
+            {selected === 'flood'             && <FloodParams     params={params} setParams={setParams} />}
+            {selected === 'watershed'         && <WatershedParams params={params} setParams={setParams} />}
+            {selected === 'solar_shadow'      && <SolarParams     params={params} setParams={setParams} />}
+            {selected === 'lz_assessment'     && <LZParams        params={params} setParams={setParams} />}
+            {selected === 'rf_coverage'       && <RFParams        params={params} setParams={setParams} />}
+            {selected === 'change_detection'  && (
+              <div style={{ fontSize: 10, padding: '4px 6px', background: referenceGrid ? '#0a2a1a' : '#2a0a0a',
+                            borderRadius: 4, border: `1px solid ${referenceGrid ? '#16a34a' : '#7f1d1d'}` }}>
+                {referenceGrid
+                  ? <span style={{ color: '#4ade80' }}>Reference DEM loaded ({referenceGrid.elevGrid.length} cells). Current DEM is "after".</span>
+                  : <span style={{ color: '#f87171' }}>No reference DEM. Click "Set as Reference" in toolbar, then load new DEM.</span>}
+              </div>
+            )}
           </div>
 
           <Button
@@ -549,25 +806,56 @@ export default function DEMAnalysisPanel({ gridData, onOverlay, onClearOverlays 
           )}
 
           {/* Actions */}
-          <div style={{ display: 'flex', gap: 6 }}>
-            {(result.image || result.geojson) && (
-              <Button size="small" icon={<GlobalOutlined />} onClick={handleOverlay}
-                style={{ flex: 1, fontSize: 11, color: '#4fc3f7', borderColor: '#4fc3f7',
-                         background: 'transparent' }}>
-                Overlay Globe
-              </Button>
-            )}
-            {result.image && (
-              <Tooltip title="Download PNG">
-                <Button size="small" icon={<DownloadOutlined />} onClick={downloadImage}
-                  style={{ background: 'transparent', borderColor: '#555', color: '#888' }} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {/* Overlay row */}
+            <div style={{ display: 'flex', gap: 6 }}>
+              {(result.image || result.geojson) && (
+                <Button size="small" icon={<GlobalOutlined />} onClick={handleOverlay}
+                  style={{ flex: 1, fontSize: 11, color: '#4fc3f7', borderColor: '#4fc3f7',
+                           background: 'transparent' }}>
+                  Overlay Globe
+                </Button>
+              )}
+              <Tooltip title="Clear all globe overlays">
+                <Button size="small" icon={<CloseOutlined />}
+                  onClick={() => { onClearOverlays(); setOverlaid(new Set()) }}
+                  style={{ background: 'transparent', borderColor: '#555', color: '#666' }} />
               </Tooltip>
-            )}
-            <Tooltip title="Clear all overlays">
-              <Button size="small" icon={<CloseOutlined />}
-                onClick={() => { onClearOverlays(); setOverlaid(new Set()) }}
-                style={{ background: 'transparent', borderColor: '#555', color: '#888' }} />
-            </Tooltip>
+            </div>
+
+            {/* Download row */}
+            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+              <Text style={{ color: '#555', fontSize: 10, alignSelf: 'center', marginRight: 2 }}>
+                Download:
+              </Text>
+              {result.image && (
+                <Tooltip title="Download PNG image">
+                  <Button size="small" icon={<DownloadOutlined />} onClick={downloadImage}
+                    style={{ background: 'transparent', borderColor: '#3a3a5e',
+                             color: '#aaa', fontSize: 10 }}>
+                    PNG
+                  </Button>
+                </Tooltip>
+              )}
+              {result.geojson && (
+                <Tooltip title="Download as GeoJSON (open in QGIS, ArcGIS, geojson.io)">
+                  <Button size="small" icon={<DownloadOutlined />} onClick={downloadGeoJSON}
+                    style={{ background: 'transparent', borderColor: '#3a3a5e',
+                             color: '#52c41a', fontSize: 10 }}>
+                    GeoJSON
+                  </Button>
+                </Tooltip>
+              )}
+              {result.profiles && (
+                <Tooltip title="Download cross-section profiles as CSV">
+                  <Button size="small" icon={<DownloadOutlined />} onClick={downloadCSV}
+                    style={{ background: 'transparent', borderColor: '#3a3a5e',
+                             color: '#faad14', fontSize: 10 }}>
+                    CSV
+                  </Button>
+                </Tooltip>
+              )}
+            </div>
           </div>
         </>
       )}

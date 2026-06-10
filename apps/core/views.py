@@ -680,74 +680,95 @@ class TerrainExportGeoTIFFView(APIView):
         cat_steep    = _pct((slope_arr >= 30) & (slope_arr < 45))
         cat_vsteep   = _pct(slope_arr >= 45)
 
-        # ── Write 6-band Float32 GeoTIFF ──────────────────────────────────────
-        tmp = tempfile.mktemp(suffix='.tif')
+        # ── Write GeoTIFF (ZIP bundle: visualization + analysis) ─────────────
+        # GDT_Float32 with 0-255 values shows as checkerboard in standard viewers.
+        # Fix: write two separate GeoTIFFs with correct types:
+        #   terrain-visualization.tif — 3-band GDT_Byte PHOTOMETRIC=RGB  (opens anywhere)
+        #   terrain-analysis.tif      — 3-band GDT_Float32 elevation/slope/aspect
+        tmp_vis = tempfile.mktemp(suffix='.tif')
+        tmp_ana = tempfile.mktemp(suffix='.tif')
         pixel_w = (max_lon - min_lon) / target_n
         pixel_h = (max_lat - min_lat) / target_n
 
         srs = osr.SpatialReference()
         srs.ImportFromEPSG(4326)
-
+        geo_transform = [min_lon, pixel_w, 0, max_lat, 0, -pixel_h]
         tiff_drv = gdal.GetDriverByName('GTiff')
-        out_ds = tiff_drv.Create(
-            tmp, target_n, target_n, 6, gdal.GDT_Float32,
+
+        # ── 3-band Byte RGB visualization ────────────────────────────────────
+        vis_ds = tiff_drv.Create(
+            tmp_vis, target_n, target_n, 3, gdal.GDT_Byte,
+            options=['COMPRESS=LZW', 'TILED=YES', 'BLOCKXSIZE=256', 'BLOCKYSIZE=256',
+                     'PHOTOMETRIC=RGB'],
+        )
+        vis_ds.SetGeoTransform(geo_transform)
+        vis_ds.SetProjection(srs.ExportToWkt())
+        for bidx, (arr, desc, ci) in enumerate([
+            (np.clip(r_out, 0, 255).astype(np.uint8), 'Red',   gdal.GCI_RedBand),
+            (np.clip(g_out, 0, 255).astype(np.uint8), 'Green', gdal.GCI_GreenBand),
+            (np.clip(b_out, 0, 255).astype(np.uint8), 'Blue',  gdal.GCI_BlueBand),
+        ], 1):
+            vb = vis_ds.GetRasterBand(bidx)
+            vb.WriteArray(arr)
+            vb.SetDescription(desc)
+            vb.SetColorInterpretation(ci)
+
+        # ── 3-band Float32 analysis (elevation / slope / aspect) ─────────────
+        ana_ds = tiff_drv.Create(
+            tmp_ana, target_n, target_n, 3, gdal.GDT_Float32,
             options=['COMPRESS=LZW', 'TILED=YES', 'BLOCKXSIZE=256', 'BLOCKYSIZE=256'],
         )
-        out_ds.SetGeoTransform([min_lon, pixel_w, 0, max_lat, 0, -pixel_h])
-        out_ds.SetProjection(srs.ExportToWkt())
+        ana_ds.SetGeoTransform(geo_transform)
+        ana_ds.SetProjection(srs.ExportToWkt())
+        for bidx, (arr, desc) in enumerate([
+            (elev_up,  'Elevation_m'),
+            (slope_up, 'Slope_deg'),
+            (asp_geo,  'Aspect_deg_0N'),
+        ], 1):
+            ab = ana_ds.GetRasterBand(bidx)
+            ab.WriteArray(arr.astype(np.float32))
+            ab.SetDescription(desc)
+            ab.SetNoDataValue(-9999)
 
-        band_defs = [
-            (r_out,    'Red — smooth slope colour, hillshade-blended (0-255)',    gdal.GCI_RedBand),
-            (g_out,    'Green — smooth slope colour, hillshade-blended (0-255)',  gdal.GCI_GreenBand),
-            (b_out,    'Blue — smooth slope colour, hillshade-blended (0-255)',   gdal.GCI_BlueBand),
-            (elev_up,  'Elevation (metres above mean sea level)',                  gdal.GCI_Undefined),
-            (slope_up, 'Slope (degrees 0-90)',                                     gdal.GCI_Undefined),
-            (asp_geo,  'Aspect (degrees 0-360, 0=North clockwise; -1=flat)',       gdal.GCI_Undefined),
-        ]
-        for idx, (data, desc, interp) in enumerate(band_defs, 1):
-            b = out_ds.GetRasterBand(idx)
-            b.WriteArray(data)
-            b.SetDescription(desc)
-            b.SetColorInterpretation(interp)
-            if idx >= 4:
-                b.SetNoDataValue(-9999)
+        # ── Metadata on both files ────────────────────────────────────────────
+        meta = {
+            'ELEVATION_MIN_M':    f'{float(elev_arr.min()):.1f}',
+            'ELEVATION_MAX_M':    f'{float(elev_arr.max()):.1f}',
+            'ELEVATION_AVG_M':    f'{float(elev_arr.mean()):.1f}',
+            'ELEVATION_RELIEF_M': f'{float(elev_arr.max() - elev_arr.min()):.1f}',
+            'SLOPE_MIN_DEG':      f'{float(slope_arr.min()):.2f}',
+            'SLOPE_AVG_DEG':      f'{float(slope_arr.mean()):.2f}',
+            'SLOPE_MAX_DEG':      f'{float(slope_arr.max()):.2f}',
+            'BBOX':               f'{min_lon:.6f},{min_lat:.6f},{max_lon:.6f},{max_lat:.6f}',
+            'CRS':                'EPSG:4326 WGS84',
+            'OUTPUT_SIZE':        f'{target_n}x{target_n}',
+            'SLOPE_FLAT_PCT':     f'{cat_flat}%',
+            'SLOPE_GENTLE_PCT':   f'{cat_gentle}%',
+            'SLOPE_MODERATE_PCT': f'{cat_moderate}%',
+            'SLOPE_STEEP_PCT':    f'{cat_steep}%',
+            'SLOPE_VSTEEP_PCT':   f'{cat_vsteep}%',
+            'COLOUR_RAMP':        'green(0deg)->amber(15deg)->red(45deg+) hillshade-blended',
+            'ASPECT_CONVENTION':  '0=North 90=East 180=South 270=West -1=flat',
+        }
+        for k, v in meta.items():
+            vis_ds.SetMetadataItem(k, v)
+            ana_ds.SetMetadataItem(k, v)
 
-        # Enhanced metadata
-        out_ds.SetMetadataItem('ELEVATION_MIN_M',    f'{float(elev_arr.min()):.1f}')
-        out_ds.SetMetadataItem('ELEVATION_MAX_M',    f'{float(elev_arr.max()):.1f}')
-        out_ds.SetMetadataItem('ELEVATION_AVG_M',    f'{float(elev_arr.mean()):.1f}')
-        out_ds.SetMetadataItem('ELEVATION_RELIEF_M', f'{float(elev_arr.max() - elev_arr.min()):.1f}')
-        out_ds.SetMetadataItem('SLOPE_MIN_DEG',      f'{float(slope_arr.min()):.2f}')
-        out_ds.SetMetadataItem('SLOPE_AVG_DEG',      f'{float(slope_arr.mean()):.2f}')
-        out_ds.SetMetadataItem('SLOPE_MAX_DEG',      f'{float(slope_arr.max()):.2f}')
-        out_ds.SetMetadataItem('BBOX_MIN_LON',        f'{min_lon:.6f}')
-        out_ds.SetMetadataItem('BBOX_MIN_LAT',        f'{min_lat:.6f}')
-        out_ds.SetMetadataItem('BBOX_MAX_LON',        f'{max_lon:.6f}')
-        out_ds.SetMetadataItem('BBOX_MAX_LAT',        f'{max_lat:.6f}')
-        out_ds.SetMetadataItem('GRID_SAMPLES',        f'{grid_n}x{grid_n}')
-        out_ds.SetMetadataItem('OUTPUT_SIZE',         f'{target_n}x{target_n}')
-        out_ds.SetMetadataItem('CRS',                 'EPSG:4326 WGS84')
-        out_ds.SetMetadataItem('SLOPE_FLAT_PCT',      f'{cat_flat}%  (0-5 deg)')
-        out_ds.SetMetadataItem('SLOPE_GENTLE_PCT',    f'{cat_gentle}%  (5-15 deg)')
-        out_ds.SetMetadataItem('SLOPE_MODERATE_PCT',  f'{cat_moderate}%  (15-30 deg)')
-        out_ds.SetMetadataItem('SLOPE_STEEP_PCT',     f'{cat_steep}%  (30-45 deg)')
-        out_ds.SetMetadataItem('SLOPE_VSTEEP_PCT',    f'{cat_vsteep}%  (>=45 deg)')
-        out_ds.SetMetadataItem('ASPECT_CONVENTION',
-            'Band6: GDAL/ArcGIS convention. 0=North, 90=East, 180=South, 270=West. '
-            '-1 = flat (no aspect). Clockwise from North.')
-        out_ds.SetMetadataItem('RENDERING_HINT',
-            'QGIS: Symbology > Multiband color, R=Band1 G=Band2 B=Band3, min=0 max=255. '
-            'Band4=Elevation(m) Band5=Slope(deg) Band6=Aspect(deg,0=N). '
-            'Colour: smooth gradient green(flat)->amber(moderate)->red(steep).')
-        out_ds.FlushCache()
-        out_ds = None
+        vis_ds.FlushCache(); vis_ds = None
+        ana_ds.FlushCache(); ana_ds = None
 
-        with open(tmp, 'rb') as f:
-            content = f.read()
-        os.unlink(tmp)
+        import zipfile, io as _io
+        zip_buf = _io.BytesIO()
+        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            with open(tmp_vis, 'rb') as f:
+                zf.writestr('terrain-visualization.tif', f.read())
+            with open(tmp_ana, 'rb') as f:
+                zf.writestr('terrain-analysis.tif', f.read())
+        os.unlink(tmp_vis)
+        os.unlink(tmp_ana)
 
-        resp = DjResponse(content, content_type='image/tiff')
-        resp['Content-Disposition'] = 'attachment; filename="terrain-analysis.tif"'
+        resp = DjResponse(zip_buf.getvalue(), content_type='application/zip')
+        resp['Content-Disposition'] = 'attachment; filename="terrain-analysis.zip"'
         return resp
 
 
@@ -761,6 +782,7 @@ class DEMAnalysisView(APIView):
     Supported types:
       contours | aspect_map | curvature | viewshed | volume | cut_fill
       flood    | landslide  | watershed | cross_section
+      twi      | solar_shadow | trafficability
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1191,6 +1213,317 @@ class DEMAnalysisView(APIView):
                          'relief_m':round(float(elevs.max()-elevs.min()),1)}})
         return {'type':'cross_section','profiles':profiles,'stats':{'count':len(profiles)}}
 
+    def _twi(self, elev_arr, slope_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params):
+        """Topographic Wetness Index: ln(flow_acc * cell_area / tan(slope))."""
+        import numpy as np
+        ny, nx = elev_arr.shape
+
+        # D8 flow accumulation — iterate cells highest→lowest, push weight downslope
+        flow_acc = np.ones((ny, nx), dtype=np.float32)
+        order = np.argsort(elev_arr.ravel())[::-1]
+        dirs = [(-1,-1),(0,-1),(1,-1),(-1,0),(1,0),(-1,1),(0,1),(1,1)]
+        for idx in order:
+            r, c = divmod(int(idx), nx)
+            best_elev = elev_arr[r, c]; br, bc = r, c
+            for dr, dc in dirs:
+                nr, nc = r+dr, c+dc
+                if 0 <= nr < ny and 0 <= nc < nx and elev_arr[nr, nc] < best_elev:
+                    best_elev = elev_arr[nr, nc]; br, bc = nr, nc
+            if (br, bc) != (r, c):
+                flow_acc[br, bc] += flow_acc[r, c]
+
+        cell_area = dx * dy
+        slope_rad = np.radians(slope_arr)
+        tan_sl = np.where(slope_arr < 0.5, np.tan(np.radians(0.5)), np.tan(slope_rad))
+        twi = np.log(flow_acc * cell_area / tan_sl).astype(np.float32)
+
+        lo, hi = float(np.percentile(twi, 2)), float(np.percentile(twi, 98))
+        norm = np.clip((twi - lo) / max(hi - lo, 0.1), 0, 1)
+        # brown→yellow→cyan→blue colour ramp
+        r_ch = np.interp(norm, [0,.4,.7,1], [139,255,  0,  0]).astype(np.uint8)
+        g_ch = np.interp(norm, [0,.4,.7,1], [ 90,215,200,  0]).astype(np.uint8)
+        b_ch = np.interp(norm, [0,.4,.7,1], [ 43,  0,255,200]).astype(np.uint8)
+        rgba = np.stack([r_ch, g_ch, b_ch, np.full((ny,nx),200,np.uint8)], axis=2)
+
+        high_pct = float(100 * (twi >= np.percentile(twi, 80)).sum() / twi.size)
+        return {
+            'type': 'twi',
+            'image': self._to_png_b64(rgba),
+            'stats': {
+                'twi_min': round(float(np.percentile(twi,5)), 2),
+                'twi_max': round(float(np.percentile(twi,95)), 2),
+                'twi_mean': round(float(twi.mean()), 2),
+                'waterlogging_risk_pct': round(high_pct, 1),
+                'cell_area_m2': round(cell_area, 1),
+            },
+        }
+
+    def _solar_shadow(self, elev_arr, slope_arr, gx, gy, dx, dy,
+                      min_lon, min_lat, max_lon, max_lat, params):
+        """Hillshade + shadow mask for a given date/time using simplified Spencer solar position."""
+        import numpy as np, math
+        ny, nx = elev_arr.shape
+        from datetime import datetime
+
+        date_str = params.get('date', '2024-06-21')
+        time_str = params.get('time', '12:00')
+        lat_c = (min_lat + max_lat) / 2
+        lon_c = (min_lon + max_lon) / 2
+
+        try:
+            dt = datetime.strptime(f'{date_str} {time_str}', '%Y-%m-%d %H:%M')
+        except ValueError:
+            dt = datetime(2024, 6, 21, 12, 0)
+
+        doy = dt.timetuple().tm_yday
+        B = math.radians(360 / 365 * (doy - 81))
+        decl = math.radians(23.45 * math.sin(B))
+        eqt  = (9.87*math.sin(2*B) - 7.53*math.cos(B) - 1.5*math.sin(B)) / 60.0
+        solar_noon = 12.0 - lon_c / 15.0 - eqt
+        hour_angle = math.radians(15 * ((dt.hour + dt.minute/60) - solar_noon))
+
+        lat_r = math.radians(lat_c)
+        sin_alt = (math.sin(lat_r)*math.sin(decl) +
+                   math.cos(lat_r)*math.cos(decl)*math.cos(hour_angle))
+        sun_alt = math.asin(max(sin_alt, 1e-6))
+        sun_elev_deg = math.degrees(sun_alt)
+
+        cos_az_num = math.sin(decl) - math.sin(lat_r)*sin_alt
+        cos_az_den = math.cos(lat_r)*math.cos(sun_alt)
+        cos_az = max(-1.0, min(1.0, cos_az_num / max(cos_az_den, 1e-9)))
+        az = math.acos(cos_az)
+        if (dt.hour + dt.minute/60) > solar_noon:
+            az = 2*math.pi - az
+        sun_az_deg = math.degrees(az)
+
+        # Hillshade
+        zenith = math.pi/2 - sun_alt
+        mag = np.sqrt(1 + gx**2 + gy**2)
+        hs = (math.cos(zenith)/mag +
+              math.sin(zenith)*(-math.sin(az)*gx - math.cos(az)*gy)/mag)
+        hs = np.clip(hs * 255, 0, 255).astype(np.uint8)
+
+        shadow = hs < 15
+        r_ch = np.where(shadow, np.uint8(15),  hs)
+        g_ch = np.where(shadow, np.uint8(20),  np.clip((hs.astype(int)*200//255), 0, 255).astype(np.uint8))
+        b_ch = np.where(shadow, np.uint8(60),  np.clip((hs.astype(int)*100//255), 0, 255).astype(np.uint8))
+        rgba = np.stack([r_ch, g_ch, b_ch, np.full((ny,nx),210,np.uint8)], axis=2)
+
+        return {
+            'type': 'solar_shadow',
+            'image': self._to_png_b64(rgba),
+            'stats': {
+                'sun_elevation_deg': round(sun_elev_deg, 1),
+                'sun_azimuth_deg': round(sun_az_deg, 1),
+                'shadowed_area_pct': round(float(100*shadow.sum()/shadow.size), 1),
+                'date': date_str,
+                'time': time_str,
+            },
+        }
+
+    def _trafficability(self, elev_arr, slope_arr, dx, dy,
+                        min_lon, min_lat, max_lon, max_lat, params):
+        """Off-road vehicle passability map from slope + terrain roughness."""
+        import numpy as np
+        ny, nx = elev_arr.shape
+        cell = dx * dy
+
+        # Local roughness = deviation from 3×3 moving average
+        kernel = np.ones((3,3)) / 9.0
+        from scipy.ndimage import uniform_filter
+        smooth = uniform_filter(elev_arr.astype(float), size=3)
+        rough = np.abs(elev_arr - smooth).astype(np.float32)
+        rough_thresh = float(np.percentile(rough, 75))
+
+        easy      = (slope_arr < 8)
+        moderate  = (slope_arr >= 8)  & (slope_arr < 15)
+        difficult = (slope_arr >= 15) & (slope_arr < 30) | (easy & (rough > rough_thresh*1.5))
+        impassable = slope_arr >= 30
+
+        r_ch = np.zeros((ny,nx), np.uint8); g_ch = r_ch.copy(); b_ch = r_ch.copy()
+        r_ch[easy]=50;  g_ch[easy]=180;  b_ch[easy]=50     # green
+        r_ch[moderate]=255; g_ch[moderate]=200; b_ch[moderate]=0  # yellow
+        r_ch[difficult]=255; g_ch[difficult]=100; b_ch[difficult]=0  # orange
+        r_ch[impassable]=200; g_ch[impassable]=0; b_ch[impassable]=0 # red
+        rgba = np.stack([r_ch, g_ch, b_ch, np.full((ny,nx),200,np.uint8)], axis=2)
+
+        total = ny * nx
+        return {
+            'type': 'trafficability',
+            'image': self._to_png_b64(rgba),
+            'stats': {
+                'easy_pct':       round(float(100*easy.sum()/total), 1),
+                'moderate_pct':   round(float(100*moderate.sum()/total), 1),
+                'difficult_pct':  round(float(100*difficult.sum()/total), 1),
+                'impassable_pct': round(float(100*impassable.sum()/total), 1),
+                'passable_area_km2': round(float((easy|moderate).sum()*cell/1e6), 3),
+            },
+        }
+
+    def _change_detection(self, elev_arr, dx, dy, params):
+        """Compare two elevation grids; positive diff=fill (blue), negative=cut (red)."""
+        import numpy as np
+        ny, nx = elev_arr.shape
+        grid2_flat = params.get('grid2', [])
+        if len(grid2_flat) != ny * nx:
+            raise ValueError(f'grid2 must have {ny*nx} values (same as grid1)')
+        grid2 = np.array(grid2_flat, dtype=np.float32).reshape(ny, nx)
+        diff = grid2 - elev_arr
+
+        cell_area = dx * dy
+        cut  = diff < -0.1
+        fill = diff > 0.1
+
+        lo = float(np.percentile(diff, 2)); hi = float(np.percentile(diff, 98))
+        norm = np.clip((diff - lo) / max(hi - lo, 0.1), 0, 1)
+        r_ch = np.interp(norm, [0,.45,.55,1], [210,200,170, 40]).astype(np.uint8)
+        g_ch = np.interp(norm, [0,.45,.55,1], [ 50,200,210,130]).astype(np.uint8)
+        b_ch = np.interp(norm, [0,.45,.55,1], [ 50, 80,230,230]).astype(np.uint8)
+        alpha = np.full((ny,nx), 210, np.uint8)
+        rgba = np.stack([r_ch, g_ch, b_ch, alpha], axis=2)
+
+        return {
+            'type': 'change_detection',
+            'image': self._to_png_b64(rgba),
+            'stats': {
+                'cut_volume_m3':  round(float((-diff[cut]).sum()  * cell_area), 1),
+                'fill_volume_m3': round(float(diff[fill].sum()    * cell_area), 1),
+                'net_change_m3':  round(float(diff.sum()          * cell_area), 1),
+                'cut_area_pct':   round(float(100 * cut.sum()  / diff.size), 1),
+                'fill_area_pct':  round(float(100 * fill.sum() / diff.size), 1),
+                'max_cut_m':      round(float((-diff).max()), 2),
+                'max_fill_m':     round(float(diff.max()), 2),
+                'rmse_m':         round(float(np.sqrt((diff**2).mean())), 3),
+            },
+        }
+
+    def _lz_assessment(self, elev_arr, slope_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params):
+        """Landing Zone assessment: slope < 7°, flat radius, approach clearance."""
+        import numpy as np, math
+        from scipy.ndimage import uniform_filter, shift as nd_shift
+        ny, nx = elev_arr.shape
+
+        radius_m    = float(params.get('radius_m', 30))
+        approach_dir = float(params.get('approach_deg', 270))
+        approach_m   = float(params.get('approach_m', 200))
+
+        # 1. Slope score — primary criterion (< 7° ideal)
+        slope_score = np.clip((7.0 - slope_arr) / 7.0 * 100, 0, 100)
+
+        # 2. Flat-area radius score — kernel min-slope check
+        kern = max(3, int(radius_m / ((dx + dy) / 2)) * 2 + 1)
+        kern = min(kern, min(ny, nx) - 1)
+        local_max_slope = uniform_filter(slope_arr.astype(float), size=kern)
+        area_score = np.clip((7.0 - local_max_slope) / 7.0 * 100, 0, 100)
+
+        # 3. Approach clearance — check terrain rise in look-ahead direction
+        approach_rad = math.radians(approach_dir)
+        shift_c =  math.cos(approach_rad) * approach_m / max(dx, 1)
+        shift_r = -math.sin(approach_rad) * approach_m / max(dy, 1)  # row increases southward
+        ahead = nd_shift(elev_arr.astype(float), (shift_r, shift_c), mode='nearest')
+        rise = np.maximum(0, ahead - elev_arr.astype(float)).astype(np.float32)
+        approach_score = np.clip(100 - rise * 3, 0, 100)
+
+        composite = (slope_score * 0.45 + area_score * 0.35 + approach_score * 0.20).astype(np.float32)
+
+        excellent  = composite >= 80
+        good       = (composite >= 60) & ~excellent
+        marginal   = (composite >= 40) & ~excellent & ~good
+        unsuitable = composite < 40
+
+        r_ch = np.zeros((ny,nx), np.uint8); g_ch = r_ch.copy(); b_ch = r_ch.copy()
+        r_ch[excellent]=0;   g_ch[excellent]=200; b_ch[excellent]=100
+        r_ch[good]=100;      g_ch[good]=210;      b_ch[good]=50
+        r_ch[marginal]=255;  g_ch[marginal]=200;  b_ch[marginal]=0
+        r_ch[unsuitable]=200; g_ch[unsuitable]=50; b_ch[unsuitable]=50
+        rgba = np.stack([r_ch, g_ch, b_ch, np.full((ny,nx),200,np.uint8)], axis=2)
+        rgba[~unsuitable & ~marginal & ~good & ~excellent] = [60,60,60,120]
+
+        total = ny * nx
+        return {
+            'type': 'lz_assessment',
+            'image': self._to_png_b64(rgba),
+            'stats': {
+                'excellent_pct':  round(float(100*excellent.sum()/total), 1),
+                'good_pct':       round(float(100*good.sum()/total), 1),
+                'marginal_pct':   round(float(100*marginal.sum()/total), 1),
+                'unsuitable_pct': round(float(100*unsuitable.sum()/total), 1),
+                'lz_radius_m':    radius_m,
+                'approach_dir_deg': approach_dir,
+                'candidate_zones': int(excellent.sum()),
+            },
+        }
+
+    def _rf_coverage(self, elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params):
+        """RF line-of-sight coverage with first Fresnel zone obstruction check."""
+        import numpy as np, math
+        ny, nx = elev_arr.shape
+
+        obs_lat  = float(params.get('tower_lat',    (min_lat+max_lat)/2))
+        obs_lon  = float(params.get('tower_lon',    (min_lon+max_lon)/2))
+        tower_h  = float(params.get('tower_height_m', 30))
+        freq_mhz = float(params.get('freq_mhz', 150))
+        rx_h     = float(params.get('rx_height_m',  2))
+
+        obs_xi = int(np.clip((obs_lon-min_lon)/(max_lon-min_lon)*(nx-1), 0, nx-1))
+        obs_yi = int(np.clip((obs_lat-min_lat)/(max_lat-min_lat)*(ny-1), 0, ny-1))
+        obs_e  = float(elev_arr[obs_yi, obs_xi]) + tower_h
+
+        tgt_y = np.arange(ny)[:,None].repeat(nx,axis=1).astype(float)
+        tgt_x = np.arange(nx)[None,:].repeat(ny,axis=0).astype(float)
+        tgt_e = elev_arr.astype(float) + rx_h
+
+        # Max terrain obstruction above LOS line for each cell
+        max_obs = np.full((ny,nx), -999.0, dtype=np.float64)
+        n_steps = np.maximum(np.abs(tgt_y-obs_yi), np.abs(tgt_x-obs_xi))
+
+        for step in range(1, int(max(ny,nx)*1.5)+1):
+            frac    = np.where(n_steps>0, step/n_steps, 1.0)
+            in_path = (frac>0.0) & (frac<1.0)
+            if not in_path.any(): break
+
+            sy = np.round(obs_yi + frac*(tgt_y-obs_yi)).astype(int).clip(0,ny-1)
+            sx = np.round(obs_xi + frac*(tgt_x-obs_xi)).astype(int).clip(0,nx-1)
+            terrain_h = elev_arr[sy, sx].astype(float)
+            los_h = obs_e + frac*(tgt_e - obs_e)
+            obstruction = terrain_h - los_h
+            max_obs = np.where(in_path, np.maximum(max_obs, obstruction), max_obs)
+
+        # Fresnel zone first radius at midpoint: r1 ≈ 17.3√(d/4f) metres
+        dist_m = np.sqrt(((tgt_y-obs_yi)*dy)**2 + ((tgt_x-obs_xi)*dx)**2)
+        dist_m = np.where(dist_m < 1, 1, dist_m)
+        freq_hz = max(freq_mhz, 1) * 1e6
+        fresnel_r = 17.3 * np.sqrt(dist_m / (4 * freq_hz))
+
+        coverage = np.zeros((ny,nx), dtype=np.uint8)
+        coverage = np.where(max_obs <= 0,                        np.uint8(3), coverage)  # clear LoS
+        coverage = np.where((max_obs>0) & (max_obs<=fresnel_r*0.6), np.uint8(2), coverage)  # minor
+        coverage = np.where((max_obs>fresnel_r*0.6) & (max_obs<=fresnel_r), np.uint8(1), coverage)  # partial
+        coverage[obs_yi, obs_xi] = 3
+
+        color_r = np.array([60,200,100, 30], np.uint8)
+        color_g = np.array([60,100,200,200], np.uint8)
+        color_b = np.array([60, 50, 50, 50], np.uint8)
+        r_ch = color_r[coverage]; g_ch = color_g[coverage]; b_ch = color_b[coverage]
+        rgba = np.stack([r_ch, g_ch, b_ch, np.full((ny,nx),200,np.uint8)], axis=2)
+        rgba[obs_yi,obs_xi] = [255,255,0,255]
+
+        total = ny*nx
+        return {
+            'type': 'rf_coverage',
+            'image': self._to_png_b64(rgba),
+            'stats': {
+                'excellent_los_pct':   round(float(100*(coverage==3).sum()/total), 1),
+                'minor_fresnel_pct':   round(float(100*(coverage==2).sum()/total), 1),
+                'partial_fresnel_pct': round(float(100*(coverage==1).sum()/total), 1),
+                'no_coverage_pct':     round(float(100*(coverage==0).sum()/total), 1),
+                'tower_height_m': tower_h,
+                'freq_mhz': freq_mhz,
+                'tower_lat': obs_lat,
+                'tower_lon': obs_lon,
+            },
+        }
+
     # ── dispatch ──────────────────────────────────────────────────────────────
 
     def post(self, request):
@@ -1202,16 +1535,22 @@ class DEMAnalysisView(APIView):
             return Response({'error': str(e)}, status=400)
 
         dispatch = {
-            'contours':     lambda: self._contours(elev_arr, min_lon, min_lat, max_lon, max_lat, params),
-            'aspect_map':   lambda: self._aspect_map(elev_arr, asp_arr, slope_arr, params),
-            'curvature':    lambda: self._curvature(elev_arr, dx, dy, params),
-            'viewshed':     lambda: self._viewshed(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
-            'volume':       lambda: self._volume(elev_arr, dx, dy, params),
-            'cut_fill':     lambda: self._volume(elev_arr, dx, dy, params),
-            'flood':        lambda: self._flood(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
-            'landslide':    lambda: self._landslide(elev_arr, slope_arr, dx, dy, params),
-            'watershed':    lambda: self._watershed(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
-            'cross_section':lambda: self._cross_section(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'contours':          lambda: self._contours(elev_arr, min_lon, min_lat, max_lon, max_lat, params),
+            'aspect_map':        lambda: self._aspect_map(elev_arr, asp_arr, slope_arr, params),
+            'curvature':         lambda: self._curvature(elev_arr, dx, dy, params),
+            'viewshed':          lambda: self._viewshed(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'volume':            lambda: self._volume(elev_arr, dx, dy, params),
+            'cut_fill':          lambda: self._volume(elev_arr, dx, dy, params),
+            'flood':             lambda: self._flood(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'landslide':         lambda: self._landslide(elev_arr, slope_arr, dx, dy, params),
+            'watershed':         lambda: self._watershed(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'cross_section':     lambda: self._cross_section(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'twi':               lambda: self._twi(elev_arr, slope_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'solar_shadow':      lambda: self._solar_shadow(elev_arr, slope_arr, gx, gy, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'trafficability':    lambda: self._trafficability(elev_arr, slope_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'change_detection':  lambda: self._change_detection(elev_arr, dx, dy, params),
+            'lz_assessment':     lambda: self._lz_assessment(elev_arr, slope_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
+            'rf_coverage':       lambda: self._rf_coverage(elev_arr, dx, dy, min_lon, min_lat, max_lon, max_lat, params),
         }
         fn = dispatch.get(analysis_type)
         if not fn:
@@ -1852,3 +2191,126 @@ def export_download(request, task_uuid):
     response['Cache-Control'] = 'no-store'
     return response
 
+
+
+# ── LiDAR point cloud upload ───────────────────────────────────────────────────
+
+class LidarUploadView(APIView):
+    parser_classes = [parsers.MultiPartParser]
+    permission_classes = [permissions.IsAuthenticated]
+
+    MAX_POINTS = 200_000  # subsample to this many for web delivery
+
+    def post(self, request):
+        las_file = request.FILES.get('file')
+        if not las_file:
+            return Response({'error': 'No file uploaded'}, status=400)
+
+        suffix = las_file.name.lower().rsplit('.', 1)[-1]
+        if suffix not in ('las', 'laz'):
+            return Response({'error': 'Only .las / .laz files are supported'}, status=400)
+
+        import tempfile, numpy as np
+
+        try:
+            import laspy
+        except ImportError:
+            return Response({'error': 'laspy not installed on server'}, status=501)
+
+        with tempfile.NamedTemporaryFile(suffix=f'.{suffix}', delete=False) as tmp:
+            for chunk in las_file.chunks():
+                tmp.write(chunk)
+            tmp_path = tmp.name
+
+        try:
+            las = laspy.read(tmp_path)
+            xs = np.array(las.x, dtype=np.float64)
+            ys = np.array(las.y, dtype=np.float64)
+            zs = np.array(las.z, dtype=np.float32)
+
+            # Reproject to WGS84 if CRS is not geographic
+            try:
+                from pyproj import CRS, Transformer
+                src_crs = None
+                if hasattr(las, 'header') and hasattr(las.header, 'parse_crs'):
+                    try:
+                        src_crs = las.header.parse_crs()
+                    except Exception:
+                        pass
+                if src_crs is None:
+                    try:
+                        src_crs = CRS.from_wkt(las.header.vlrs[0].record_data.decode('utf-8'))
+                    except Exception:
+                        pass
+                if src_crs and not src_crs.is_geographic:
+                    t = Transformer.from_crs(src_crs, 'EPSG:4326', always_xy=True)
+                    xs, ys = t.transform(xs, ys)
+            except Exception:
+                pass  # leave as-is — may already be WGS84
+
+            n_pts = len(xs)
+            if n_pts > self.MAX_POINTS:
+                idx = np.random.choice(n_pts, self.MAX_POINTS, replace=False)
+                xs = xs[idx]; ys = ys[idx]; zs = zs[idx]
+
+            # Try to get intensity / RGB for colouring
+            try:
+                intensity = np.array(las.intensity, dtype=np.float32)
+                if n_pts > self.MAX_POINTS:
+                    intensity = intensity[idx]
+                # Normalise to 0-255
+                imin, imax = intensity.min(), intensity.max()
+                if imax > imin:
+                    intensity = ((intensity - imin) / (imax - imin) * 255).astype(np.uint8)
+                else:
+                    intensity = np.full(len(xs), 128, np.uint8)
+            except Exception:
+                intensity = np.full(len(xs), 128, np.uint8)
+
+            # Build DEM from point cloud using 2D histogram binning
+            dem_data = None
+            try:
+                from scipy.stats import binned_statistic_2d
+                n_bins = 64
+                stat, x_edges, y_edges, _ = binned_statistic_2d(
+                    xs, ys, zs, statistic='mean', bins=n_bins,
+                )
+                valid = ~np.isnan(stat)
+                if valid.any():
+                    # Fill NaN with nearest valid (simple forward fill)
+                    from scipy.ndimage import label
+                    filled = stat.copy()
+                    mean_z = float(zs.mean())
+                    filled[~valid] = mean_z
+                    min_lon = float(x_edges[0]); max_lon = float(x_edges[-1])
+                    min_lat = float(y_edges[0]); max_lat = float(y_edges[-1])
+                    dem_data = {
+                        'elevGrid': filled.T.ravel().tolist(),
+                        'bbox': [min_lon, min_lat, max_lon, max_lat],
+                        'gridN': n_bins,
+                    }
+            except Exception:
+                pass
+
+            return Response({
+                'point_count': int(len(xs)),
+                'original_count': int(n_pts),
+                'min_lon': float(xs.min()), 'max_lon': float(xs.max()),
+                'min_lat': float(ys.min()), 'max_lat': float(ys.max()),
+                'min_elev': float(zs.min()), 'max_elev': float(zs.max()),
+                'points': {
+                    'x': xs.tolist(),
+                    'y': ys.tolist(),
+                    'z': zs.tolist(),
+                    'i': intensity.tolist(),
+                },
+                'dem': dem_data,
+            })
+        except Exception as exc:
+            return Response({'error': f'Failed to parse point cloud: {exc}'}, status=400)
+        finally:
+            import os as _os
+            try:
+                _os.unlink(tmp_path)
+            except Exception:
+                pass

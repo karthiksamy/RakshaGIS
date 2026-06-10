@@ -462,6 +462,34 @@ _detect_nvidia_gpu() {
   command -v nvidia-smi &>/dev/null && nvidia-smi --query-gpu=name --format=csv,noheader &>/dev/null
 }
 
+# Check NVIDIA Container Toolkit without pulling a large image.
+# Strategy 1: check toolkit binary/config directly.
+# Strategy 2: test with the smallest already-cached image that supports --gpus.
+_check_nvidia_toolkit() {
+  # Direct binary checks (fastest, no Docker needed)
+  if command -v nvidia-container-toolkit &>/dev/null; then return 0; fi
+  if command -v nvidia-container-runtime &>/dev/null; then return 0; fi
+  if [[ -f /usr/bin/nvidia-container-toolkit ]]; then return 0; fi
+  if [[ -f /usr/bin/nvidia-container-runtime ]]; then return 0; fi
+  if [[ -f /etc/nvidia-container-runtime/config.toml ]]; then return 0; fi
+  # Check Docker daemon config for nvidia runtime
+  if docker info 2>/dev/null | grep -qi "nvidia"; then return 0; fi
+  # Try a lightweight Docker --gpus test using an already-cached image
+  # Prefer a small existing image rather than pulling nvidia/cuda (~200 MB)
+  local _test_img
+  for _test_img in \
+      "ubuntu:22.04" "ubuntu:20.04" "ubuntu:latest" \
+      "debian:bookworm-slim" "alpine:latest" \
+      "nvidia/cuda:12.0-base-ubuntu22.04"; do
+    if docker image inspect "$_test_img" &>/dev/null 2>&1; then
+      if docker run --rm --gpus all "$_test_img" true &>/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
 GPU_MODE="cpu"        # cpu | nvidia
 GPU_PROFILE_SUFFIX="" # "" for CPU, "-gpu" for NVIDIA
 
@@ -470,29 +498,46 @@ if _detect_nvidia_gpu; then
   GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -3)
   echo -e "  ${GREEN}NVIDIA GPU detected:${RESET}"
   while IFS= read -r g; do echo "    • $g"; done <<< "$GPU_NAMES"
+
+  # Pre-check toolkit so we can show accurate status before prompting
+  _TOOLKIT_OK=false
+  if _check_nvidia_toolkit; then _TOOLKIT_OK=true; fi
+
   echo ""
   echo -e "  ${CYAN}Which compute mode do you want for AI backends?${RESET}"
   echo "  [1] CPU only    — works on any machine, slower inference"
-  echo "  [2] NVIDIA GPU  — faster inference (requires NVIDIA Container Toolkit)"
+  if [[ "$_TOOLKIT_OK" == true ]]; then
+    echo -e "  [2] NVIDIA GPU  — ${GREEN}Container Toolkit detected ✓${RESET}"
+  else
+    echo -e "  [2] NVIDIA GPU  — ${YELLOW}Container Toolkit not detected (install first)${RESET}"
+  fi
   echo ""
   read -rp "  Your choice [1]: " GPU_CHOICE
   case "${GPU_CHOICE:-1}" in
     2)
       GPU_MODE="nvidia"
       GPU_PROFILE_SUFFIX="-gpu"
-      echo -e "  ${GREEN}✓ NVIDIA GPU mode selected${RESET}"
-      # Verify NVIDIA Container Toolkit is installed
-      if ! docker run --rm --gpus all nvidia/cuda:12.0-base-ubuntu22.04 nvidia-smi &>/dev/null 2>&1; then
+      if [[ "$_TOOLKIT_OK" == true ]]; then
+        echo -e "  ${GREEN}✓ NVIDIA GPU mode selected — toolkit verified${RESET}"
+      else
         echo ""
         echo -e "  ${YELLOW}⚠  NVIDIA Container Toolkit not detected.${RESET}"
-        echo "     Install it before starting GPU containers:"
-        echo "     https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
+        echo "     GPU containers will fail at runtime without it."
+        echo "     Install guide: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
+        echo "     Quick install:"
+        echo "       curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+        echo "       curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+        echo "       sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit"
+        echo "       sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker"
         echo ""
-        echo "  Falling back to CPU mode for now (you can switch later)."
-        GPU_MODE="cpu"
-        GPU_PROFILE_SUFFIX=""
-      else
-        echo -e "  ${GREEN}✓ NVIDIA Container Toolkit verified${RESET}"
+        read -rp "  Proceed with GPU mode anyway? (you can install toolkit later) [y/N]: " _force_gpu
+        if [[ "${_force_gpu,,}" == "y" ]]; then
+          echo -e "  ${YELLOW}GPU mode set — install toolkit before starting containers.${RESET}"
+        else
+          echo "  Falling back to CPU mode."
+          GPU_MODE="cpu"
+          GPU_PROFILE_SUFFIX=""
+        fi
       fi
       ;;
     *)

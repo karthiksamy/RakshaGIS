@@ -828,6 +828,54 @@ class DEMAnalysisView(APIView):
         img.save(buf, format='PNG')
         return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
 
+    @staticmethod
+    def _make_hillshade(gx, gy):
+        """Dual-illumination hillshade (0–1) — matches slope export lighting."""
+        import numpy as np, math
+        alt = math.radians(45)
+        sl  = np.arctan(np.sqrt(gx**2 + gy**2))
+        asp = np.arctan2(gx, -gy)
+        for az_deg, w in [(315, 0.72), (45, 0.28)]:
+            az = math.radians(az_deg)
+            h  = np.sin(alt)*np.cos(sl) + np.cos(alt)*np.sin(sl)*np.cos(az - asp)
+            if az_deg == 315:
+                hs = w * np.clip(h, 0, 1)
+            else:
+                hs += w * np.clip(h, 0, 1)
+        return hs.astype(np.float32)
+
+    @staticmethod
+    def _composite_hillshade(png_b64: str, hs) -> str:
+        """Blend an RGBA analysis PNG over an earth-tone hillshade background."""
+        import io, base64, numpy as np
+        from PIL import Image
+
+        raw   = base64.b64decode(png_b64.split(',', 1)[1])
+        ana   = np.array(Image.open(io.BytesIO(raw)).convert('RGBA'), dtype=np.float32)
+        ah, aw = ana.shape[:2]
+
+        # Resize hillshade to match PNG dimensions (DEM grid may be smaller)
+        if hs.shape != (ah, aw):
+            hs_img = Image.fromarray((np.clip(hs, 0, 1) * 255).astype(np.uint8))
+            hs_img = hs_img.resize((aw, ah), Image.BILINEAR)
+            hs = np.array(hs_img, dtype=np.float32) / 255.0
+
+        # Earth-tone base: dark-earth shadows → warm-light highlights
+        base_r = 45  + 155 * hs
+        base_g = 40  + 140 * hs
+        base_b = 30  + 110 * hs
+
+        # Alpha-composite analysis RGBA over the hillshade base
+        a = ana[:, :, 3] / 255.0
+        out_r = np.clip(a * ana[:, :, 0] + (1 - a) * base_r, 0, 255)
+        out_g = np.clip(a * ana[:, :, 1] + (1 - a) * base_g, 0, 255)
+        out_b = np.clip(a * ana[:, :, 2] + (1 - a) * base_b, 0, 255)
+
+        rgb = np.stack([out_r, out_g, out_b], axis=2).astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(rgb, 'RGB').save(buf, format='PNG')
+        return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+
     # ── analysis methods ──────────────────────────────────────────────────────
 
     def _contours(self, elev_arr, min_lon, min_lat, max_lon, max_lat, params):
@@ -1561,6 +1609,16 @@ class DEMAnalysisView(APIView):
         except Exception as exc:
             import traceback
             return Response({'error': str(exc), 'trace': traceback.format_exc()}, status=500)
+
+        # Composite every raster image over an earth-tone hillshade base so the
+        # downloaded PNG contains terrain context (like the slope export output).
+        # solar_shadow already encodes its own hillshade; skip to avoid double-blending.
+        if result.get('image') and analysis_type != 'solar_shadow':
+            try:
+                hs = self._make_hillshade(gx, gy)
+                result['image'] = self._composite_hillshade(result['image'], hs)
+            except Exception:
+                pass  # fall back to plain image if compositing fails
 
         result['bbox'] = [min_lon, min_lat, max_lon, max_lat]
         return Response(result)

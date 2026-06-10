@@ -55,6 +55,9 @@ cryptography==43.0.3
 # ── C2PA content provenance (signed manifests for PNG/JPEG/TIFF/WebP) ─────────
 c2pa-python==0.32.11
 
+# ── Scientific computing (DEM analysis, trafficability, LZ, LiDAR DEM) ──────
+scipy==1.13.1
+
 # ── LiDAR / point cloud processing ──────────────────────────────────────────
 laspy[lazrs]==2.5.4
 pyproj==3.6.1

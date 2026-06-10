@@ -311,6 +311,18 @@ class WorkflowStepViewSet(viewsets.ReadOnlyModelViewSet):
             remarks=serializer.validated_data['remarks'],
         )
 
+        # Take a workflow snapshot at every state transition so users can
+        # see exactly what the area looked like at each review milestone.
+        try:
+            from apps.survey_projects.views import _take_snapshot
+            from apps.survey_projects.models import SurveyAreaSnapshot
+            _take_snapshot(
+                area, request.user, SurveyAreaSnapshot.WORKFLOW,
+                label=f'{TRANSITION_LABELS.get(transition_name, transition_name)} → {new_status}',
+            )
+        except Exception:
+            pass  # snapshot failure must never block the workflow
+
         if transition_name == 'approve':
             _create_final_folder(area.project, request.user)
             from apps.survey_projects.models import ReviewAnnotation

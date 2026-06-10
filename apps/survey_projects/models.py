@@ -173,6 +173,16 @@ class SurveyArea(models.Model):
         (RETURNED,     'Returned for Revision'),
     ]
 
+    STANDARD     = 'STANDARD'
+    POCKET       = 'POCKET'
+    SPLIT_RESULT = 'SPLIT_RESULT'
+
+    AREA_TYPE_CHOICES = [
+        (STANDARD,     'Standard'),
+        (POCKET,       'Pocket (sub-area)'),
+        (SPLIT_RESULT, 'Split Result'),
+    ]
+
     project     = models.ForeignKey(SurveyProject, on_delete=models.CASCADE, related_name='survey_areas')
     name        = models.CharField(max_length=200)
     area_code   = models.CharField(max_length=50, blank=True)
@@ -182,6 +192,13 @@ class SurveyArea(models.Model):
         'ProjectLayerFolder', on_delete=models.SET_NULL, null=True, blank=True,
         related_name='survey_area_link',
     )
+    # Hierarchy: pocket/split areas point to their source area
+    parent_area = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='child_areas',
+        help_text='Source area this was split or pocketed from',
+    )
+    area_type   = models.CharField(max_length=15, choices=AREA_TYPE_CHOICES, default=STANDARD)
     assigned_to = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='assigned_survey_areas',
@@ -202,6 +219,7 @@ class SurveyArea(models.Model):
         unique_together = [('project', 'name')]
         indexes = [
             models.Index(fields=['project', 'status']),
+            models.Index(fields=['parent_area']),
         ]
 
     def __str__(self):
@@ -242,6 +260,12 @@ class GISFeature(models.Model):
         ProjectLayerFolder, null=True, blank=True,
         on_delete=models.SET_NULL, related_name='features'
     )
+    # Direct survey-area link: faster than traversing the folder tree; required for
+    # history recording and split/transfer operations.
+    survey_area = models.ForeignKey(
+        SurveyArea, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='direct_features',
+    )
     feature_id = models.CharField(max_length=50, blank=True)
     layer_name = models.CharField(max_length=64, validators=[validate_layer_name])
     geometry_type = models.CharField(max_length=10, choices=GEOMETRY_TYPE_CHOICES)
@@ -268,9 +292,49 @@ class GISFeature(models.Model):
             models.Index(fields=['project', 'is_deleted']),
             models.Index(fields=['folder', 'is_deleted']),
             models.Index(fields=['project', 'deo_visible', 'is_deleted']),
+            models.Index(fields=['survey_area', 'is_deleted']),
         ]
 
+    # ── Convenience: resolve survey_area from folder hierarchy ────────────────
+    def _resolve_survey_area(self):
+        """Walk up the folder tree to find the owning SurveyArea."""
+        if not self.folder_id:
+            return None
+        folder_id = self.folder_id
+        for _ in range(8):  # max folder depth
+            try:
+                folder = ProjectLayerFolder.objects.get(pk=folder_id)
+                try:
+                    return folder.survey_area_link
+                except Exception:
+                    pass
+                if folder.parent_id:
+                    folder_id = folder.parent_id
+                else:
+                    break
+            except Exception:
+                break
+        return None
+
     def save(self, *args, **kwargs):
+        is_new = self.pk is None
+
+        # Capture old state for history recording (before any field changes)
+        old_instance = None
+        if not is_new and self.survey_area_id:
+            old_instance = (
+                GISFeature.objects
+                .only('geometry', 'attributes', 'is_deleted', 'layer_name')
+                .filter(pk=self.pk)
+                .first()
+            )
+
+        # Auto-populate survey_area from folder hierarchy on first save
+        if is_new and not self.survey_area_id:
+            resolved = self._resolve_survey_area()
+            if resolved:
+                self.survey_area = resolved
+
         # Auto-assign Land_Parcel_ID (eNLI) if not already present
         if self.geometry is not None and not (self.attributes or {}).get('Land_Parcel_ID'):
             try:
@@ -278,7 +342,59 @@ class GISFeature(models.Model):
                 self.attributes = ensure_land_parcel_id(self.attributes or {}, self.geometry)
             except Exception:
                 pass
+
         super().save(*args, **kwargs)
+
+        # Record history (skip if _skip_history flag is set, e.g. bulk backfill)
+        if not getattr(self, '_skip_history', False) and self.survey_area_id:
+            _user = getattr(self, '_history_user', None)
+            _note = getattr(self, '_history_note', '')
+            try:
+                self._record_history(is_new, old_instance, _user, _note)
+            except Exception:
+                pass  # history is best-effort; never block the actual save
+
+    def _record_history(self, is_new, old_instance, changed_by, note=''):
+        area_status = ''
+        try:
+            area_status = self.survey_area.status
+        except Exception:
+            pass
+
+        if is_new:
+            GISFeatureHistory.objects.create(
+                feature=self,
+                feature_pk=self.pk,
+                survey_area_id=self.survey_area_id,
+                project_id=self.project_id,
+                changed_by=changed_by,
+                change_type=GISFeatureHistory.CREATE,
+                layer_name=self.layer_name,
+                new_geometry=self.geometry,
+                new_attributes=self.attributes or {},
+                area_status_at_change=area_status,
+                note=note,
+            )
+        elif old_instance:
+            geom_changed = old_instance.geometry != self.geometry
+            attr_changed = old_instance.attributes != self.attributes
+            became_deleted = not old_instance.is_deleted and self.is_deleted
+            if became_deleted or geom_changed or attr_changed:
+                GISFeatureHistory.objects.create(
+                    feature=self if not self.is_deleted else None,
+                    feature_pk=self.pk,
+                    survey_area_id=self.survey_area_id,
+                    project_id=self.project_id,
+                    changed_by=changed_by,
+                    change_type=GISFeatureHistory.DELETE if became_deleted else GISFeatureHistory.MODIFY,
+                    layer_name=self.layer_name,
+                    old_geometry=old_instance.geometry,
+                    new_geometry=self.geometry if not self.is_deleted else None,
+                    old_attributes=old_instance.attributes or {},
+                    new_attributes=self.attributes if not self.is_deleted else {},
+                    area_status_at_change=area_status,
+                    note=note,
+                )
 
     def __str__(self):
         return f"{self.layer_name} [{self.geometry_type}] — {self.project.project_number}"
@@ -814,3 +930,148 @@ class TopologyRule(models.Model):
 
     def __str__(self):
         return f"{self.project.project_number} / {self.rule_type} on {self.layer_a}"
+
+
+# ── Time-series / versioning models ──────────────────────────────────────────
+
+class GISFeatureHistory(models.Model):
+    """
+    Immutable audit log of every create / modify / delete on a GISFeature.
+    Written automatically by GISFeature.save() — never edit directly.
+    """
+    CREATE       = 'CREATE'
+    MODIFY       = 'MODIFY'
+    DELETE       = 'DELETE'
+    TRANSFER_OUT = 'TRANSFER_OUT'
+    TRANSFER_IN  = 'TRANSFER_IN'
+
+    CHANGE_TYPES = [
+        (CREATE,       'Created'),
+        (MODIFY,       'Modified'),
+        (DELETE,       'Deleted'),
+        (TRANSFER_OUT, 'Transferred Out'),
+        (TRANSFER_IN,  'Transferred In'),
+    ]
+
+    # feature may become None if the GISFeature is hard-deleted; feature_pk always preserved
+    feature     = models.ForeignKey(
+        GISFeature, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='history',
+    )
+    feature_pk  = models.IntegerField(db_index=True)
+    survey_area = models.ForeignKey(
+        SurveyArea, on_delete=models.CASCADE, related_name='feature_history',
+    )
+    project     = models.ForeignKey(
+        SurveyProject, on_delete=models.CASCADE, related_name='feature_history',
+    )
+    changed_by  = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+    )
+    changed_at  = models.DateTimeField(auto_now_add=True, db_index=True)
+    change_type = models.CharField(max_length=15, choices=CHANGE_TYPES)
+    layer_name  = models.CharField(max_length=64, blank=True)
+
+    old_geometry   = gis_models.GeometryField(srid=4326, null=True, blank=True)
+    new_geometry   = gis_models.GeometryField(srid=4326, null=True, blank=True)
+    old_attributes = models.JSONField(default=dict)
+    new_attributes = models.JSONField(default=dict)
+
+    area_status_at_change = models.CharField(max_length=20, blank=True)
+    note = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['-changed_at']
+        indexes = [
+            models.Index(fields=['survey_area', '-changed_at']),
+            models.Index(fields=['project', '-changed_at']),
+            models.Index(fields=['survey_area', 'change_type']),
+        ]
+
+    def __str__(self):
+        return f"{self.change_type} feature {self.feature_pk} @ {self.changed_at:%Y-%m-%d %H:%M}"
+
+
+class SurveyAreaSnapshot(models.Model):
+    """
+    Point-in-time GeoJSON snapshot of a survey area's features.
+    Taken automatically at every workflow transition and at each split.
+    Can also be taken manually.
+    """
+    WORKFLOW     = 'WORKFLOW'
+    SPLIT_BEFORE = 'SPLIT_BEFORE'
+    SPLIT_AFTER  = 'SPLIT_AFTER'
+    TRANSFER     = 'TRANSFER'
+    MANUAL       = 'MANUAL'
+
+    SNAPSHOT_TYPES = [
+        (WORKFLOW,     'Workflow Transition'),
+        (SPLIT_BEFORE, 'Before Split'),
+        (SPLIT_AFTER,  'After Split'),
+        (TRANSFER,     'Physical Transfer'),
+        (MANUAL,       'Manual'),
+    ]
+
+    survey_area      = models.ForeignKey(SurveyArea, on_delete=models.CASCADE, related_name='snapshots')
+    snapshot_type    = models.CharField(max_length=15, choices=SNAPSHOT_TYPES, default=MANUAL)
+    taken_at         = models.DateTimeField(auto_now_add=True)
+    taken_by         = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+    )
+    status_at_snapshot = models.CharField(max_length=20, blank=True)
+    feature_count    = models.IntegerField(default=0)
+    features_geojson = models.JSONField(default=dict)  # GeoJSON FeatureCollection
+    label            = models.CharField(max_length=200, blank=True)
+    notes            = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['-taken_at']
+        indexes = [
+            models.Index(fields=['survey_area', '-taken_at']),
+        ]
+
+    def __str__(self):
+        return f"Snapshot {self.survey_area} [{self.snapshot_type}] @ {self.taken_at:%Y-%m-%d}"
+
+
+class SurveyAreaSplitRecord(models.Model):
+    """
+    Tracks every split / pocket / transfer operation.
+    SPLIT    — area divided, one portion creates a new peer survey area.
+    POCKET   — a sub-region extracted as a child (pocket) area.
+    TRANSFER — physically transferred to another service; new DRAFT area created.
+               Works on APPROVED/PUBLISHED areas — source area is NOT de-published.
+    """
+    SPLIT    = 'SPLIT'
+    POCKET   = 'POCKET'
+    TRANSFER = 'TRANSFER'
+
+    OPERATION_TYPES = [
+        (SPLIT,    'Area Split'),
+        (POCKET,   'Pocket Created'),
+        (TRANSFER, 'Physical Transfer'),
+    ]
+
+    source_area  = models.ForeignKey(
+        SurveyArea, on_delete=models.CASCADE, related_name='split_events_as_source',
+    )
+    new_area     = models.OneToOneField(
+        SurveyArea, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='split_origin',
+    )
+    operation    = models.CharField(max_length=10, choices=OPERATION_TYPES)
+    transferred_feature_ids = models.JSONField(default=list)
+    transferred_feature_count = models.IntegerField(default=0)
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+    )
+    performed_at = models.DateTimeField(auto_now_add=True)
+    reason       = models.CharField(max_length=500, blank=True)
+    notes        = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['-performed_at']
+
+    def __str__(self):
+        op = dict(self.OPERATION_TYPES).get(self.operation, self.operation)
+        return f"{op}: {self.source_area} → {self.new_area} @ {self.performed_at:%Y-%m-%d}"

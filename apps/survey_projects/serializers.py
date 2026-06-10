@@ -6,6 +6,7 @@ from .models import (
     ShapefileImport, ProjectLayerFolder, ProjectShare, GeoTiffLayer,
     FeatureAttachment, ProjectMilestone, QGISUploadLog, TemporaryLayer,
     SurveyAreaAccessRequest, ReviewAnnotation, TopologyRule,
+    GISFeatureHistory, SurveyAreaSnapshot, SurveyAreaSplitRecord,
 )
 
 
@@ -33,21 +34,72 @@ class SurveyProjectSerializer(serializers.ModelSerializer):
 
 
 class SurveyAreaSerializer(serializers.ModelSerializer):
-    assigned_to_name = serializers.CharField(source='assigned_to.get_full_name', read_only=True)
-    created_by_name  = serializers.CharField(source='created_by.get_full_name', read_only=True)
-    status_display   = serializers.CharField(source='get_status_display', read_only=True)
-    folder_name      = serializers.CharField(source='folder.name', read_only=True)
+    assigned_to_name  = serializers.CharField(source='assigned_to.get_full_name', read_only=True)
+    created_by_name   = serializers.CharField(source='created_by.get_full_name', read_only=True)
+    status_display    = serializers.CharField(source='get_status_display', read_only=True)
+    folder_name       = serializers.CharField(source='folder.name', read_only=True)
+    area_type_display = serializers.CharField(source='get_area_type_display', read_only=True)
+    parent_area_name  = serializers.CharField(source='parent_area.name', read_only=True)
+    child_count       = serializers.SerializerMethodField()
 
     class Meta:
         model  = SurveyArea
         fields = [
             'id', 'project', 'name', 'area_code', 'description',
             'folder', 'folder_name',
+            'parent_area', 'parent_area_name', 'area_type', 'area_type_display',
+            'child_count',
             'assigned_to', 'assigned_to_name',
             'status', 'status_display', 'map_enabled',
             'created_by', 'created_by_name', 'created_at', 'updated_at',
         ]
         read_only_fields = ['created_by', 'created_at', 'updated_at', 'status', 'map_enabled']
+
+    def get_child_count(self, obj):
+        return obj.child_areas.count()
+
+
+class GISFeatureHistorySerializer(serializers.ModelSerializer):
+    changed_by_name = serializers.CharField(source='changed_by.get_full_name', read_only=True)
+    change_type_display = serializers.CharField(source='get_change_type_display', read_only=True)
+
+    class Meta:
+        model = GISFeatureHistory
+        fields = [
+            'id', 'feature_pk', 'change_type', 'change_type_display',
+            'layer_name', 'changed_by', 'changed_by_name', 'changed_at',
+            'old_attributes', 'new_attributes',
+            'area_status_at_change', 'note',
+        ]
+
+
+class SurveyAreaSnapshotSerializer(serializers.ModelSerializer):
+    taken_by_name = serializers.CharField(source='taken_by.get_full_name', read_only=True)
+    snapshot_type_display = serializers.CharField(source='get_snapshot_type_display', read_only=True)
+
+    class Meta:
+        model = SurveyAreaSnapshot
+        fields = [
+            'id', 'survey_area', 'snapshot_type', 'snapshot_type_display',
+            'taken_at', 'taken_by', 'taken_by_name',
+            'status_at_snapshot', 'feature_count', 'label', 'notes',
+        ]
+
+
+class SurveyAreaSplitRecordSerializer(serializers.ModelSerializer):
+    performed_by_name = serializers.CharField(source='performed_by.get_full_name', read_only=True)
+    operation_display = serializers.CharField(source='get_operation_display', read_only=True)
+    new_area_name = serializers.CharField(source='new_area.name', read_only=True)
+    new_area_status = serializers.CharField(source='new_area.status', read_only=True)
+
+    class Meta:
+        model = SurveyAreaSplitRecord
+        fields = [
+            'id', 'source_area', 'new_area', 'new_area_name', 'new_area_status',
+            'operation', 'operation_display',
+            'transferred_feature_count', 'performed_by', 'performed_by_name',
+            'performed_at', 'reason', 'notes',
+        ]
 
 
 class ProjectLayerFolderSerializer(serializers.ModelSerializer):

@@ -129,6 +129,11 @@ export interface SurveyArea {
   description: string
   folder: number | null
   folder_name: string
+  parent_area: number | null
+  parent_area_name: string
+  area_type: 'STANDARD' | 'POCKET' | 'SPLIT_RESULT'
+  area_type_display: string
+  child_count: number
   assigned_to: number | null
   assigned_to_name: string
   status: ProjectStatus
@@ -138,6 +143,66 @@ export interface SurveyArea {
   created_by_name: string
   created_at: string
   updated_at: string
+}
+
+export interface FeatureHistoryEntry {
+  id: number
+  feature_pk: number
+  change_type: 'CREATE' | 'MODIFY' | 'DELETE' | 'TRANSFER_OUT' | 'TRANSFER_IN'
+  change_type_display: string
+  layer_name: string
+  changed_by: number | null
+  changed_by_name: string
+  changed_at: string
+  old_attributes: Record<string, unknown>
+  new_attributes: Record<string, unknown>
+  area_status_at_change: string
+  note: string
+}
+
+export interface AreaSnapshot {
+  id: number
+  survey_area: number
+  snapshot_type: string
+  snapshot_type_display: string
+  taken_at: string
+  taken_by: number | null
+  taken_by_name: string
+  status_at_snapshot: string
+  feature_count: number
+  label: string
+  notes: string
+}
+
+export interface AreaSplitRecord {
+  id: number
+  source_area: number
+  new_area: number | null
+  new_area_name: string
+  new_area_status: string
+  operation: 'SPLIT' | 'POCKET' | 'TRANSFER'
+  operation_display: string
+  transferred_feature_count: number
+  performed_by: number | null
+  performed_by_name: string
+  performed_at: string
+  reason: string
+  notes: string
+}
+
+export interface AreaLineage {
+  area: SurveyArea
+  parent: SurveyArea | null
+  children: SurveyArea[]
+  split_events: AreaSplitRecord[]
+}
+
+export interface AreaTimeline {
+  dates: string[]
+  created: number[]
+  modified: number[]
+  deleted: number[]
+  transferred: number[]
 }
 
 export interface SurveyProject {

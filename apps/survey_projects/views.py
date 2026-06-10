@@ -3029,6 +3029,361 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
             })
         return Response(result)
 
+    # ── Time-series / history endpoints ──────────────────────────────────────
+
+    @action(detail=True, methods=['get'], url_path='history',
+            permission_classes=[permissions.IsAuthenticated])
+    def history(self, request, pk=None):
+        """
+        GET /api/projects/survey-areas/{id}/history/
+        Paginated feature change log for this survey area.
+        Optional query params: change_type, layer_name, days (default 90)
+        """
+        from apps.survey_projects.models import GISFeatureHistory
+        from apps.survey_projects.serializers import GISFeatureHistorySerializer
+        from django.utils import timezone
+        import datetime
+
+        area = self.get_object()
+        qs = GISFeatureHistory.objects.filter(survey_area=area).select_related('changed_by')
+
+        change_type = request.query_params.get('change_type')
+        if change_type:
+            qs = qs.filter(change_type=change_type)
+        layer_name = request.query_params.get('layer_name')
+        if layer_name:
+            qs = qs.filter(layer_name=layer_name)
+        days = int(request.query_params.get('days', 90))
+        cutoff = timezone.now() - datetime.timedelta(days=days)
+        qs = qs.filter(changed_at__gte=cutoff)
+
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            return self.get_paginated_response(GISFeatureHistorySerializer(page, many=True).data)
+        return Response(GISFeatureHistorySerializer(qs[:200], many=True).data)
+
+    @action(detail=True, methods=['get'], url_path='timeline',
+            permission_classes=[permissions.IsAuthenticated])
+    def timeline(self, request, pk=None):
+        """
+        GET /api/projects/survey-areas/{id}/timeline/
+        Returns daily change counts for the past N days (default 90) — used for chart.
+        Response: { dates: [...], created: [...], modified: [...], deleted: [...] }
+        """
+        from apps.survey_projects.models import GISFeatureHistory
+        from django.utils import timezone
+        from django.db.models.functions import TruncDate
+        from django.db.models import Count
+        import datetime
+
+        area = self.get_object()
+        days = int(request.query_params.get('days', 90))
+        cutoff = timezone.now() - datetime.timedelta(days=days)
+
+        rows = (
+            GISFeatureHistory.objects
+            .filter(survey_area=area, changed_at__gte=cutoff)
+            .annotate(day=TruncDate('changed_at'))
+            .values('day', 'change_type')
+            .annotate(n=Count('id'))
+            .order_by('day')
+        )
+
+        # Build date-indexed dicts
+        from collections import defaultdict
+        by_day: dict = defaultdict(lambda: {'CREATE': 0, 'MODIFY': 0, 'DELETE': 0,
+                                             'TRANSFER_OUT': 0, 'TRANSFER_IN': 0})
+        for row in rows:
+            d = str(row['day'])
+            by_day[d][row['change_type']] = row['n']
+
+        # Fill in every date from cutoff to today (for a continuous chart)
+        all_dates = []
+        cur = cutoff.date()
+        end = timezone.now().date()
+        while cur <= end:
+            all_dates.append(str(cur))
+            cur += datetime.timedelta(days=1)
+
+        return Response({
+            'dates':        all_dates,
+            'created':      [by_day[d]['CREATE'] for d in all_dates],
+            'modified':     [by_day[d]['MODIFY'] for d in all_dates],
+            'deleted':      [by_day[d]['DELETE'] for d in all_dates],
+            'transferred':  [by_day[d]['TRANSFER_OUT'] + by_day[d]['TRANSFER_IN'] for d in all_dates],
+        })
+
+    @action(detail=True, methods=['get', 'post'], url_path='snapshots',
+            permission_classes=[permissions.IsAuthenticated])
+    def snapshots(self, request, pk=None):
+        """
+        GET  /api/projects/survey-areas/{id}/snapshots/ — list snapshots
+        POST /api/projects/survey-areas/{id}/snapshots/ — take manual snapshot
+        """
+        from apps.survey_projects.models import SurveyAreaSnapshot
+        from apps.survey_projects.serializers import SurveyAreaSnapshotSerializer
+
+        area = self.get_object()
+
+        if request.method == 'POST':
+            snap = _take_snapshot(area, request.user, SurveyAreaSnapshot.MANUAL,
+                                   notes=request.data.get('notes', ''),
+                                   label=request.data.get('label', ''))
+            return Response(SurveyAreaSnapshotSerializer(snap).data, status=201)
+
+        qs = SurveyAreaSnapshot.objects.filter(survey_area=area).select_related('taken_by')
+        return Response(SurveyAreaSnapshotSerializer(qs, many=True).data)
+
+    @action(detail=True, methods=['get'], url_path=r'snapshots/(?P<snapshot_id>[0-9]+)/geojson',
+            permission_classes=[permissions.IsAuthenticated])
+    def snapshot_geojson(self, request, pk=None, snapshot_id=None):
+        """
+        GET /api/projects/survey-areas/{id}/snapshots/{snapshot_id}/geojson/
+        Returns the full GeoJSON FeatureCollection for that snapshot.
+        """
+        from apps.survey_projects.models import SurveyAreaSnapshot
+        area = self.get_object()
+        try:
+            snap = SurveyAreaSnapshot.objects.get(pk=snapshot_id, survey_area=area)
+        except SurveyAreaSnapshot.DoesNotExist:
+            return Response({'detail': 'Snapshot not found.'}, status=404)
+        return Response(snap.features_geojson)
+
+    @action(detail=True, methods=['get'], url_path='lineage',
+            permission_classes=[permissions.IsAuthenticated])
+    def lineage(self, request, pk=None):
+        """
+        GET /api/projects/survey-areas/{id}/lineage/
+        Returns parent area info + all child areas (pockets/splits) for this area.
+        """
+        from apps.survey_projects.models import SurveyAreaSplitRecord
+        from apps.survey_projects.serializers import (
+            SurveyAreaSerializer, SurveyAreaSplitRecordSerializer,
+        )
+
+        area = self.get_object()
+        parent = SurveyAreaSerializer(area.parent_area).data if area.parent_area_id else None
+        children = SurveyAreaSerializer(
+            area.child_areas.select_related('project'), many=True
+        ).data
+        split_events = SurveyAreaSplitRecord.objects.filter(source_area=area).select_related(
+            'new_area', 'performed_by'
+        )
+        return Response({
+            'area':         SurveyAreaSerializer(area).data,
+            'parent':       parent,
+            'children':     children,
+            'split_events': SurveyAreaSplitRecordSerializer(split_events, many=True).data,
+        })
+
+    @action(detail=True, methods=['post'], url_path='split',
+            permission_classes=[permissions.IsAuthenticated])
+    def split(self, request, pk=None):
+        """
+        POST /api/projects/survey-areas/{id}/split/
+        Split this area: move selected features into a new survey area.
+
+        Body:
+          new_area_name    (str)   — name for the new area
+          new_area_code    (str)   — optional area code
+          feature_ids      (list)  — IDs of GISFeature records to transfer
+          operation        (str)   — SPLIT | POCKET | TRANSFER (default SPLIT)
+          reason           (str)   — required for TRANSFER
+          notes            (str)   — optional
+
+        Rules:
+          - Any source area status is accepted (DRAFT through PUBLISHED).
+          - APPROVED/PUBLISHED areas: new area starts as DRAFT; source stays unchanged.
+          - Moved features get survey_area updated to new area (folder re-assigned too).
+          - Before/after snapshots are taken automatically.
+        """
+        from apps.survey_projects.models import (
+            GISFeatureHistory, SurveyAreaSnapshot, SurveyAreaSplitRecord,
+        )
+        from apps.survey_projects.serializers import SurveyAreaSerializer
+
+        area = self.get_object()
+        new_name    = (request.data.get('new_area_name') or '').strip()
+        new_code    = (request.data.get('new_area_code') or '').strip()
+        feature_ids = request.data.get('feature_ids', [])
+        operation   = request.data.get('operation', SurveyAreaSplitRecord.SPLIT)
+        reason      = (request.data.get('reason') or '').strip()
+        notes       = (request.data.get('notes') or '').strip()
+
+        if not new_name:
+            return Response({'detail': 'new_area_name is required.'}, status=400)
+        if not feature_ids:
+            return Response({'detail': 'feature_ids must not be empty.'}, status=400)
+        if operation not in (SurveyAreaSplitRecord.SPLIT, SurveyAreaSplitRecord.POCKET,
+                             SurveyAreaSplitRecord.TRANSFER):
+            return Response({'detail': 'Invalid operation.'}, status=400)
+        if operation == SurveyAreaSplitRecord.TRANSFER and not reason:
+            return Response({'detail': 'reason is required for TRANSFER operations.'}, status=400)
+
+        # Validate features belong to this area
+        features = list(
+            GISFeature.objects.filter(pk__in=feature_ids, is_deleted=False)
+            .select_related('folder')
+        )
+        if not features:
+            return Response({'detail': 'No valid features found for the given IDs.'}, status=400)
+
+        # Take SPLIT_BEFORE snapshot of source area
+        _take_snapshot(area, request.user, SurveyAreaSnapshot.SPLIT_BEFORE,
+                       label=f'Before {operation.lower()} → {new_name}')
+
+        # Create new survey area
+        area_type = (SurveyArea.POCKET if operation == SurveyAreaSplitRecord.POCKET
+                     else SurveyArea.SPLIT_RESULT)
+        new_area = SurveyArea.objects.create(
+            project=area.project,
+            name=new_name,
+            area_code=new_code,
+            status=SurveyArea.DRAFT,
+            area_type=area_type,
+            parent_area=area,
+            created_by=request.user,
+        )
+        # Create folder tree for new area
+        new_root = ProjectLayerFolder.objects.create(
+            project=area.project, name=new_name,
+            folder_type=ProjectLayerFolder.ZONE, created_by=request.user, order=0,
+        )
+        _add_survey_area_subfolders(new_root, request.user)
+        new_area.folder = new_root
+        new_area.save(update_fields=['folder'])
+
+        # Find the target subfolder (first child folder, likely "Shape Files")
+        target_folder = (
+            ProjectLayerFolder.objects.filter(parent=new_root)
+            .order_by('order', 'name')
+            .first()
+        ) or new_root
+
+        # Transfer features: reassign folder + survey_area, record history
+        for feat in features:
+            feat._history_user = request.user
+            feat._history_note = f'Transferred to {new_name} ({operation})'
+
+            # Record TRANSFER_OUT on old area
+            GISFeatureHistory.objects.create(
+                feature=feat, feature_pk=feat.pk,
+                survey_area=area, project_id=feat.project_id,
+                changed_by=request.user,
+                change_type=GISFeatureHistory.TRANSFER_OUT,
+                layer_name=feat.layer_name,
+                old_geometry=feat.geometry,
+                new_geometry=feat.geometry,
+                old_attributes=feat.attributes or {},
+                new_attributes=feat.attributes or {},
+                area_status_at_change=area.status,
+                note=f'Transferred to {new_name}. Reason: {reason}' if reason else f'Transferred to {new_name}',
+            )
+
+            # Update feature assignment
+            old_survey_area_id = feat.survey_area_id
+            feat.survey_area = new_area
+            feat.folder = target_folder
+            feat._skip_history = True  # suppress the auto-history; we're recording manually
+            feat.save(update_fields=['survey_area', 'folder'])
+
+            # Record TRANSFER_IN on new area
+            GISFeatureHistory.objects.create(
+                feature=feat, feature_pk=feat.pk,
+                survey_area=new_area, project_id=feat.project_id,
+                changed_by=request.user,
+                change_type=GISFeatureHistory.TRANSFER_IN,
+                layer_name=feat.layer_name,
+                old_geometry=None,
+                new_geometry=feat.geometry,
+                old_attributes={},
+                new_attributes=feat.attributes or {},
+                area_status_at_change=new_area.status,
+                note=f'Received from {area.name}. Reason: {reason}' if reason else f'Received from {area.name}',
+            )
+
+        # Create split record
+        SurveyAreaSplitRecord.objects.create(
+            source_area=area,
+            new_area=new_area,
+            operation=operation,
+            transferred_feature_ids=[f.pk for f in features],
+            transferred_feature_count=len(features),
+            performed_by=request.user,
+            reason=reason,
+            notes=notes,
+        )
+
+        # Take SPLIT_AFTER snapshots for both areas
+        _take_snapshot(area, request.user, SurveyAreaSnapshot.SPLIT_AFTER,
+                       label=f'After {operation.lower()} — {len(features)} features moved to {new_name}')
+        _take_snapshot(new_area, request.user, SurveyAreaSnapshot.SPLIT_AFTER,
+                       label=f'Initial state after {operation.lower()} from {area.name}')
+
+        return Response({
+            'detail': f'{len(features)} feature(s) transferred to new area "{new_name}".',
+            'new_area': SurveyAreaSerializer(new_area).data,
+        }, status=201)
+
+
+# ── Snapshot helper ───────────────────────────────────────────────────────────
+
+def _take_snapshot(area, user, snapshot_type, label='', notes=''):
+    """Build and store a GeoJSON snapshot of all live features in an area."""
+    from apps.survey_projects.models import SurveyAreaSnapshot
+    from django.contrib.gis.serializers.geojson import Serializer as GeoJSONSerializer
+
+    features_qs = GISFeature.objects.filter(
+        survey_area=area, is_deleted=False
+    ).select_related('created_by')
+
+    # Also include folder-linked features (legacy records without direct survey_area)
+    if area.folder_id:
+        folder_ids = _get_subtree_folder_ids(area.folder_id)
+        legacy = GISFeature.objects.filter(folder_id__in=folder_ids, is_deleted=False).exclude(
+            survey_area=area
+        )
+        # Union via Python (small counts expected)
+        all_feats = list(features_qs) + list(legacy)
+    else:
+        all_feats = list(features_qs)
+
+    # Build minimal GeoJSON FeatureCollection
+    fc = {
+        'type': 'FeatureCollection',
+        'features': [
+            {
+                'type': 'Feature',
+                'geometry': {'type': f.geometry.geom_type, 'coordinates': []},  # placeholder
+                'properties': {
+                    'id': f.pk, 'layer_name': f.layer_name,
+                    'geometry_type': f.geometry_type,
+                    **{k: v for k, v in (f.attributes or {}).items()},
+                },
+            }
+            for f in all_feats
+        ],
+    }
+    # Write proper GeoJSON geometry via GDAL
+    for i, feat in enumerate(all_feats):
+        try:
+            import json
+            fc['features'][i]['geometry'] = json.loads(feat.geometry.geojson)
+        except Exception:
+            fc['features'][i]['geometry'] = None
+
+    snap = SurveyAreaSnapshot.objects.create(
+        survey_area=area,
+        snapshot_type=snapshot_type,
+        taken_by=user,
+        status_at_snapshot=area.status,
+        feature_count=len(all_feats),
+        features_geojson=fc,
+        label=label or snapshot_type,
+        notes=notes,
+    )
+    return snap
+
 
 class SurveyAreaAccessRequestViewSet(viewsets.GenericViewSet):
     """

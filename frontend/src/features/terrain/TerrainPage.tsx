@@ -24,7 +24,8 @@ type Tool = 'none' | 'elevation' | 'profile' | 'slope'
 const INDIA_RECT = Cesium.Rectangle.fromDegrees(68.0, 6.5, 97.5, 37.5)
 
 interface ElevPoint { dist: number; elev: number; lat: number; lon: number }
-interface SlopeStats { min: number; max: number; avg: number; gridSize: number }
+interface SlopeCategories { flat: number; gentle: number; moderate: number; steep: number; verysteep: number }
+interface SlopeStats { min: number; max: number; avg: number; gridSize: number; categories: SlopeCategories }
 interface ClickedElev { lat: number; lon: number; elev: number }
 interface SlopeGridData {
   elevGrid: number[]
@@ -622,24 +623,140 @@ export default function TerrainPage() {
 
   // ── Export helpers ──────────────────────────────────────────────────────────
 
-  const exportPNG = useCallback(() => {
+  const exportPNG = useCallback(async () => {
     const viewer = viewerRef.current
     if (!viewer) return
+    setExporting(true)
     try {
       viewer.render()
-      viewer.scene.canvas.toBlob((blob) => {
-        if (!blob) { message.error('PNG capture failed'); return }
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = `rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.png`
-        a.click()
-        URL.revokeObjectURL(url)
-      }, 'image/png')
+      const src = viewer.scene.canvas
+      const W = src.width, H = src.height
+      const out = document.createElement('canvas')
+      out.width = W; out.height = H
+      const ctx = out.getContext('2d')
+      if (!ctx) throw new Error('no 2d context')
+      ctx.drawImage(src, 0, 0)
+
+      const fs = Math.max(14, Math.round(W / 80))
+      const rowH = Math.round(fs * 1.8)
+      const pad = 12
+
+      // ── Title bar ────────────────────────────────────────────────
+      ctx.fillStyle = 'rgba(10,12,28,0.90)'
+      ctx.fillRect(0, 0, W, Math.round(fs * 4))
+      ctx.fillStyle = '#4fc3f7'
+      ctx.font = `bold ${Math.round(fs * 1.15)}px sans-serif`
+      ctx.fillText('RakshaGIS — Terrain Analysis', pad, Math.round(fs * 2))
+      ctx.fillStyle = '#999'
+      ctx.font = `${Math.round(fs * 0.82)}px sans-serif`
+      ctx.fillText(`${new Date().toLocaleString()}  ·  ${terrainLabel}`, pad, Math.round(fs * 3.3))
+
+      // ── Slope Legend (bottom-left) ───────────────────────────────
+      const legendItems = [
+        { label: 'Flat      0–5°',    color: '#52c41a' },
+        { label: 'Gentle   5–15°',   color: '#a0d911' },
+        { label: 'Moderate 15–30°',  color: '#faad14' },
+        { label: 'Steep    30–45°',  color: '#fa8c16' },
+        { label: 'V.Steep  ≥45°',    color: '#ff4d4f' },
+      ]
+      const legW = Math.round(fs * 14.5)
+      const legH = legendItems.length * rowH + Math.round(fs * 3.2)
+      const legX = pad, legY = H - legH - pad
+      ctx.fillStyle = 'rgba(10,12,28,0.85)'
+      ctx.fillRect(legX, legY, legW, legH)
+      ctx.fillStyle = '#4fc3f7'
+      ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
+      ctx.fillText('Slope Legend', legX + 10, legY + Math.round(fs * 1.6))
+      legendItems.forEach((it, i) => {
+        const iy = legY + Math.round(fs * 2.9) + i * rowH
+        ctx.fillStyle = it.color
+        ctx.fillRect(legX + 10, iy - Math.round(fs * 0.95), Math.round(fs * 1.1), Math.round(fs * 1.1))
+        ctx.fillStyle = '#ddd'
+        ctx.font = `${Math.round(fs * 0.82)}px monospace`
+        ctx.fillText(it.label, legX + 10 + Math.round(fs * 1.5), iy)
+      })
+
+      // ── Slope Statistics (bottom-right) ─────────────────────────
+      if (slopeStats) {
+        const desc = slopeStats.avg < 5 ? 'Mostly flat'
+          : slopeStats.avg < 15 ? 'Gentle slopes'
+          : slopeStats.avg < 30 ? 'Moderate terrain' : 'Steep terrain'
+        const statLines = [
+          `Min  ${slopeStats.min.toFixed(1)}°`,
+          `Avg  ${slopeStats.avg.toFixed(1)}°  (${desc})`,
+          `Max  ${slopeStats.max.toFixed(1)}°`,
+          `Grid ${slopeStats.gridSize}×${slopeStats.gridSize} pts`,
+          `─────────────────────`,
+          `Flat      ${slopeStats.categories.flat.toFixed(1)}%`,
+          `Gentle    ${slopeStats.categories.gentle.toFixed(1)}%`,
+          `Moderate  ${slopeStats.categories.moderate.toFixed(1)}%`,
+          `Steep     ${slopeStats.categories.steep.toFixed(1)}%`,
+          `V.Steep   ${slopeStats.categories.verysteep.toFixed(1)}%`,
+        ]
+        const stW = Math.round(fs * 18.5)
+        const stH = statLines.length * rowH + Math.round(fs * 3.2)
+        const stX = W - stW - pad, stY = H - stH - pad
+        ctx.fillStyle = 'rgba(10,12,28,0.85)'
+        ctx.fillRect(stX, stY, stW, stH)
+        ctx.fillStyle = '#4fc3f7'
+        ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
+        ctx.fillText('Slope Statistics', stX + 10, stY + Math.round(fs * 1.6))
+        statLines.forEach((ln, i) => {
+          ctx.fillStyle = i === 4 ? '#333' : '#ddd'
+          ctx.font = `${Math.round(fs * 0.82)}px monospace`
+          ctx.fillText(ln, stX + 10, stY + Math.round(fs * 2.9) + i * rowH)
+        })
+      }
+
+      // ── Point Elevation (top-right) ──────────────────────────────
+      if (clickedElev) {
+        const elvLines = [
+          `Lat : ${clickedElev.lat.toFixed(5)}°`,
+          `Lon : ${clickedElev.lon.toFixed(5)}°`,
+          `Elev: ${clickedElev.elev.toFixed(1)} m`,
+        ]
+        const eW = Math.round(fs * 16), eH = elvLines.length * rowH + Math.round(fs * 3.2)
+        const eX = W - eW - pad, eY = Math.round(fs * 4) + pad
+        ctx.fillStyle = 'rgba(10,12,28,0.85)'
+        ctx.fillRect(eX, eY, eW, eH)
+        ctx.fillStyle = '#4fc3f7'
+        ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
+        ctx.fillText('Point Elevation', eX + 10, eY + Math.round(fs * 1.6))
+        elvLines.forEach((ln, i) => {
+          ctx.fillStyle = '#ddd'
+          ctx.font = `${Math.round(fs * 0.82)}px monospace`
+          ctx.fillText(ln, eX + 10, eY + Math.round(fs * 2.9) + i * rowH)
+        })
+      }
+
+      // ── North arrow ──────────────────────────────────────────────
+      const nax = 54, nay = Math.round(fs * 4) + 52
+      ctx.strokeStyle = '#eee'; ctx.fillStyle = '#eee'; ctx.lineWidth = 2.5
+      ctx.beginPath(); ctx.moveTo(nax, nay + 30); ctx.lineTo(nax, nay); ctx.stroke()
+      ctx.beginPath()
+      ctx.moveTo(nax - 9, nay + 14); ctx.lineTo(nax, nay); ctx.lineTo(nax + 9, nay + 14)
+      ctx.closePath(); ctx.fill()
+      ctx.fillStyle = '#bbb'; ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
+      ctx.textAlign = 'center'
+      ctx.fillText('N', nax, nay + 46)
+      ctx.textAlign = 'left'
+
+      // ── Save ─────────────────────────────────────────────────────
+      const blob = await new Promise<Blob | null>(res => out.toBlob(res, 'image/png'))
+      if (!blob) { message.error('PNG capture failed'); return }
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.png`
+      a.click()
+      URL.revokeObjectURL(url)
+      message.success('PNG exported')
     } catch {
       message.error('PNG export failed — canvas may be unavailable')
+    } finally {
+      setExporting(false)
     }
-  }, [])
+  }, [slopeStats, clickedElev, terrainLabel])
 
   const exportPDF = useCallback(async () => {
     setExporting(true)
@@ -648,71 +765,279 @@ export default function TerrainPage() {
       const viewer = viewerRef.current
       const W = 297, H = 210  // A4 landscape mm
       const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' })
+      const date = new Date().toLocaleString()
+      let totalPages = 1
+      if (profileData.length > 1) totalPages = 2
 
-      // Header bar
-      pdf.setFillColor(13, 13, 31)
-      pdf.rect(0, 0, W, 22, 'F')
-      pdf.setTextColor(79, 195, 247)
-      pdf.setFontSize(14)
-      pdf.text('RakshaGIS — Terrain Analysis Report', 10, 14)
-      pdf.setTextColor(160, 160, 160)
-      pdf.setFontSize(8)
-      pdf.text(`Generated: ${new Date().toLocaleString()}   |   Terrain source: ${terrainLabel}`, 10, 20)
+      // ── helper: page header ───────────────────────────────────────
+      const drawHeader = (title: string, sub: string) => {
+        pdf.setFillColor(10, 12, 28)
+        pdf.rect(0, 0, W, 18, 'F')
+        pdf.setTextColor(79, 195, 247)
+        pdf.setFontSize(12)
+        pdf.setFont('helvetica', 'bold')
+        pdf.text(title, 10, 11)
+        pdf.setFont('helvetica', 'normal')
+        pdf.setTextColor(130, 130, 130)
+        pdf.setFontSize(7)
+        pdf.text(sub, 10, 17)
+      }
 
-      // Globe screenshot
+      // ── helper: page footer ───────────────────────────────────────
+      const drawFooter = (page: number) => {
+        pdf.setFillColor(10, 12, 28)
+        pdf.rect(0, H - 6, W, 6, 'F')
+        pdf.setTextColor(80, 80, 80)
+        pdf.setFontSize(6)
+        pdf.setFont('helvetica', 'normal')
+        pdf.text('RakshaGIS — Defence GIS Platform  ·  CONFIDENTIAL', 10, H - 1.5)
+        pdf.text(`Page ${page} / ${totalPages}`, W - 10, H - 1.5, { align: 'right' })
+      }
+
+      // ════════════════════════════════════════════════════════════
+      // PAGE 1: Map + Stats column + Legend strip
+      // ════════════════════════════════════════════════════════════
+      drawHeader('RakshaGIS — Terrain Analysis Report', `${date}   ·   Terrain: ${terrainLabel}`)
+
+      // Map image (left column)
+      const mapX = 10, mapY = 20, mapW = 172, mapH = 118
       if (viewer) {
         try {
           viewer.render()
-          const imgData = viewer.scene.canvas.toDataURL('image/jpeg', 0.85)
-          pdf.addImage(imgData, 'JPEG', 10, 26, W - 20, 110)
-        } catch { /* tainted canvas — skip image */ }
+          const img = viewer.scene.canvas.toDataURL('image/jpeg', 0.92)
+          pdf.addImage(img, 'JPEG', mapX, mapY, mapW, mapH)
+        } catch { /* tainted canvas */ }
+      }
+      pdf.setDrawColor(25, 40, 80); pdf.setLineWidth(0.3)
+      pdf.rect(mapX, mapY, mapW, mapH)
+
+      // Slope colour legend strip below map
+      const legY2 = mapY + mapH + 2
+      const legItems2 = [
+        { l: 'Flat 0–5°',       r: 82,  g: 196, b: 26  },
+        { l: 'Gentle 5–15°',    r: 160, g: 217, b: 17  },
+        { l: 'Moderate 15–30°', r: 250, g: 173, b: 20  },
+        { l: 'Steep 30–45°',    r: 250, g: 140, b: 22  },
+        { l: 'V.Steep ≥45°',    r: 255, g: 77,  b: 79  },
+      ]
+      const lw2 = mapW / legItems2.length
+      legItems2.forEach((it, i) => {
+        pdf.setFillColor(it.r, it.g, it.b)
+        pdf.rect(mapX + i * lw2, legY2, lw2, 3.5, 'F')
+        pdf.setTextColor(200, 200, 200)
+        pdf.setFontSize(5.5)
+        pdf.setFont('helvetica', 'normal')
+        pdf.text(it.l, mapX + i * lw2 + lw2 * 0.5, legY2 + 7.5, { align: 'center' })
+      })
+
+      // Right stats column
+      const rx = 187, rw = W - rx - 5
+      let ry = mapY
+
+      // Stats box helper (draws box, returns next y)
+      const sbox = (
+        y: number, title: string, cr: number, cg: number, cb: number,
+        rows: Array<{ l: string; v: string }>
+      ) => {
+        const rowH = 7, titleH = 9, bH = titleH + rows.length * rowH + 3
+        pdf.setFillColor(13, 17, 40)
+        pdf.rect(rx, y, rw, bH, 'F')
+        pdf.setDrawColor(22, 35, 70); pdf.setLineWidth(0.15)
+        pdf.rect(rx, y, rw, bH, 'S')
+        pdf.setTextColor(cr, cg, cb)
+        pdf.setFontSize(7.5); pdf.setFont('helvetica', 'bold')
+        pdf.text(title, rx + 3, y + titleH - 1)
+        rows.forEach((r, i) => {
+          const ry2 = y + titleH + i * rowH + rowH - 1.5
+          pdf.setTextColor(100, 105, 120); pdf.setFontSize(6); pdf.setFont('helvetica', 'normal')
+          pdf.text(r.l, rx + 3, ry2)
+          pdf.setTextColor(210, 215, 230); pdf.setFontSize(7); pdf.setFont('helvetica', 'bold')
+          pdf.text(r.v, rx + rw - 3, ry2, { align: 'right' })
+        })
+        return y + bH + 2.5
       }
 
-      // Analysis data
-      let x = 10, y = 144
-      pdf.setTextColor(30, 30, 30)
-
       if (clickedElev) {
-        pdf.setFontSize(11); pdf.setTextColor(79, 195, 247)
-        pdf.text('Point Elevation', x, y); y += 6
-        pdf.setFontSize(9); pdf.setTextColor(50, 50, 50)
-        pdf.text(`Latitude  : ${clickedElev.lat.toFixed(5)}°`, x + 4, y); y += 5
-        pdf.text(`Longitude : ${clickedElev.lon.toFixed(5)}°`, x + 4, y); y += 5
-        pdf.text(`Elevation : ${clickedElev.elev.toFixed(1)} m`, x + 4, y); y += 8
+        ry = sbox(ry, 'Point Elevation', 79, 195, 247, [
+          { l: 'Latitude',  v: `${clickedElev.lat.toFixed(5)}°` },
+          { l: 'Longitude', v: `${clickedElev.lon.toFixed(5)}°` },
+          { l: 'Elevation', v: `${clickedElev.elev.toFixed(1)} m` },
+        ])
       }
 
       if (profileData.length > 0) {
-        pdf.setFontSize(11); pdf.setTextColor(79, 195, 247)
-        pdf.text('Elevation Profile', x, y); y += 6
-        pdf.setFontSize(9); pdf.setTextColor(50, 50, 50)
-        const minE = Math.min(...profileData.map(d => d.elev))
-        const maxE = Math.max(...profileData.map(d => d.elev))
-        const lenKm = ((profileData[profileData.length - 1]?.dist ?? 0) / 1000).toFixed(2)
-        pdf.text(`Length    : ${lenKm} km`, x + 4, y); y += 5
-        pdf.text(`Min elev  : ${minE.toFixed(1)} m`, x + 4, y); y += 5
-        pdf.text(`Max elev  : ${maxE.toFixed(1)} m`, x + 4, y); y += 5
-        pdf.text(`Relief    : ${(maxE - minE).toFixed(1)} m`, x + 4, y); y += 8
+        const minE2 = Math.min(...profileData.map(d => d.elev))
+        const maxE2 = Math.max(...profileData.map(d => d.elev))
+        const lenKm2 = ((profileData[profileData.length - 1]?.dist ?? 0) / 1000)
+        ry = sbox(ry, 'Elevation Profile', 82, 196, 26, [
+          { l: 'Length',       v: `${lenKm2.toFixed(2)} km` },
+          { l: 'Start elev',   v: `${profileData[0].elev.toFixed(1)} m` },
+          { l: 'End elev',     v: `${profileData[profileData.length-1].elev.toFixed(1)} m` },
+          { l: 'Highest',      v: `${maxE2.toFixed(1)} m` },
+          { l: 'Lowest',       v: `${minE2.toFixed(1)} m` },
+          { l: 'Relief',       v: `${(maxE2 - minE2).toFixed(1)} m` },
+        ])
       }
 
       if (slopeStats) {
-        pdf.setFontSize(11); pdf.setTextColor(79, 195, 247)
-        pdf.text('Slope Analysis', x, y); y += 6
-        pdf.setFontSize(9); pdf.setTextColor(50, 50, 50)
-        const desc = slopeStats.avg < 5 ? 'Mostly flat' : slopeStats.avg < 15 ? 'Gentle slopes'
-          : slopeStats.avg < 30 ? 'Moderate terrain' : 'Steep terrain'
-        pdf.text(`Min slope : ${slopeStats.min.toFixed(1)}°`, x + 4, y); y += 5
-        pdf.text(`Avg slope : ${slopeStats.avg.toFixed(1)}°  (${desc})`, x + 4, y); y += 5
-        pdf.text(`Max slope : ${slopeStats.max.toFixed(1)}°`, x + 4, y); y += 5
-        pdf.text(`Grid      : ${slopeStats.gridSize}×${slopeStats.gridSize} samples`, x + 4, y)
+        const desc2 = slopeStats.avg < 5 ? 'Mostly flat'
+          : slopeStats.avg < 15 ? 'Gentle' : slopeStats.avg < 30 ? 'Moderate' : 'Steep'
+        ry = sbox(ry, 'Slope Analysis', 250, 173, 20, [
+          { l: 'Min slope', v: `${slopeStats.min.toFixed(1)}°` },
+          { l: 'Avg slope', v: `${slopeStats.avg.toFixed(1)}° — ${desc2}` },
+          { l: 'Max slope', v: `${slopeStats.max.toFixed(1)}°` },
+          { l: 'Grid',      v: `${slopeStats.gridSize}×${slopeStats.gridSize}` },
+        ])
+
+        // Category breakdown bars
+        const cats2 = [
+          { l: 'Flat 0–5°',       p: slopeStats.categories.flat,      r: 82,  g: 196, b: 26  },
+          { l: 'Gentle 5–15°',    p: slopeStats.categories.gentle,     r: 160, g: 217, b: 17  },
+          { l: 'Moderate 15–30°', p: slopeStats.categories.moderate,   r: 250, g: 173, b: 20  },
+          { l: 'Steep 30–45°',    p: slopeStats.categories.steep,      r: 250, g: 140, b: 22  },
+          { l: 'V.Steep ≥45°',    p: slopeStats.categories.verysteep,  r: 255, g: 77,  b: 79  },
+        ]
+        const cbH = cats2.length * 9.5 + 11
+        pdf.setFillColor(13, 17, 40)
+        pdf.rect(rx, ry, rw, cbH, 'F')
+        pdf.setDrawColor(22, 35, 70); pdf.setLineWidth(0.15)
+        pdf.rect(rx, ry, rw, cbH, 'S')
+        pdf.setTextColor(79, 195, 247); pdf.setFontSize(7.5); pdf.setFont('helvetica', 'bold')
+        pdf.text('Category Breakdown', rx + 3, ry + 8)
+        let cy2 = ry + 11
+        cats2.forEach(c => {
+          pdf.setTextColor(145, 150, 160); pdf.setFontSize(6); pdf.setFont('helvetica', 'normal')
+          pdf.text(c.l, rx + 3, cy2 + 4.5)
+          pdf.setTextColor(c.r, c.g, c.b)
+          pdf.text(`${c.p.toFixed(1)}%`, rx + rw - 3, cy2 + 4.5, { align: 'right' })
+          pdf.setFillColor(18, 28, 55)
+          pdf.rect(rx + 3, cy2 + 6, rw - 6, 2.5, 'F')
+          if (c.p > 0) {
+            pdf.setFillColor(c.r, c.g, c.b)
+            pdf.rect(rx + 3, cy2 + 6, (rw - 6) * c.p / 100, 2.5, 'F')
+          }
+          cy2 += 9.5
+        })
       }
 
-      // Footer
-      pdf.setTextColor(120, 120, 120); pdf.setFontSize(7)
-      pdf.text('RakshaGIS — Defence GIS Platform', W - 10, H - 4, { align: 'right' })
+      drawFooter(1)
+
+      // ════════════════════════════════════════════════════════════
+      // PAGE 2: Elevation Profile Chart (if data available)
+      // ════════════════════════════════════════════════════════════
+      if (profileData.length > 1) {
+        pdf.addPage()
+        drawHeader('RakshaGIS — Elevation Profile Chart',
+          `${date}   ·   ${profileData.length} sample points   ·   ${terrainLabel}`)
+
+        // Chart dimensions
+        const cx = 22, cyt = 24, cw = 256, ch = 110
+        const minE3 = Math.min(...profileData.map(d => d.elev))
+        const maxE3 = Math.max(...profileData.map(d => d.elev))
+        const eRange3 = maxE3 - minE3 || 1
+        const maxDist3 = Math.max(profileData[profileData.length - 1]?.dist ?? 1, 1)
+        const ePad3 = eRange3 * 0.12
+        const eMin3 = minE3 - ePad3, eMax3 = maxE3 + ePad3
+        const eSpan3 = eMax3 - eMin3
+
+        // Chart background
+        pdf.setFillColor(10, 13, 32)
+        pdf.rect(cx, cyt, cw, ch, 'F')
+        pdf.setDrawColor(22, 35, 70); pdf.setLineWidth(0.3)
+        pdf.rect(cx, cyt, cw, ch)
+
+        // Horizontal grid lines + Y labels
+        const gridN3 = 5
+        for (let i = 0; i <= gridN3; i++) {
+          const gy3 = cyt + ch - (i / gridN3) * ch
+          const ev3 = eMin3 + (i / gridN3) * eSpan3
+          pdf.setDrawColor(20, 32, 65); pdf.setLineWidth(0.18)
+          pdf.line(cx, gy3, cx + cw, gy3)
+          pdf.setTextColor(80, 95, 118); pdf.setFontSize(5.5); pdf.setFont('helvetica', 'normal')
+          pdf.text(`${ev3.toFixed(0)}m`, cx - 1.5, gy3 + 1.5, { align: 'right' })
+        }
+
+        // Vertical grid lines + X labels
+        const xTicks = 6
+        for (let i = 0; i <= xTicks; i++) {
+          const gx3 = cx + (i / xTicks) * cw
+          const dv3 = (i / xTicks) * maxDist3 / 1000
+          pdf.setDrawColor(20, 32, 65); pdf.setLineWidth(0.18)
+          pdf.line(gx3, cyt, gx3, cyt + ch)
+          pdf.setTextColor(80, 95, 118); pdf.setFontSize(5.5)
+          pdf.text(`${dv3.toFixed(dv3 < 10 ? 1 : 0)}km`, gx3, cyt + ch + 4.5, { align: 'center' })
+        }
+
+        // Axis labels
+        pdf.setTextColor(120, 130, 150); pdf.setFontSize(6.5); pdf.setFont('helvetica', 'normal')
+        pdf.text('Distance', cx + cw / 2, cyt + ch + 10, { align: 'center' })
+        pdf.text('Elevation (m)', 4, cyt + ch / 2, { angle: 90 })
+
+        // Profile polyline — coloured by elevation (green=low → red=high)
+        pdf.setLineWidth(0.75)
+        for (let i = 1; i < profileData.length; i++) {
+          const p0 = profileData[i - 1], p1 = profileData[i]
+          const px0 = cx + (p0.dist / maxDist3) * cw
+          const py0 = cyt + ch - ((p0.elev - eMin3) / eSpan3) * ch
+          const px1 = cx + (p1.dist / maxDist3) * cw
+          const py1 = cyt + ch - ((p1.elev - eMin3) / eSpan3) * ch
+          const ratio3 = Math.min(((p0.elev + p1.elev) / 2 - minE3) / eRange3, 1)
+          const r3 = Math.round(82  + ratio3 * (255 - 82))
+          const g3 = Math.round(196 - ratio3 * (196 - 55))
+          const b3 = Math.round(26  + ratio3 * (79  - 26))
+          pdf.setDrawColor(r3, g3, b3)
+          pdf.line(px0, py0, px1, py1)
+        }
+
+        // Peak (▲) and valley (▼) markers
+        const peakPt = profileData.reduce((a, b) => a.elev > b.elev ? a : b)
+        const valPt  = profileData.reduce((a, b) => a.elev < b.elev ? a : b)
+        const peakX = cx + (peakPt.dist / maxDist3) * cw
+        const peakY = cyt + ch - ((peakPt.elev - eMin3) / eSpan3) * ch
+        const valX  = cx + (valPt.dist / maxDist3) * cw
+        const valY  = cyt + ch - ((valPt.elev - eMin3) / eSpan3) * ch
+
+        pdf.setFillColor(255, 77, 79)
+        pdf.circle(peakX, peakY, 2, 'F')
+        pdf.setTextColor(255, 120, 120); pdf.setFontSize(6); pdf.setFont('helvetica', 'bold')
+        pdf.text(`▲ ${peakPt.elev.toFixed(0)} m`, peakX + 3, peakY - 1)
+
+        pdf.setFillColor(82, 196, 26)
+        pdf.circle(valX, valY, 2, 'F')
+        pdf.setTextColor(100, 220, 60); pdf.setFontSize(6)
+        pdf.text(`▼ ${valPt.elev.toFixed(0)} m`, valX + 3, valY + 4.5)
+
+        // Stats table below chart
+        const sbY = cyt + ch + 17
+        const statItems = [
+          { l: 'Profile length',  v: `${(maxDist3 / 1000).toFixed(2)} km` },
+          { l: 'Start elevation', v: `${profileData[0].elev.toFixed(1)} m` },
+          { l: 'End elevation',   v: `${profileData[profileData.length-1].elev.toFixed(1)} m` },
+          { l: 'Highest point',   v: `${maxE3.toFixed(1)} m` },
+          { l: 'Lowest point',    v: `${minE3.toFixed(1)} m` },
+          { l: 'Total relief',    v: `${(maxE3 - minE3).toFixed(1)} m` },
+          { l: 'Sample points',   v: `${profileData.length}` },
+          { l: 'Terrain',         v: terrainLabel },
+        ]
+        pdf.setFillColor(10, 13, 32)
+        pdf.rect(cx, sbY, cw, 34, 'F')
+        const cols3 = 4, colW3 = cw / cols3
+        statItems.forEach((s, i) => {
+          const scx = cx + (i % cols3) * colW3 + 4
+          const scy = sbY + Math.floor(i / cols3) * 15 + 8
+          pdf.setTextColor(80, 95, 115); pdf.setFontSize(6); pdf.setFont('helvetica', 'normal')
+          pdf.text(s.l, scx, scy)
+          pdf.setTextColor(205, 215, 230); pdf.setFontSize(8); pdf.setFont('helvetica', 'bold')
+          pdf.text(s.v, scx, scy + 7)
+        })
+
+        drawFooter(2)
+      }
 
       pdf.save(`rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.pdf`)
       message.success('PDF exported')
     } catch (e) {
+      console.error(e)
       message.error('PDF export failed')
     } finally {
       setExporting(false)
@@ -1042,7 +1367,7 @@ export default function TerrainPage() {
                 <Text style={{ color: '#aaa', fontSize: 12 }}>Slope Analysis</Text>
                 {slopeBuilding ? (
                   <div style={{ textAlign: 'center', padding: 16 }}>
-                    <Spin size="small" /> <Text style={{ color: '#888', fontSize: 11 }}> Sampling {Math.pow(15,2)} points…</Text>
+                    <Spin size="small" /> <Text style={{ color: '#888', fontSize: 11 }}> Sampling {Math.pow(50,2)} points…</Text>
                   </div>
                 ) : slopeStats && (
                   <>
@@ -1064,6 +1389,7 @@ export default function TerrainPage() {
                       Sampled on {slopeStats.gridSize}×{slopeStats.gridSize} grid ·&nbsp;
                       {slopeStats.avg < 5 ? 'Mostly flat' : slopeStats.avg < 15 ? 'Gentle slopes' : slopeStats.avg < 30 ? 'Moderate terrain' : 'Steep terrain'}
                     </div>
+                    <SlopeCategoryBar categories={slopeStats.categories} />
                     <SlopeColorBar />
                   </>
                 )}
@@ -1215,7 +1541,7 @@ async function computeSlopeStats(
   viewer: Cesium.Viewer,
   corner1: Cesium.Cartesian3,
   corner2: Cesium.Cartesian3,
-  gridN = 15,
+  gridN = 50,
 ): Promise<{ stats: SlopeStats; gridData: SlopeGridData }> {
   const c1 = Cesium.Cartographic.fromCartesian(corner1)
   const c2 = Cesium.Cartographic.fromCartesian(corner2)
@@ -1273,16 +1599,54 @@ async function computeSlopeStats(
     }
   }
 
+  const total = slopes.length || 1
+  const pct = (fn: (s: number) => boolean) =>
+    parseFloat((slopes.filter(fn).length / total * 100).toFixed(1))
+  const categories: SlopeCategories = {
+    flat:      pct(s => s < 5),
+    gentle:    pct(s => s >= 5  && s < 15),
+    moderate:  pct(s => s >= 15 && s < 30),
+    steep:     pct(s => s >= 30 && s < 45),
+    verysteep: pct(s => s >= 45),
+  }
+
   const stats: SlopeStats = slopes.length
     ? {
         min: Math.min(...slopes),
         max: Math.max(...slopes),
         avg: slopes.reduce((a, b) => a + b, 0) / slopes.length,
         gridSize: gridN,
+        categories,
       }
-    : { min: 0, max: 0, avg: 0, gridSize: gridN }
+    : { min: 0, max: 0, avg: 0, gridSize: gridN, categories: { flat: 0, gentle: 0, moderate: 0, steep: 0, verysteep: 0 } }
 
   return { stats, gridData: { elevGrid, bbox, gridN } }
+}
+
+function SlopeCategoryBar({ categories }: { categories: SlopeCategories }) {
+  const rows = [
+    { label: 'Flat (0-5°)',      pct: categories.flat,      color: '#52c41a' },
+    { label: 'Gentle (5-15°)',   pct: categories.gentle,    color: '#a0d911' },
+    { label: 'Moderate (15-30°)', pct: categories.moderate, color: '#faad14' },
+    { label: 'Steep (30-45°)',   pct: categories.steep,     color: '#fa8c16' },
+    { label: 'V.Steep (≥45°)',   pct: categories.verysteep, color: '#ff4d4f' },
+  ]
+  return (
+    <div style={{ marginTop: 8 }}>
+      <Text style={{ color: '#888', fontSize: 10 }}>Area breakdown by slope class</Text>
+      <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
+        {rows.map(r => (
+          <div key={r.label} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10 }}>
+            <span style={{ color: '#aaa', width: 110, flexShrink: 0 }}>{r.label}</span>
+            <div style={{ flex: 1, background: '#1a1a2e', borderRadius: 2, height: 8, overflow: 'hidden' }}>
+              <div style={{ width: `${r.pct}%`, height: '100%', background: r.color, transition: 'width 0.4s' }} />
+            </div>
+            <span style={{ color: r.color, width: 36, textAlign: 'right', fontWeight: 600 }}>{r.pct.toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function SlopeColorBar() {

@@ -18,7 +18,7 @@ import {
   CodeOutlined, EnvironmentOutlined, LockOutlined, EditOutlined, RollbackOutlined,
   StopOutlined, ClockCircleOutlined, RobotOutlined, LoadingOutlined, FileAddOutlined,
   FileWordOutlined, DownloadOutlined, FileExcelOutlined, FilePptOutlined,
-  FileProtectOutlined,
+  FileProtectOutlined, HistoryOutlined, SplitCellsOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import type { DataNode } from 'antd/es/tree'
@@ -28,6 +28,8 @@ import { useAppStore } from '@/app/store'
 import type { SurveyProject, SurveyArea, Document, ProjectLayerFolder, GeoTiffLayer, ShapefileImport, QGISUploadLog } from '@/types'
 import NewLayerModal from '@/features/map/NewLayerModal'
 import DisputeModal, { type DisputeRow } from './DisputeModal'
+import SurveyAreaHistoryDrawer from './SurveyAreaHistoryDrawer'
+import SurveyAreaSplitModal from './SurveyAreaSplitModal'
 import { useTranslation } from 'react-i18next'
 import { openDocumentInNewTab } from '@/services/documentUtils'
 
@@ -396,6 +398,9 @@ export default function ProjectDetailPage() {
   const [areaRemarks, setAreaRemarks] = useState('')
   const [disputeModal, setDisputeModal] = useState<{ area: SurveyArea; action: string; disputes: DisputeRow[] } | null>(null)
   const [expandedAreaId, setExpandedAreaId] = useState<number | null>(null)
+  // History + Split
+  const [historyArea, setHistoryArea] = useState<SurveyArea | null>(null)
+  const [splitArea, setSplitArea] = useState<SurveyArea | null>(null)
 
   // ── Async export state ────────────────────────────────────────────────────
   type ExportJob = {
@@ -584,7 +589,7 @@ export default function ProjectDetailPage() {
   })
 
   // Survey Areas queries & mutations
-  const { data: surveyAreas = [] } = useQuery<SurveyArea[]>({
+  const { data: surveyAreas = [], refetch: refetchSurveyAreas } = useQuery<SurveyArea[]>({
     queryKey: qk.surveyAreas(pid),
     queryFn: () => api.get(`/projects/survey-areas/?project=${pid}&page_size=200`).then(r => r.data.results ?? r.data),
   })
@@ -1304,11 +1309,25 @@ export default function ProjectDetailPage() {
                                 onClick={() => startAreaExport(area)}
                               />
                             </Tooltip>
+                            <Tooltip title="View change history, snapshots and lineage">
+                              <Button
+                                size="small" type="text" icon={<HistoryOutlined />}
+                                style={{ color: '#b37feb' }}
+                                onClick={() => setHistoryArea(area)}
+                              />
+                            </Tooltip>
+                            <Tooltip title="Split, pocket or transfer this area">
+                              <Button
+                                size="small" type="text" icon={<SplitCellsOutlined />}
+                                style={{ color: '#ff9c6e' }}
+                                onClick={() => setSplitArea(area)}
+                              />
+                            </Tooltip>
                             <Button
                               size="small" type="text" icon={<EyeOutlined />}
                               onClick={() => setExpandedAreaId(isExpanded ? null : area.id)}
                             >
-                              {isExpanded ? 'Hide' : 'History'}
+                              {isExpanded ? 'Hide' : 'Workflow'}
                             </Button>
                           </Space>
                         }
@@ -2444,6 +2463,26 @@ export default function ProjectDetailPage() {
           }
         `}</style>
       </Modal>
+
+      {historyArea && (
+        <SurveyAreaHistoryDrawer
+          area={historyArea}
+          open={!!historyArea}
+          onClose={() => setHistoryArea(null)}
+        />
+      )}
+
+      {splitArea && (
+        <SurveyAreaSplitModal
+          area={splitArea}
+          open={!!splitArea}
+          onClose={() => setSplitArea(null)}
+          onSuccess={() => {
+            setSplitArea(null)
+            refetchSurveyAreas()
+          }}
+        />
+      )}
     </div>
   )
 }

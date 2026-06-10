@@ -537,13 +537,17 @@ class TerrainExportGeoTIFFView(APIView):
 
     Body: { elevGrid: float[], bbox: [minLon,minLat,maxLon,maxLat], gridN: int }
 
-    Returns a 5-band GeoTIFF (WGS84 / EPSG:4326):
-      Bands 1-3 – RGB colorized slope map (Byte) blended with hillshade — viewable
-                  in any image viewer and importable into QGIS/ArcGIS as a color image.
-      Band 4    – Elevation in metres (Float32) for GIS analysis
-      Band 5    – Slope in degrees   (Float32) for GIS analysis
+    Returns a 6-band Float32 GeoTIFF (WGS84 / EPSG:4326):
+      Band 1 – Red   (smooth slope colour, hillshade-blended, 0-255)
+      Band 2 – Green (smooth slope colour, hillshade-blended, 0-255)
+      Band 3 – Blue  (smooth slope colour, hillshade-blended, 0-255)
+      Band 4 – Elevation in metres (Float32)
+      Band 5 – Slope in degrees   (Float32)
+      Band 6 – Aspect in degrees  (Float32, 0=North clockwise, -1=flat)
 
-    The grid is bilinearly upscaled to at least 256×256 so the image is not tiny.
+    QGIS: Symbology → Multiband color, R=Band1 G=Band2 B=Band3, min=0 max=255.
+    Band 4/5/6 carry the analysis data for raster calculations.
+    Colour ramp: smooth gradient green→yellow→orange→red for 0→45°+ slope.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -584,116 +588,166 @@ class TerrainExportGeoTIFFView(APIView):
         grad_y, grad_x = np.gradient(elev_arr, dy, dx)
         slope_arr = np.degrees(np.arctan(np.sqrt(grad_x**2 + grad_y**2))).astype(np.float32)
 
-        # ── Bilinear upscale to ≥256 px so the image is not a tiny 15×15 blob ─
-        scale = max(1, 256 // grid_n)
-        try:
-            from scipy.ndimage import zoom as _zoom
-            elev_up  = _zoom(elev_arr,  scale, order=1).astype(np.float32)
-            slope_up = _zoom(slope_arr, scale, order=1).astype(np.float32)
-        except ImportError:
-            # Fallback: nearest-neighbour via numpy kron
-            ones = np.ones((scale, scale), dtype=np.float32)
-            elev_up  = np.kron(elev_arr,  ones)
-            slope_up = np.kron(slope_arr, ones)
+        # ── Pure-numpy bilinear resize (no scipy needed) ──────────────────────
+        def _bilinear_resize(arr, target_n):
+            h, w = arr.shape
+            y_out = np.linspace(0, h - 1, target_n)
+            x_out = np.linspace(0, w - 1, target_n)
+            y0 = np.floor(y_out).astype(int).clip(0, h - 2)
+            x0 = np.floor(x_out).astype(int).clip(0, w - 2)
+            y1 = (y0 + 1).clip(0, h - 1)
+            x1 = (x0 + 1).clip(0, w - 1)
+            dy_f = (y_out - y0)[:, None]
+            dx_f = (x_out - x0)[None, :]
+            return (arr[np.ix_(y0, x0)] * (1 - dy_f) * (1 - dx_f) +
+                    arr[np.ix_(y0, x1)] * (1 - dy_f) * dx_f +
+                    arr[np.ix_(y1, x0)] * dy_f * (1 - dx_f) +
+                    arr[np.ix_(y1, x1)] * dy_f * dx_f).astype(arr.dtype)
 
-        out_n = elev_up.shape[0]
+        # Higher resolution for more detail: 1024 min or gridN × 20
+        target_n = max(1024, grid_n * 20)
+        elev_up  = _bilinear_resize(elev_arr,  target_n)
+        slope_up = _bilinear_resize(slope_arr, target_n)
 
-        # ── Slope colour ramp (matches frontend SlopeColorBar) ────────────────
-        def _slope_rgb(s):
-            r = np.empty_like(s, dtype=np.uint8)
-            g = np.empty_like(s, dtype=np.uint8)
-            b = np.empty_like(s, dtype=np.uint8)
-            for mask, col in [
-                (s <  5,                    (82,  196,  26)),  # green
-                ((s >= 5)  & (s < 15),      (160, 217,  17)),  # yellow-green
-                ((s >= 15) & (s < 30),      (250, 173,  20)),  # orange-yellow
-                ((s >= 30) & (s < 45),      (250, 140,  22)),  # orange
-                (s >= 45,                   (255,  77,  79)),   # red
-            ]:
-                r[mask], g[mask], b[mask] = col
+        # ── Smooth slope colour ramp ──────────────────────────────────────────
+        # Interpolates between key (slope_deg, RGB) stops — no hard category edges
+        def _slope_rgb_smooth(s):
+            keys = [
+                (0.0,  (82,  196,  26)),   # flat green
+                (5.0,  (130, 210,  20)),
+                (15.0, (250, 173,  20)),   # moderate amber
+                (30.0, (250,  95,  15)),   # steep dark orange
+                (45.0, (255,  50,  50)),   # very steep red
+                (90.0, (160,   0,  30)),   # extreme
+            ]
+            r = np.zeros_like(s, dtype=np.float32)
+            g = np.zeros_like(s, dtype=np.float32)
+            b = np.zeros_like(s, dtype=np.float32)
+            for i in range(len(keys) - 1):
+                s0, c0 = keys[i]
+                s1, c1 = keys[i + 1]
+                mask = (s >= s0) & (s < s1)
+                if not mask.any():
+                    continue
+                t = np.where(mask, (s - s0) / float(s1 - s0), 0.0)
+                r += mask * (c0[0] + t * (c1[0] - c0[0]))
+                g += mask * (c0[1] + t * (c1[1] - c0[1]))
+                b += mask * (c0[2] + t * (c1[2] - c0[2]))
+            last_s, last_c = keys[-1]
+            cap = s >= last_s
+            r += cap * last_c[0]
+            g += cap * last_c[1]
+            b += cap * last_c[2]
             return r, g, b
 
-        # ── Hillshade (NW light at 45°) for visual depth ──────────────────────
-        dx_up = dx / scale
-        dy_up = dy / scale
-        gy_up, gx_up = np.gradient(elev_up, dy_up, dx_up)
+        # ── Hillshade: dual-light (NW primary + NE fill) ──────────────────────
+        cell_m = dx / (target_n / max(grid_n, 1))
+        gy_up, gx_up = np.gradient(elev_up, cell_m, cell_m)
         sl_up  = np.arctan(np.sqrt(gx_up**2 + gy_up**2))
-        asp_up = np.arctan2(-gy_up, gx_up)
-        az, alt = np.radians(315 - 90), np.radians(45)
-        hs = np.sin(alt) * np.cos(sl_up) + np.cos(alt) * np.sin(sl_up) * np.cos(az - asp_up)
-        hs = np.clip(hs, 0.0, 1.0)
+        hs_asp = np.arctan2(-gy_up, gx_up)   # hillshade azimuth (math convention)
+        alt    = np.radians(45)
 
-        r_col, g_col, b_col = _slope_rgb(slope_up)
-        # Blend: 40% ambient + 60% hillshade so colours stay visible in shadows
-        r_out = np.clip(r_col * (0.4 + 0.6 * hs), 0, 255).astype(np.uint8)
-        g_out = np.clip(g_col * (0.4 + 0.6 * hs), 0, 255).astype(np.uint8)
-        b_out = np.clip(b_col * (0.4 + 0.6 * hs), 0, 255).astype(np.uint8)
+        # Primary NW light (225° from east = standard cartographic NW)
+        az_nw = np.radians(225)
+        hs_nw = np.sin(alt) * np.cos(sl_up) + np.cos(alt) * np.sin(sl_up) * np.cos(az_nw - hs_asp)
 
-        # ── Write GeoTIFF ─────────────────────────────────────────────────────
-        # Strategy: one GTiff file, two data types.
-        # GDAL GTiff allows per-band types via a MEM dataset + CreateCopy.
+        # Soft NE fill light to reduce dark shadow areas
+        az_ne = np.radians(315)
+        hs_ne = np.sin(alt) * np.cos(sl_up) + np.cos(alt) * np.sin(sl_up) * np.cos(az_ne - hs_asp)
+
+        hs = np.clip(0.72 * hs_nw + 0.28 * hs_ne, 0.0, 1.0)
+
+        r_col, g_col, b_col = _slope_rgb_smooth(slope_up)
+        # Blend: 38% ambient + 62% hillshade modulated; gamma 0.88 for vivid output
+        blend = (0.38 + 0.62 * hs) ** 0.88
+        r_out = np.clip(r_col * blend, 0, 255).astype(np.float32)
+        g_out = np.clip(g_col * blend, 0, 255).astype(np.float32)
+        b_out = np.clip(b_col * blend, 0, 255).astype(np.float32)
+
+        # ── Aspect (Band 6): GDAL convention 0=North, 90=East, clockwise ──────
+        # atan2(east_grad, -north_grad) → [−180, 180] → normalise to [0, 360)
+        asp_deg = np.degrees(np.arctan2(gx_up, -gy_up))
+        asp_geo = np.where(asp_deg < 0, asp_deg + 360.0, asp_deg).astype(np.float32)
+        flat_mask = (gx_up ** 2 + gy_up ** 2) < 1e-10
+        asp_geo[flat_mask] = -1.0   # -1 = undefined (flat pixel)
+
+        # ── Slope category percentages (metadata) ─────────────────────────────
+        total_px = slope_arr.size
+        def _pct(mask): return round(float(mask.sum()) / total_px * 100, 1)
+        cat_flat     = _pct(slope_arr <  5)
+        cat_gentle   = _pct((slope_arr >= 5)  & (slope_arr < 15))
+        cat_moderate = _pct((slope_arr >= 15) & (slope_arr < 30))
+        cat_steep    = _pct((slope_arr >= 30) & (slope_arr < 45))
+        cat_vsteep   = _pct(slope_arr >= 45)
+
+        # ── Write 6-band Float32 GeoTIFF ──────────────────────────────────────
         tmp = tempfile.mktemp(suffix='.tif')
-        pixel_w = (max_lon - min_lon) / out_n
-        pixel_h = (max_lat - min_lat) / out_n
+        pixel_w = (max_lon - min_lon) / target_n
+        pixel_h = (max_lat - min_lat) / target_n
 
-        mem_drv = gdal.GetDriverByName('MEM')
-
-        # First create RGB Byte dataset (3 bands)
-        rgb_ds = mem_drv.Create('', out_n, out_n, 3, gdal.GDT_Byte)
-        gt = [min_lon, pixel_w, 0, max_lat, 0, -pixel_h]
         srs = osr.SpatialReference()
         srs.ImportFromEPSG(4326)
 
-        rgb_ds.SetGeoTransform(gt)
-        rgb_ds.SetProjection(srs.ExportToWkt())
-        rgb_ds.GetRasterBand(1).WriteArray(r_out)
-        rgb_ds.GetRasterBand(1).SetDescription('Red (slope colour)')
-        rgb_ds.GetRasterBand(2).WriteArray(g_out)
-        rgb_ds.GetRasterBand(2).SetDescription('Green (slope colour)')
-        rgb_ds.GetRasterBand(3).WriteArray(b_out)
-        rgb_ds.GetRasterBand(3).SetDescription('Blue (slope colour)')
-        rgb_ds.SetMetadataItem('COLORMAP', 'Green<5° YellowGreen<15° Orange<30° DarkOrange<45° Red>=45°')
-
-        # Then create Float32 dataset for raw data bands (original grid resolution)
-        raw_ds = mem_drv.Create('', grid_n, grid_n, 2, gdal.GDT_Float32)
-        pixel_w_raw = (max_lon - min_lon) / grid_n
-        pixel_h_raw = (max_lat - min_lat) / grid_n
-        raw_ds.SetGeoTransform([min_lon, pixel_w_raw, 0, max_lat, 0, -pixel_h_raw])
-        raw_ds.SetProjection(srs.ExportToWkt())
-        raw_ds.GetRasterBand(1).WriteArray(elev_arr)
-        raw_ds.GetRasterBand(1).SetDescription('Elevation (m)')
-        raw_ds.GetRasterBand(1).SetNoDataValue(-9999)
-        raw_ds.GetRasterBand(2).WriteArray(slope_arr)
-        raw_ds.GetRasterBand(2).SetDescription('Slope (degrees)')
-        raw_ds.GetRasterBand(2).SetNoDataValue(-9999)
-
-        # Save RGB GeoTIFF (primary, viewable) using CreateCopy
         tiff_drv = gdal.GetDriverByName('GTiff')
-        out_ds = tiff_drv.CreateCopy(
-            tmp, rgb_ds,
-            options=['COMPRESS=LZW', 'PHOTOMETRIC=RGB', 'TILED=YES'],
+        out_ds = tiff_drv.Create(
+            tmp, target_n, target_n, 6, gdal.GDT_Float32,
+            options=['COMPRESS=LZW', 'TILED=YES', 'BLOCKXSIZE=256', 'BLOCKYSIZE=256'],
         )
-        # Append elevation metadata so GIS users know the raw values
-        out_ds.SetMetadataItem('ELEVATION_MIN_M', f'{float(elev_arr.min()):.1f}')
-        out_ds.SetMetadataItem('ELEVATION_MAX_M', f'{float(elev_arr.max()):.1f}')
-        out_ds.SetMetadataItem('SLOPE_MIN_DEG',   f'{float(slope_arr.min()):.1f}')
-        out_ds.SetMetadataItem('SLOPE_MAX_DEG',   f'{float(slope_arr.max()):.1f}')
-        out_ds.SetMetadataItem('DESCRIPTION',
-            'RakshaGIS Terrain Slope Analysis — '
-            'Bands 1-3: RGB slope map (hillshade-blended). '
-            'Open in QGIS/ArcGIS for georeferenced view. '
-            'Colour: Green<5° YellowGreen<15° Orange<30° DarkOrange<45° Red>=45°')
+        out_ds.SetGeoTransform([min_lon, pixel_w, 0, max_lat, 0, -pixel_h])
+        out_ds.SetProjection(srs.ExportToWkt())
+
+        band_defs = [
+            (r_out,    'Red — smooth slope colour, hillshade-blended (0-255)',    gdal.GCI_RedBand),
+            (g_out,    'Green — smooth slope colour, hillshade-blended (0-255)',  gdal.GCI_GreenBand),
+            (b_out,    'Blue — smooth slope colour, hillshade-blended (0-255)',   gdal.GCI_BlueBand),
+            (elev_up,  'Elevation (metres above mean sea level)',                  gdal.GCI_Undefined),
+            (slope_up, 'Slope (degrees 0-90)',                                     gdal.GCI_Undefined),
+            (asp_geo,  'Aspect (degrees 0-360, 0=North clockwise; -1=flat)',       gdal.GCI_Undefined),
+        ]
+        for idx, (data, desc, interp) in enumerate(band_defs, 1):
+            b = out_ds.GetRasterBand(idx)
+            b.WriteArray(data)
+            b.SetDescription(desc)
+            b.SetColorInterpretation(interp)
+            if idx >= 4:
+                b.SetNoDataValue(-9999)
+
+        # Enhanced metadata
+        out_ds.SetMetadataItem('ELEVATION_MIN_M',    f'{float(elev_arr.min()):.1f}')
+        out_ds.SetMetadataItem('ELEVATION_MAX_M',    f'{float(elev_arr.max()):.1f}')
+        out_ds.SetMetadataItem('ELEVATION_AVG_M',    f'{float(elev_arr.mean()):.1f}')
+        out_ds.SetMetadataItem('ELEVATION_RELIEF_M', f'{float(elev_arr.max() - elev_arr.min()):.1f}')
+        out_ds.SetMetadataItem('SLOPE_MIN_DEG',      f'{float(slope_arr.min()):.2f}')
+        out_ds.SetMetadataItem('SLOPE_AVG_DEG',      f'{float(slope_arr.mean()):.2f}')
+        out_ds.SetMetadataItem('SLOPE_MAX_DEG',      f'{float(slope_arr.max()):.2f}')
+        out_ds.SetMetadataItem('BBOX_MIN_LON',        f'{min_lon:.6f}')
+        out_ds.SetMetadataItem('BBOX_MIN_LAT',        f'{min_lat:.6f}')
+        out_ds.SetMetadataItem('BBOX_MAX_LON',        f'{max_lon:.6f}')
+        out_ds.SetMetadataItem('BBOX_MAX_LAT',        f'{max_lat:.6f}')
+        out_ds.SetMetadataItem('GRID_SAMPLES',        f'{grid_n}x{grid_n}')
+        out_ds.SetMetadataItem('OUTPUT_SIZE',         f'{target_n}x{target_n}')
+        out_ds.SetMetadataItem('CRS',                 'EPSG:4326 WGS84')
+        out_ds.SetMetadataItem('SLOPE_FLAT_PCT',      f'{cat_flat}%  (0-5 deg)')
+        out_ds.SetMetadataItem('SLOPE_GENTLE_PCT',    f'{cat_gentle}%  (5-15 deg)')
+        out_ds.SetMetadataItem('SLOPE_MODERATE_PCT',  f'{cat_moderate}%  (15-30 deg)')
+        out_ds.SetMetadataItem('SLOPE_STEEP_PCT',     f'{cat_steep}%  (30-45 deg)')
+        out_ds.SetMetadataItem('SLOPE_VSTEEP_PCT',    f'{cat_vsteep}%  (>=45 deg)')
+        out_ds.SetMetadataItem('ASPECT_CONVENTION',
+            'Band6: GDAL/ArcGIS convention. 0=North, 90=East, 180=South, 270=West. '
+            '-1 = flat (no aspect). Clockwise from North.')
+        out_ds.SetMetadataItem('RENDERING_HINT',
+            'QGIS: Symbology > Multiband color, R=Band1 G=Band2 B=Band3, min=0 max=255. '
+            'Band4=Elevation(m) Band5=Slope(deg) Band6=Aspect(deg,0=N). '
+            'Colour: smooth gradient green(flat)->amber(moderate)->red(steep).')
         out_ds.FlushCache()
         out_ds = None
-        rgb_ds = None
-        raw_ds = None
 
         with open(tmp, 'rb') as f:
             content = f.read()
         os.unlink(tmp)
 
         resp = DjResponse(content, content_type='image/tiff')
-        resp['Content-Disposition'] = 'attachment; filename="slope-analysis.tif"'
+        resp['Content-Disposition'] = 'attachment; filename="terrain-analysis.tif"'
         return resp
 
 

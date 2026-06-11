@@ -9,12 +9,13 @@ import type { MenuProps } from 'antd'
 import {
   LineChartOutlined, AreaChartOutlined, RadarChartOutlined,
   AimOutlined, ReloadOutlined, GlobalOutlined, InfoCircleOutlined,
-  CloseOutlined, ColumnHeightOutlined, ExportOutlined,
+  CloseOutlined, ColumnHeightOutlined,
   FileImageOutlined, FilePdfOutlined, FileTextOutlined, SyncOutlined,
   UploadOutlined, SplitCellsOutlined,
 } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 import api from '@/services/api'
+import { watermarkAndDownload } from '@/utils/watermarkDownload'
 import ElevationChart from './ElevationChart'
 import DEMAnalysisPanel, { type DEMLayer } from './DEMAnalysisPanel'
 
@@ -659,13 +660,21 @@ export default function TerrainPage() {
     if (!viewer) return
     const [minLon, minLat, maxLon, maxLat] = layer.bbox
     const rect = Cesium.Rectangle.fromDegrees(minLon, minLat, maxLon, maxLat)
+    // Fly to a padded view (~60% margin) — flying to the exact bbox zooms in
+    // past the basemap's available tile levels and the map turns blank.
+    const padLon = Math.max((maxLon - minLon) * 0.6, 0.01)
+    const padLat = Math.max((maxLat - minLat) * 0.6, 0.01)
+    const flyRect = Cesium.Rectangle.fromDegrees(
+      Math.max(minLon - padLon, -180), Math.max(minLat - padLat, -90),
+      Math.min(maxLon + padLon, 180),  Math.min(maxLat + padLat, 90),
+    )
 
     if (layer.type === 'image' && layer.imageData) {
       const provider = new Cesium.SingleTileImageryProvider({ url: layer.imageData, rectangle: rect })
       const il = viewer.imageryLayers.addImageryProvider(provider)
       il.alpha = 0.75
       demLayerRefsRef.current.set(layer.id, il)
-      viewer.camera.flyTo({ destination: rect, duration: 1.5 })
+      viewer.camera.flyTo({ destination: flyRect, duration: 1.5 })
     } else if (layer.type === 'geojson' && layer.geojson) {
       Cesium.GeoJsonDataSource.load(layer.geojson, {
         clampToGround: true,
@@ -676,7 +685,7 @@ export default function TerrainPage() {
         ds.name = `dem-${layer.id}`
         viewer.dataSources.add(ds)
         demLayerRefsRef.current.set(layer.id, ds)
-        viewer.camera.flyTo({ destination: rect, duration: 1.5 })
+        viewer.camera.flyTo({ destination: flyRect, duration: 1.5 })
       })
     }
     message.success(`Overlay "${layer.label}" added to globe`)
@@ -945,19 +954,27 @@ export default function TerrainPage() {
       viewer.render()
       const src = viewer.scene.canvas
       const W = src.width, H = src.height
-      const out = document.createElement('canvas')
-      out.width = W; out.height = H
-      const ctx = out.getContext('2d')
-      if (!ctx) throw new Error('no 2d context')
-      ctx.drawImage(src, 0, 0)
-
       const fs = Math.max(14, Math.round(W / 80))
       const rowH = Math.round(fs * 1.8)
       const pad = 12
 
-      // ── Title bar ────────────────────────────────────────────────
-      ctx.fillStyle = 'rgba(10,12,28,0.90)'
-      ctx.fillRect(0, 0, W, Math.round(fs * 4))
+      // Layout: title band ABOVE the scene, legend+stats band BELOW it —
+      // panels never cover the basemap or the analysis overlay.
+      const titleH = Math.round(fs * 4)
+      const legendRows = opts.legendItems?.length ?? 0
+      const statRows = opts.statLines?.length ?? 0
+      const infoRows = Math.max(legendRows, statRows)
+      const infoH = infoRows > 0 ? infoRows * rowH + Math.round(fs * 3.2) + pad : 0
+
+      const out = document.createElement('canvas')
+      out.width = W
+      out.height = titleH + H + infoH
+      const ctx = out.getContext('2d')
+      if (!ctx) throw new Error('no 2d context')
+
+      // ── Title band ───────────────────────────────────────────────
+      ctx.fillStyle = '#0a0c1c'
+      ctx.fillRect(0, 0, W, titleH)
       ctx.fillStyle = '#4fc3f7'
       ctx.font = `bold ${Math.round(fs * 1.15)}px sans-serif`
       ctx.fillText('RakshaGIS — Terrain Analysis', pad, Math.round(fs * 2))
@@ -966,56 +983,10 @@ export default function TerrainPage() {
       const sub = opts.subtitle ? `  ·  ${opts.subtitle}` : ''
       ctx.fillText(`${new Date().toLocaleString()}  ·  ${terrainLabel}${sub}`, pad, Math.round(fs * 3.3))
 
-      // ── Legend (bottom-left) ─────────────────────────────────────
-      if (opts.legendItems?.length) {
-        const legendItems = opts.legendItems
-        const legW = Math.round(fs * 0.62 * Math.max(
-          (opts.legendTitle ?? '').length + 4,
-          ...legendItems.map(it => it.label.length + 5),
-          22,
-        ))
-        const legH = legendItems.length * rowH + Math.round(fs * 3.2)
-        const legX = pad, legY = H - legH - pad
-        ctx.fillStyle = 'rgba(10,12,28,0.85)'
-        ctx.fillRect(legX, legY, legW, legH)
-        ctx.fillStyle = '#4fc3f7'
-        ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
-        ctx.fillText(opts.legendTitle ?? 'Legend', legX + 10, legY + Math.round(fs * 1.6))
-        legendItems.forEach((it, i) => {
-          const iy = legY + Math.round(fs * 2.9) + i * rowH
-          if (it.color) {
-            ctx.fillStyle = it.color
-            ctx.fillRect(legX + 10, iy - Math.round(fs * 0.95), Math.round(fs * 1.1), Math.round(fs * 1.1))
-          }
-          ctx.fillStyle = '#ddd'
-          ctx.font = `${Math.round(fs * 0.82)}px monospace`
-          ctx.fillText(it.label, legX + 10 + Math.round(fs * 1.5), iy)
-        })
-      }
+      // ── 3D scene (unobstructed) ──────────────────────────────────
+      ctx.drawImage(src, 0, titleH)
 
-      // ── Statistics (bottom-right) ────────────────────────────────
-      if (opts.statLines?.length) {
-        const statLines = opts.statLines
-        const stW = Math.round(fs * 0.62 * Math.max(
-          (opts.statsTitle ?? '').length + 4,
-          ...statLines.map(l => l.length + 3),
-          26,
-        ))
-        const stH = statLines.length * rowH + Math.round(fs * 3.2)
-        const stX = W - stW - pad, stY = H - stH - pad
-        ctx.fillStyle = 'rgba(10,12,28,0.85)'
-        ctx.fillRect(stX, stY, stW, stH)
-        ctx.fillStyle = '#4fc3f7'
-        ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
-        ctx.fillText(opts.statsTitle ?? 'Statistics', stX + 10, stY + Math.round(fs * 1.6))
-        statLines.forEach((ln, i) => {
-          ctx.fillStyle = ln.startsWith('─') ? '#333' : '#ddd'
-          ctx.font = `${Math.round(fs * 0.82)}px monospace`
-          ctx.fillText(ln, stX + 10, stY + Math.round(fs * 2.9) + i * rowH)
-        })
-      }
-
-      // ── Point Elevation (top-right) ──────────────────────────────
+      // ── Point Elevation (top-right of the scene) ─────────────────
       if (clickedElev) {
         const elvLines = [
           `Lat : ${clickedElev.lat.toFixed(5)}°`,
@@ -1023,7 +994,7 @@ export default function TerrainPage() {
           `Elev: ${clickedElev.elev.toFixed(1)} m`,
         ]
         const eW = Math.round(fs * 16), eH = elvLines.length * rowH + Math.round(fs * 3.2)
-        const eX = W - eW - pad, eY = Math.round(fs * 4) + pad
+        const eX = W - eW - pad, eY = titleH + pad
         ctx.fillStyle = 'rgba(10,12,28,0.85)'
         ctx.fillRect(eX, eY, eW, eH)
         ctx.fillStyle = '#4fc3f7'
@@ -1036,8 +1007,8 @@ export default function TerrainPage() {
         })
       }
 
-      // ── North arrow ──────────────────────────────────────────────
-      const nax = 54, nay = Math.round(fs * 4) + 52
+      // ── North arrow (top-left of the scene) ──────────────────────
+      const nax = 54, nay = titleH + 52
       ctx.strokeStyle = '#eee'; ctx.fillStyle = '#eee'; ctx.lineWidth = 2.5
       ctx.beginPath(); ctx.moveTo(nax, nay + 30); ctx.lineTo(nax, nay); ctx.stroke()
       ctx.beginPath()
@@ -1048,16 +1019,54 @@ export default function TerrainPage() {
       ctx.fillText('N', nax, nay + 46)
       ctx.textAlign = 'left'
 
-      // ── Save ─────────────────────────────────────────────────────
+      // ── Info band below the scene: legend (left) + stats (right) ─
+      if (infoRows > 0) {
+        const bandY = titleH + H
+        ctx.fillStyle = '#0a0c1c'
+        ctx.fillRect(0, bandY, W, infoH)
+
+        if (opts.legendItems?.length) {
+          const legendItems = opts.legendItems
+          const legX = pad, legY = bandY + Math.round(pad / 2)
+          ctx.fillStyle = '#4fc3f7'
+          ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
+          ctx.fillText(opts.legendTitle ?? 'Legend', legX + 10, legY + Math.round(fs * 1.6))
+          legendItems.forEach((it, i) => {
+            const iy = legY + Math.round(fs * 2.9) + i * rowH
+            if (it.color) {
+              ctx.fillStyle = it.color
+              ctx.fillRect(legX + 10, iy - Math.round(fs * 0.95), Math.round(fs * 1.1), Math.round(fs * 1.1))
+            }
+            ctx.fillStyle = '#ddd'
+            ctx.font = `${Math.round(fs * 0.82)}px monospace`
+            ctx.fillText(it.label, legX + 10 + Math.round(fs * 1.5), iy)
+          })
+        }
+
+        if (opts.statLines?.length) {
+          const statLines = opts.statLines
+          const stW = Math.round(fs * 0.62 * Math.max(
+            (opts.statsTitle ?? '').length + 4,
+            ...statLines.map(l => l.length + 3),
+            26,
+          ))
+          const stX = W - stW - pad, stY = bandY + Math.round(pad / 2)
+          ctx.fillStyle = '#4fc3f7'
+          ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
+          ctx.fillText(opts.statsTitle ?? 'Statistics', stX, stY + Math.round(fs * 1.6))
+          statLines.forEach((ln, i) => {
+            ctx.fillStyle = ln.startsWith('─') ? '#333' : '#ddd'
+            ctx.font = `${Math.round(fs * 0.82)}px monospace`
+            ctx.fillText(ln, stX, stY + Math.round(fs * 2.9) + i * rowH)
+          })
+        }
+      }
+
+      // ── Save (via C2PA/LP-DNA watermark service) ─────────────────
       const blob = await new Promise<Blob | null>(res => out.toBlob(res, 'image/png'))
       if (!blob) { message.error('PNG capture failed'); return }
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = opts.filename
-      a.click()
-      URL.revokeObjectURL(url)
-      message.success('PNG exported')
+      await watermarkAndDownload(blob, opts.filename, 'image/png')
+      message.success('PNG exported with provenance watermark')
     } catch {
       message.error('PNG export failed — canvas may be unavailable')
     } finally {
@@ -1389,8 +1398,12 @@ export default function TerrainPage() {
         drawFooter(2)
       }
 
-      pdf.save(`rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.pdf`)
-      message.success('PDF exported')
+      await watermarkAndDownload(
+        pdf.output('blob'),
+        `rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.pdf`,
+        'application/pdf',
+      )
+      message.success('PDF exported with provenance watermark')
     } catch (e) {
       console.error(e)
       message.error('PDF export failed')
@@ -1399,43 +1412,23 @@ export default function TerrainPage() {
     }
   }, [clickedElev, profileData, slopeStats, terrainLabel])
 
-  const exportProfileCSV = useCallback(() => {
+  const exportProfileCSV = useCallback(async () => {
     if (!profileData.length) return
     const rows = ['point,distance_m,latitude_deg,longitude_deg,elevation_m']
     profileData.forEach((p, i) =>
       rows.push(`${i + 1},${p.dist.toFixed(1)},${p.lat.toFixed(6)},${p.lon.toFixed(6)},${p.elev.toFixed(2)}`)
     )
-    const blob = new Blob([rows.join('\n')], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `elevation-profile-${new Date().toISOString().slice(0, 10)}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
-    message.success('CSV exported')
-  }, [profileData])
-
-  const exportGeoTIFF = useCallback(async () => {
-    if (!slopeGridData) return
-    setExporting(true)
     try {
-      message.loading({ content: 'Building GeoTIFF…', key: 'gtiff' })
-      const res = await api.post('/core/terrain/export-geotiff/', slopeGridData, {
-        responseType: 'blob',
-      })
-      const url = URL.createObjectURL(res.data)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `terrain-analysis-${new Date().toISOString().slice(0, 10)}.zip`
-      a.click()
-      URL.revokeObjectURL(url)
-      message.success({ content: 'GeoTIFF exported — ZIP contains visualization.tif (RGB) + analysis.tif (Float32)', key: 'gtiff' })
+      await watermarkAndDownload(
+        rows.join('\n'),
+        `elevation-profile-${new Date().toISOString().slice(0, 10)}.csv`,
+        'text/csv',
+      )
+      message.success('CSV exported with provenance watermark')
     } catch {
-      message.error({ content: 'GeoTIFF export failed', key: 'gtiff' })
-    } finally {
-      setExporting(false)
+      message.error('CSV export failed — watermark service unavailable')
     }
-  }, [slopeGridData])
+  }, [profileData])
 
   if (cesiumError) {
     return (
@@ -1976,15 +1969,6 @@ export default function TerrainPage() {
                         onClick={exportProfileCSV}
                         style={{ fontSize: 11 }}
                       >CSV</Button>
-                    </Tooltip>
-                  )}
-                  {slopeGridData && (
-                    <Tooltip title="Export as ZIP: terrain-visualization.tif (RGB, opens in any viewer) + terrain-analysis.tif (Float32 elevation/slope/aspect)">
-                      <Button
-                        size="small" icon={<ExportOutlined />}
-                        loading={exporting} onClick={exportGeoTIFF}
-                        style={{ fontSize: 11 }}
-                      >GeoTIFF</Button>
                     </Tooltip>
                   )}
                 </div>

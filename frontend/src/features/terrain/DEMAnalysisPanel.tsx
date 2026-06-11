@@ -14,6 +14,7 @@ import {
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import api from '@/services/api'
+import { watermarkAndDownload } from '@/utils/watermarkDownload'
 
 const { Text } = Typography
 
@@ -762,25 +763,24 @@ export default function DEMAnalysisPanel({ gridData, referenceGrid, onOverlay, o
       return
     }
 
-    // Fallback: raw analysis raster
+    // Fallback: raw analysis raster (watermarked)
     if (!result.image) return
-    const a = document.createElement('a')
-    a.href = result.image
-    a.download = `dem-${result.type}-${datestamp}.png`
-    a.click()
+    try {
+      const blob = await (await fetch(result.image)).blob()
+      await watermarkAndDownload(blob, `dem-${result.type}-${datestamp}.png`, 'image/png')
+    } catch { /* watermark service unavailable */ }
   }, [result, tool, onScenePNG, overlaid, handleOverlay, datestamp])
 
-  const downloadGeoJSON = useCallback(() => {
+  const downloadGeoJSON = useCallback(async () => {
     if (!result?.geojson) return
-    const blob = new Blob([JSON.stringify(result.geojson, null, 2)], { type: 'application/json' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = `dem-${result.type}-${datestamp}.geojson`
-    a.click()
-    URL.revokeObjectURL(a.href)
+    await watermarkAndDownload(
+      JSON.stringify(result.geojson, null, 2),
+      `dem-${result.type}-${datestamp}.geojson`,
+      'application/json',
+    )
   }, [result, datestamp])
 
-  const downloadCSV = useCallback(() => {
+  const downloadCSV = useCallback(async () => {
     if (!result?.profiles) return
     const rows: string[] = ['profile,point,distance_m,elevation_m']
     result.profiles.forEach((p: any) => {
@@ -788,12 +788,7 @@ export default function DEMAnalysisPanel({ gridData, referenceGrid, onOverlay, o
         rows.push(`${p.label},${i + 1},${pt.dist.toFixed(1)},${pt.elev.toFixed(2)}`)
       })
     })
-    const blob = new Blob([rows.join('\n')], { type: 'text/csv' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = `dem-cross-sections-${datestamp}.csv`
-    a.click()
-    URL.revokeObjectURL(a.href)
+    await watermarkAndDownload(rows.join('\n'), `dem-cross-sections-${datestamp}.csv`, 'text/csv')
   }, [result, datestamp])
 
 

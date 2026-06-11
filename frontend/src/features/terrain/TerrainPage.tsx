@@ -54,6 +54,10 @@ function makeCesiumImagery(basemap?: any): Cesium.ImageryProvider | Promise<Cesi
   }
 
   let url = (basemap?.url_template || '').trim()
+    // WMTS REST template (GoogleMapsCompatible) → Cesium {z}/{y}/{x} placeholders
+    .replace('{TileMatrix}', '{z}')
+    .replace('{TileRow}', '{y}')
+    .replace('{TileCol}', '{x}')
   let subdomains: string[] | undefined
   const m = url.match(/\{([a-z])-([a-z])\}/i)
   if (m) {
@@ -2013,7 +2017,9 @@ async function apiElevation(locs: { lat: number; lon: number }[]): Promise<numbe
   try {
     const res = await api.post('/core/elevation/', { locations: locs })
     const results: any[] = res.data?.results ?? []
-    return results.map((r: any) => r.elevation ?? 0)
+    // Always return exactly locs.length values — a short/partial server
+    // response would make the analysis grid invalid ("Invalid grid data")
+    return locs.map((_, i) => results[i]?.elevation ?? 0)
   } catch {
     return locs.map(() => 0)
   }

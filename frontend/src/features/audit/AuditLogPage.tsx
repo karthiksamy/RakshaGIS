@@ -6,9 +6,12 @@ import {
   EditOutlined, DeleteOutlined, PlusCircleOutlined, ExportOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
+import relativeTime from 'dayjs/plugin/relativeTime'
 import { useTranslation } from 'react-i18next'
 import api from '@/services/api'
 import { useAppStore } from '@/app/store'
+
+dayjs.extend(relativeTime)
 
 const { Title, Text } = Typography
 const { RangePicker } = DatePicker

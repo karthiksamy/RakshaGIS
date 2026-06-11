@@ -497,10 +497,13 @@ class ElevationLookupView(APIView):
                 status=503,
             )
 
+        # Cap must cover a full 50×50 slope-analysis grid (2500 points) — a
+        # lower cap returns a short array and the slope endpoints reject it
+        # with "Invalid grid data".
         results = [
             {'lat': loc['lat'], 'lon': loc['lon'],
              'elevation': self._sample(float(loc['lat']), float(loc['lon']))}
-            for loc in locations[:500]
+            for loc in locations[:5000]
         ]
         return Response({'results': results})
 

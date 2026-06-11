@@ -303,7 +303,13 @@ function makeBasemapSource(bm: BasemapConfig | null) {
       crossOrigin: 'anonymous',
     })
   }
-  return new XYZ({ url: bm.url_template, crossOrigin: 'anonymous' })
+  // WMTS REST templates (e.g. EOX Sentinel-2) use {TileMatrix}/{TileRow}/{TileCol};
+  // for GoogleMapsCompatible grids these are exactly {z}/{y}/{x} in XYZ terms.
+  const url = bm.url_template
+    .replace('{TileMatrix}', '{z}')
+    .replace('{TileRow}', '{y}')
+    .replace('{TileCol}', '{x}')
+  return new XYZ({ url, crossOrigin: 'anonymous' })
 }
 
 function loadBookmarks(): MapBookmark[] {

@@ -202,7 +202,10 @@ services:
     expose:
       - "8765"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8765/"]
+      # 127.0.0.1 (not localhost): busybox wget tries ::1 first but nginx
+      # listens on IPv4 only → false "unhealthy". Probe layer.json so the
+      # check also fails when the tile data volume is empty.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8765/layer.json"]
       interval: 30s
       timeout: 5s
       retries: 3

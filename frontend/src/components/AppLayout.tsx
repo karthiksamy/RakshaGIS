@@ -8,7 +8,7 @@ import {
   GlobalOutlined, FolderOutlined, FileOutlined, TeamOutlined, BankOutlined,
   RobotOutlined, AppstoreOutlined, UserOutlined, LogoutOutlined,
   MenuFoldOutlined, MenuUnfoldOutlined, DatabaseOutlined, KeyOutlined,
-  BellOutlined, DashboardOutlined, BarChartOutlined, AuditOutlined,
+  BellOutlined, DashboardOutlined, BarChartOutlined, AuditOutlined, ApartmentOutlined,
   CheckCircleOutlined, SearchOutlined, BgColorsOutlined, EyeOutlined, EnvironmentOutlined,
   ShareAltOutlined, ImportOutlined, CompassOutlined, SafetyOutlined, CloudServerOutlined,
   SafetyCertificateOutlined, ClockCircleOutlined,
@@ -27,9 +27,11 @@ const { Header, Sider, Content } = Layout
 
 const NAV_ITEMS = [
   { key: '/dashboard', icon: <DashboardOutlined />, label: 'Dashboard' },
+  { key: '/drilldown', icon: <ApartmentOutlined />, label: 'Office Drilldown' },
   { key: '/map', icon: <GlobalOutlined />, label: 'Map' },
   { key: '/terrain', icon: <CompassOutlined />, label: '3D Terrain' },
   { key: '/drone', icon: <CloudServerOutlined />, label: 'Drone Survey' },
+  { key: '/field', icon: <EnvironmentOutlined />, label: 'Field Companion' },
   { key: '/projects', icon: <FolderOutlined />, label: 'Projects' },
   { key: '/documents', icon: <FileOutlined />, label: 'Documents' },
   { key: '/basemaps', icon: <AppstoreOutlined />, label: 'Basemaps' },

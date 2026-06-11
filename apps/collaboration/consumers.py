@@ -377,7 +377,7 @@ class ProjectRoomConsumer(AsyncWebsocketConsumer):
         from apps.accounts.models import User
 
         user = self.user
-        if user.role == User.SUPERADMIN or user.role == 'PDDE_VIEWER':
+        if user.role == User.SUPERADMIN:
             return SurveyProject.objects.filter(id=self.project_id).exists()
 
         if user.organisation_id:

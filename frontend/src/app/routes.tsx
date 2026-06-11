@@ -6,6 +6,7 @@ import LoginPage from '@/features/auth/LoginPage'
 import AppLayout from '@/components/AppLayout'
 
 const DashboardPage = lazy(() => import('@/features/dashboard/DashboardPage'))
+const OrgDrilldownPage = lazy(() => import('@/features/dashboard/OrgDrilldownPage'))
 const MapPage = lazy(() => import('@/features/map/MapPage'))
 const ProjectsPage = lazy(() => import('@/features/projects/ProjectsPage'))
 const ProjectDetailPage = lazy(() => import('@/features/projects/ProjectDetailPage'))
@@ -24,6 +25,7 @@ const TalukMasterPage = lazy(() => import('@/features/master/TalukMasterPage'))
 const VillageMasterPage = lazy(() => import('@/features/master/VillageMasterPage'))
 const BoundaryImportPage = lazy(() => import('@/features/master/BoundaryImportPage'))
 const TerrainPage = lazy(() => import('@/features/terrain/TerrainPage'))
+const FieldCompanionPage = lazy(() => import('@/features/field/FieldCompanionPage'))
 const BoundaryExtractionPage = lazy(() => import('@/features/ai-vision/BoundaryExtractionPage'))
 const BoundaryReviewPage = lazy(() => import('@/features/ai-vision/BoundaryReviewPage'))
 const BackupPage = lazy(() => import('@/features/backups/BackupPage'))
@@ -63,6 +65,7 @@ export default function AppRoutes() {
         >
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="dashboard" element={<DashboardPage />} />
+          <Route path="drilldown" element={<OrgDrilldownPage />} />
           <Route path="map" element={<MapPage />} />
           <Route path="projects" element={<ProjectsPage />} />
           <Route path="projects/:id" element={<ProjectDetailPage />} />
@@ -82,6 +85,7 @@ export default function AppRoutes() {
           <Route path="master/villages" element={<VillageMasterPage />} />
           <Route path="master/boundary-import" element={<BoundaryImportPage />} />
           <Route path="terrain" element={<TerrainPage />} />
+          <Route path="field" element={<FieldCompanionPage />} />
           <Route path="drone" element={<DroneDatasetsPage />} />
           <Route path="ai-vision" element={<BoundaryExtractionPage />} />
           <Route path="boundary-review/:jobId" element={<BoundaryReviewPage />} />

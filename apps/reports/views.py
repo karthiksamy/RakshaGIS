@@ -34,6 +34,9 @@ class ReportScheduleViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='send-now')
     def send_now(self, request, pk=None):
         schedule = self.get_object()
+        # Force this schedule due — otherwise a future next_run means
+        # "Send Now" silently skips it.
+        ReportSchedule.objects.filter(pk=schedule.pk).update(next_run=None)
         send_scheduled_reports.delay()
         return Response({'detail': f'Report "{schedule.name}" queued for sending.'})
 

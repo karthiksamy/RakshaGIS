@@ -30,6 +30,20 @@ def _sla_status(days, limit):
     return 'OVERDUE'
 
 
+def _visible_org_ids(user):
+    """Org scope for dashboard aggregates.
+
+    Field offices (DEO and below) see their own subtree — the DEO rule allows
+    own + subordinate office data. DGDE/PDDE office users are isolated to
+    their OWN org: subordinate project/area data must reach them only through
+    the published Map Viewer, never through dashboards or search.
+    """
+    from apps.survey_projects.access import hq_level
+    if hq_level(user):
+        return [user.organisation_id]
+    return user.organisation.get_subtree_ids()
+
+
 class DashboardStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -39,7 +53,7 @@ class DashboardStatsView(APIView):
         if user.is_superadmin:
             projects = SurveyProject.objects.all()
         elif user.organisation:
-            org_ids = user.organisation.get_subtree_ids()
+            org_ids = _visible_org_ids(user)
             projects = SurveyProject.objects.filter(
                 Q(organisation_id__in=org_ids) | Q(shares__granted_to_id__in=org_ids)
             ).distinct()
@@ -67,7 +81,7 @@ class DashboardStatsView(APIView):
             org_count = Organisation.objects.count()
         elif user.organisation:
             user_count = User.objects.filter(
-                organisation_id__in=user.organisation.get_subtree_ids(), is_active=True
+                organisation_id__in=_visible_org_ids(user), is_active=True
             ).count()
 
         # Recent projects (7 days)
@@ -91,7 +105,7 @@ class DashboardStatsView(APIView):
                 'project', 'survey_area__project', 'actor'
             ).order_by('-timestamp')[:12]
         elif user.organisation:
-            org_ids = user.organisation.get_subtree_ids()
+            org_ids = _visible_org_ids(user)
             recent_actions = WorkflowStep.objects.filter(
                 Q(project__organisation_id__in=org_ids) |
                 Q(survey_area__project__organisation_id__in=org_ids)
@@ -204,7 +218,7 @@ class SurveyAreaProgressView(APIView):
         if user.is_superadmin:
             projects = SurveyProject.objects.all()
         elif user.organisation:
-            org_ids = user.organisation.get_subtree_ids()
+            org_ids = _visible_org_ids(user)
             projects = SurveyProject.objects.filter(
                 Q(organisation_id__in=org_ids) | Q(shares__granted_to_id__in=org_ids)
             ).distinct()
@@ -242,8 +256,13 @@ class GlobalSearchView(APIView):
         if user.is_superadmin:
             projects = SurveyProject.objects.all()
         elif user.organisation:
-            org_ids = user.organisation.get_subtree_ids()
-            projects = SurveyProject.objects.filter(organisation_id__in=org_ids)
+            # Search returns concrete project/feature/area records — scope it
+            # exactly like the projects API: own org + explicit grants only.
+            from apps.survey_projects.access import permitted_extra_project_ids
+            projects = SurveyProject.objects.filter(
+                Q(organisation=user.organisation)
+                | Q(id__in=permitted_extra_project_ids(user))
+            ).distinct()
         else:
             projects = SurveyProject.objects.none()
 
@@ -269,7 +288,7 @@ class GlobalSearchView(APIView):
                 user_qs = User.objects.all()
             elif user.organisation:
                 user_qs = User.objects.filter(
-                    organisation_id__in=user.organisation.get_subtree_ids()
+                    organisation_id__in=_visible_org_ids(user)
                 )
             else:
                 user_qs = User.objects.none()
@@ -342,7 +361,7 @@ class SLAReportView(APIView):
         if user.is_superadmin:
             projects = SurveyProject.objects.all()
         elif user.organisation:
-            org_ids = user.organisation.get_subtree_ids()
+            org_ids = _visible_org_ids(user)
             projects = SurveyProject.objects.filter(organisation_id__in=org_ids)
         else:
             return Response({'results': [], 'sla_days': SLA_DAYS, 'summary': {}})
@@ -453,4 +472,116 @@ class SLAReportView(APIView):
             'results':  results,
             'sla_days': SLA_DAYS,
             'summary':  summary,
+        })
+
+
+class OrgDrilldownView(APIView):
+    """Hierarchical aggregate dashboard (DGDE → command → office → sub-office).
+
+    GET /api/dashboard/org-drilldown/?org=<id>
+
+    Returns aggregate statistics for the target office and one row per child
+    office. Aggregates only — no project names or records — so HQ users can
+    monitor progress down the tree without breaching office-level data
+    isolation. The target must be the requesting user's own office or one of
+    its descendants: DGDE drills through everything, PDDE only through its
+    own command, DEO through its own offices.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @staticmethod
+    def _is_descendant(org, ancestor) -> bool:
+        seen = set()
+        cur = org
+        while cur and cur.id not in seen:
+            if cur.id == ancestor.id:
+                return True
+            seen.add(cur.id)
+            cur = cur.parent
+        return False
+
+    @staticmethod
+    def _descendant_ids(org) -> list:
+        """org.id + ALL descendants (any depth — BFS over parent links)."""
+        ids = [org.id]
+        frontier = [org.id]
+        while frontier:
+            children = list(
+                Organisation.objects.filter(parent_id__in=frontier)
+                .exclude(id__in=ids).values_list('id', flat=True)
+            )
+            ids.extend(children)
+            frontier = children
+        return ids
+
+    @staticmethod
+    def _org_stats(org_ids) -> dict:
+        projects = SurveyProject.objects.filter(organisation_id__in=org_ids)
+        areas = SurveyArea.objects.filter(project__organisation_id__in=org_ids)
+        return {
+            'projects': projects.count(),
+            'projects_published': projects.filter(status='PUBLISHED').count(),
+            'areas': areas.count(),
+            'areas_published': areas.filter(status='PUBLISHED').count(),
+            'areas_in_review': areas.filter(
+                status__in=['SUBMITTED', 'UNDER_REVIEW']).count(),
+            'features': GISFeature.objects.filter(
+                project__organisation_id__in=org_ids, is_deleted=False).count(),
+            'users': User.objects.filter(
+                organisation_id__in=org_ids, is_active=True).count(),
+        }
+
+    def get(self, request):
+        user = request.user
+        if user.is_superadmin:
+            home = (Organisation.objects.filter(level=Organisation.DGDE).first()
+                    or user.organisation)
+        else:
+            home = user.organisation
+        if home is None:
+            return Response({'detail': 'No organisation assigned.'}, status=403)
+
+        target_id = request.query_params.get('org')
+        if target_id:
+            try:
+                target = Organisation.objects.select_related('parent').get(id=target_id)
+            except Organisation.DoesNotExist:
+                return Response({'detail': 'Organisation not found.'}, status=404)
+            if not self._is_descendant(target, home):
+                return Response({'detail': 'Outside your office scope.'}, status=403)
+        else:
+            target = home
+
+        children = list(
+            Organisation.objects.filter(parent=target).order_by('level', 'name')
+        )
+        child_rows = []
+        for child in children:
+            sub_ids = self._descendant_ids(child)
+            child_rows.append({
+                'id': child.id,
+                'name': child.name,
+                'level': child.level,
+                'level_display': child.get_level_display(),
+                'has_children': Organisation.objects.filter(parent=child).exists(),
+                'stats': self._org_stats(sub_ids),
+            })
+
+        # Breadcrumb: home → … → target (always stops at the user's own office)
+        breadcrumb = []
+        cur = target
+        while cur:
+            breadcrumb.append({'id': cur.id, 'name': cur.name, 'level': cur.level})
+            if cur.id == home.id:
+                break
+            cur = cur.parent
+        breadcrumb.reverse()
+
+        return Response({
+            'org': {'id': target.id, 'name': target.name, 'level': target.level,
+                    'level_display': target.get_level_display()},
+            'breadcrumb': breadcrumb,
+            'own_stats': self._org_stats([target.id]),
+            'total_stats': self._org_stats(self._descendant_ids(target)),
+            'children': child_rows,
         })

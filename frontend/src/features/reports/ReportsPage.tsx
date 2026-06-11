@@ -181,6 +181,7 @@ export default function ReportsPage() {
                     { value: 'FEATURE_EXPORT',  label: 'Feature Data Export' },
                     { value: 'ACTIVITY_LOG',    label: 'User Activity Log' },
                     { value: 'TERRAIN_SUMMARY', label: '🗺 Terrain Analysis Summary (PDF)' },
+                    { value: 'AI_SUMMARY',      label: '🤖 AI Survey Summary (PDF)' },
                   ]}
                 />
               </Form.Item>
@@ -209,6 +210,15 @@ export default function ReportsPage() {
           >
             <Input.TextArea rows={2} placeholder="user1@example.com, user2@example.com" />
           </Form.Item>
+
+          {reportType === 'AI_SUMMARY' && (
+            <div style={{ fontSize: 11, color: '#888', marginBottom: 12 }}>
+              The local AI assistant (Ollama) writes a narrative executive summary from
+              project statistics, feature counts, surveyed area and the recent timeline.
+              A formatted, provenance-watermarked PDF is attached to the email. If the
+              LLM is offline a statistical summary is sent instead.
+            </div>
+          )}
 
           {reportType === 'TERRAIN_SUMMARY' && (
             <>

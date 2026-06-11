@@ -1625,10 +1625,38 @@ export default function ProjectDetailPage() {
                     pagination={false}
                     expandable={{
                       expandedRowRender: (row) => {
-                        if (!row.columns?.length) return <span style={{ color: '#555', fontSize: 12 }}>No attribute columns recorded.</span>
+                        const qaWarnings = row.validation_warnings ?? []
+                        const qaBlock = qaWarnings.length > 0 && (
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: 12, color: '#aaa', marginBottom: 4 }}>Attribute QA:</div>
+                            {qaWarnings.map((w, i) => (
+                              <Alert
+                                key={i}
+                                type={w.level === 'error' ? 'error' : w.level === 'warning' ? 'warning' : 'info'}
+                                showIcon
+                                icon={w.code === 'ai_review' ? <RobotOutlined /> : undefined}
+                                message={
+                                  <span style={{ fontSize: 12 }}>
+                                    {w.code === 'ai_review' && <b>AI review: </b>}{w.message}
+                                  </span>
+                                }
+                                style={{ marginBottom: 4, padding: '4px 10px' }}
+                              />
+                            ))}
+                          </div>
+                        )
+                        if (!row.columns?.length) {
+                          return (
+                            <div style={{ padding: '8px 0' }}>
+                              {qaBlock}
+                              <span style={{ color: '#555', fontSize: 12 }}>No attribute columns recorded.</span>
+                            </div>
+                          )
+                        }
                         const sensitiveOnes = row.columns.filter(isSensitive)
                         return (
                           <div style={{ padding: '8px 0' }}>
+                            {qaBlock}
                             {sensitiveOnes.length > 0 && (
                               <Alert
                                 type="warning"
@@ -1672,6 +1700,25 @@ export default function ProjectDetailPage() {
                         ),
                       },
                       { title: 'Features', dataIndex: 'feature_count', width: 80, render: (v) => v ?? '—' },
+                      {
+                        title: 'QA', width: 80,
+                        render: (_, row) => {
+                          if (row.status !== 'DONE') return <span style={{ color: '#555', fontSize: 11 }}>—</span>
+                          const ws = row.validation_warnings ?? []
+                          const errs = ws.filter(w => w.level === 'error').length
+                          const warns = ws.filter(w => w.level === 'warning').length
+                          if (!errs && !warns) {
+                            return <Tag color="green" style={{ fontSize: 10 }}>OK</Tag>
+                          }
+                          return (
+                            <Tooltip title="Expand the row for attribute QA details">
+                              <Tag color={errs ? 'error' : 'orange'} icon={<AlertOutlined />} style={{ fontSize: 10 }}>
+                                {errs ? `${errs} issue${errs > 1 ? 's' : ''}` : `${warns} warn`}
+                              </Tag>
+                            </Tooltip>
+                          )
+                        },
+                      },
                       {
                         title: 'Columns', width: 80,
                         render: (_, row) => {

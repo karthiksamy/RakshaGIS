@@ -79,6 +79,17 @@ class ChatSessionViewSet(viewsets.ModelViewSet):
         user_message = serializer.validated_data['message']
         project_id   = request.data.get('project_id')  # optional: triggers RAG
 
+        # Org-level retrieval scope: DGDE → all, PDDE → subtree, DEO/CEO/ADEO →
+        # own org + explicit grants. Never let the AI read a project outside
+        # the requesting user's access level.
+        if project_id:
+            from apps.survey_projects.access import ai_can_access_project
+            if not ai_can_access_project(request.user, project_id):
+                return Response(
+                    {'detail': 'You do not have access to this project’s data.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
         ChatMessage.objects.create(session=session, role=ChatMessage.USER, content=user_message)
 
         service = OllamaService()
@@ -133,13 +144,25 @@ class AITaskViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role in ('SUPERADMIN', 'PDDE_VIEWER', 'DEO_ADMIN'):
-            return AITask.objects.select_related('requested_by').all()
-        return AITask.objects.select_related('requested_by').filter(requested_by=user)
+        qs = AITask.objects.select_related('requested_by')
+        if user.role == 'SUPERADMIN':
+            return qs
+        # Office admins see their own office subtree's tasks; everyone else
+        # only their own. Tasks must never leak across office boundaries
+        # (results may contain report text / data summaries).
+        org = getattr(user, 'organisation', None)
+        if org and user.role in ('PDDE_VIEWER', 'DEO_ADMIN', 'CEO_ADMIN', 'ADEO_ADMIN'):
+            return qs.filter(requested_by__organisation_id__in=org.get_subtree_ids())
+        return qs.filter(requested_by=user)
 
     @action(detail=False, methods=['post'], url_path='generate-report/(?P<project_pk>[^/.]+)')
     def generate_report(self, request, project_pk=None):
         from apps.ai_assistant.tasks import generate_project_report
+        from apps.survey_projects.access import ai_can_access_project
+
+        if not ai_can_access_project(request.user, project_pk):
+            return Response({'detail': 'You do not have access to this project.'},
+                            status=status.HTTP_403_FORBIDDEN)
 
         task = AITask.objects.create(
             task_type=AITask.REPORT_GENERATION,
@@ -546,11 +569,24 @@ class EmbeddingViewSet(viewsets.ViewSet):
     """Manage document embeddings for RAG."""
     permission_classes = [permissions.IsAuthenticated]
 
+    @staticmethod
+    def _deny_unless_accessible(request, project_pk):
+        """Org-scope gate shared by all per-project embedding endpoints."""
+        from apps.survey_projects.access import ai_can_access_project
+        if not ai_can_access_project(request.user, project_pk):
+            return Response({'detail': 'You do not have access to this project.'},
+                            status=status.HTTP_403_FORBIDDEN)
+        return None
+
     @action(detail=False, methods=['post'], url_path='embed-project/(?P<project_pk>[^/.]+)')
     def embed_project(self, request, project_pk=None):
         """Queue embedding tasks for all AI-processed documents in a project."""
         from apps.documents.models import Document
         from .tasks import embed_document
+
+        denied = self._deny_unless_accessible(request, project_pk)
+        if denied:
+            return denied
 
         embed_model = request.data.get('embed_model', 'nomic-embed-text')
         docs = Document.objects.filter(project_id=project_pk, ai_processed=True).exclude(ai_extracted_text='')
@@ -573,6 +609,10 @@ class EmbeddingViewSet(viewsets.ViewSet):
     def embed_status(self, request, project_pk=None):
         """Return RAG embedding status for a project."""
         from apps.documents.models import Document
+
+        denied = self._deny_unless_accessible(request, project_pk)
+        if denied:
+            return denied
 
         total_docs = Document.objects.filter(project_id=project_pk, ai_processed=True).count()
         embedded_docs = DocumentChunk.objects.filter(project_id=project_pk).values('document_id').distinct().count()
@@ -597,6 +637,9 @@ class EmbeddingViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['delete'], url_path='clear-embeddings/(?P<project_pk>[^/.]+)')
     def clear_embeddings(self, request, project_pk=None):
         """Delete all embeddings for a project."""
+        denied = self._deny_unless_accessible(request, project_pk)
+        if denied:
+            return denied
         count, _ = DocumentChunk.objects.filter(project_id=project_pk).delete()
         return Response({'deleted_chunks': count})
 

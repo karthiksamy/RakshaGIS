@@ -7,6 +7,7 @@ from .models import (
     FeatureAttachment, ProjectMilestone, QGISUploadLog, TemporaryLayer,
     SurveyAreaAccessRequest, ReviewAnnotation, TopologyRule,
     GISFeatureHistory, SurveyAreaSnapshot, SurveyAreaSplitRecord,
+    FeatureComment,
 )
 
 
@@ -210,11 +211,12 @@ class ShapefileImportSerializer(serializers.ModelSerializer):
             'id', 'project', 'folder', 'folder_name', 'file', 'layer_name',
             'attribute_template', 'status', 'status_display', 'deo_visible',
             'feature_count', 'columns', 'error',
-            'ai_processed', 'ai_summary',
+            'ai_processed', 'ai_summary', 'validation_warnings',
             'created_by', 'created_by_name', 'created_at',
         ]
         read_only_fields = ['id', 'status', 'feature_count', 'columns', 'error',
-                            'ai_processed', 'ai_summary', 'created_by', 'created_at']
+                            'ai_processed', 'ai_summary', 'validation_warnings',
+                            'created_by', 'created_at']
 
 
 class BufferParcelSerializer(serializers.ModelSerializer):
@@ -420,3 +422,17 @@ class TopologyRuleSerializer(serializers.ModelSerializer):
             'is_active', 'created_by', 'created_by_name', 'created_at',
         ]
         read_only_fields = ['id', 'created_by', 'created_at']
+
+
+class FeatureCommentSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.get_full_name', read_only=True, default='')
+    user_username = serializers.CharField(source='user.username', read_only=True, default='')
+    user_role = serializers.CharField(source='user.role', read_only=True, default='')
+
+    class Meta:
+        model = FeatureComment
+        fields = [
+            'id', 'feature', 'user', 'user_name', 'user_username', 'user_role',
+            'text', 'created_at',
+        ]
+        read_only_fields = ['id', 'user', 'created_at']

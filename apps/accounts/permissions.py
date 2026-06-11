@@ -104,8 +104,8 @@ class OrgScopedAccess(BasePermission):
     """
     Object-level: enforce org visibility rules.
       SUPERADMIN   → everything
-      PDDE_VIEWER  → own PDDE org + full subtree (DEO + CEO + ADEO under it)
-      All others   → own org only
+      All others   → own org only (strict office-level isolation; subordinate
+                     data is reachable only via published maps or explicit grants)
     """
 
     def has_object_permission(self, request, view, obj):
@@ -117,9 +117,6 @@ class OrgScopedAccess(BasePermission):
         if org is None:
             return False
 
-        if user.role == User.PDDE_VIEWER:
-            return org.id in user.organisation.get_subtree_ids()
-
         return org == user.organisation
 
 
@@ -128,13 +125,16 @@ def org_queryset_filter(user, qs, org_field='organisation'):
     Reusable helper: filter a queryset to records visible to the given user.
 
     - SUPERADMIN        → no filter (sees all)
-    - PDDE_VIEWER       → own PDDE + full subtree (2-hop: children + grandchildren)
     - All other roles   → own org only
+
+    Strict isolation: every office (including PDDE/DGDE) sees only the records
+    of its own organisation by default. Subordinate-office data reaches HQ
+    users exclusively through the published Map Viewer endpoints, and reaches
+    peer/parent offices only via explicit grants (ProjectShare, approved
+    SurveyAreaAccessRequest, deo_visible opt-in) added by the viewsets.
     """
     if user.role == User.SUPERADMIN:
         return qs
-    if user.role == User.PDDE_VIEWER:
-        return qs.filter(**{f'{org_field}_id__in': user.organisation.get_subtree_ids()})
     return qs.filter(**{org_field: user.organisation})
 
 

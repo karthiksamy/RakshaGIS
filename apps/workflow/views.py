@@ -423,8 +423,14 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role in (User.SUPERADMIN, User.PDDE_VIEWER):
+        if user.role == User.SUPERADMIN:
             return AuditLog.objects.select_related('user').all()
+        # PDDE oversight is limited to its own command subtree — global audit
+        # logs would leak other commands' activity.
+        if user.role == User.PDDE_VIEWER and user.organisation:
+            return AuditLog.objects.select_related('user').filter(
+                user__organisation_id__in=user.organisation.get_subtree_ids()
+            )
         return AuditLog.objects.select_related('user').filter(user=user)
 
 
@@ -602,7 +608,13 @@ class EncroachmentSummaryView(APIView):
             status=DisputeReport.HAS_DISPUTES, acknowledged=False
         ).select_related('survey_area__project__organisation').order_by('-checked_at')
         if not user.is_superadmin and user.organisation:
-            org_ids = user.organisation.get_subtree_ids()
+            from apps.survey_projects.access import hq_level
+            # HQ (DGDE/PDDE) users: own org only — dispute details of
+            # subordinate offices are not their scope.
+            if hq_level(user):
+                org_ids = [user.organisation_id]
+            else:
+                org_ids = user.organisation.get_subtree_ids()
             qs = qs.filter(survey_area__project__organisation_id__in=org_ids)
         elif not user.is_superadmin:
             qs = qs.none()

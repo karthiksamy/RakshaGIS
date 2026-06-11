@@ -423,6 +423,7 @@ export interface ShapefileImport {
   error: string
   ai_processed: boolean
   ai_summary: string
+  validation_warnings?: { level: 'error' | 'warning' | 'info'; code: string; message: string }[]
   created_by: number | null
   created_by_name: string
   created_at: string

@@ -101,13 +101,123 @@ def import_shapefile(self, job_id: int):
         job.columns = detected_columns
         job.error = ''
 
+        # ── Post-import attribute QA (rule-based, instant) ────────────────────
+        try:
+            job.validation_warnings = _validate_imported_features(job)
+        except Exception:
+            job.validation_warnings = []
+
     except Exception as exc:
         job.status = ShapefileImport.FAILED
         job.error = str(exc)
         self.retry(exc=exc, countdown=15)
 
     finally:
-        job.save(update_fields=['status', 'feature_count', 'columns', 'error'])
+        job.save(update_fields=['status', 'feature_count', 'columns', 'error',
+                                'validation_warnings'])
+
+    # AI review runs async after the import is saved (LLM may be slow/offline)
+    if job.status == ShapefileImport.DONE:
+        try:
+            from apps.ai_assistant.models import AITask
+            from apps.ai_assistant.tasks import validate_import_attributes
+            ai_task = AITask.objects.create(
+                task_type=AITask.ATTRIBUTE_VALIDATION,
+                requested_by=job.created_by,
+                input_data={'shapefile_import_id': job.id},
+            )
+            validate_import_attributes.delay(ai_task.id)
+        except Exception:
+            pass
+
+
+# Rough India envelope incl. island territories — flags obviously wrong CRS/data
+_EXPECTED_BBOX = (66.0, 5.0, 100.0, 38.0)   # minLon, minLat, maxLon, maxLat
+
+
+def _validate_imported_features(job):
+    """Deterministic QA checks on the features created by a shapefile import.
+
+    Returns a list of {level, code, message} dicts stored on the import record
+    and rendered inline in the import modal.
+    """
+    from apps.survey_projects.models import GISFeature
+
+    warnings = []
+    feats = GISFeature.objects.filter(
+        project=job.project, layer_name=job.layer_name, is_deleted=False,
+    ).only('feature_id', 'attributes', 'geometry', 'geometry_type')
+
+    required = []
+    if job.attribute_template:
+        required = [f['name'] for f in (job.attribute_template.fields or [])
+                    if f.get('required')]
+
+    seen_ids: set = set()
+    dup_ids: set = set()
+    missing = {name: 0 for name in required}
+    zero_area = out_of_bbox = empty_attrs = total = 0
+
+    for f in feats.iterator(chunk_size=500):
+        total += 1
+        fid = (f.feature_id or '').strip()
+        if fid:
+            if fid in seen_ids:
+                dup_ids.add(fid)
+            seen_ids.add(fid)
+
+        attrs = f.attributes or {}
+        if not attrs:
+            empty_attrs += 1
+        for name in required:
+            v = attrs.get(name)
+            if v is None or v == '':
+                missing[name] += 1
+
+        try:
+            xmin, ymin, xmax, ymax = f.geometry.extent
+            if (xmin < _EXPECTED_BBOX[0] or ymin < _EXPECTED_BBOX[1] or
+                    xmax > _EXPECTED_BBOX[2] or ymax > _EXPECTED_BBOX[3]):
+                out_of_bbox += 1
+            if f.geometry_type == GISFeature.POLYGON and f.geometry.area == 0:
+                zero_area += 1
+        except Exception:
+            pass
+
+    if dup_ids:
+        sample = ', '.join(sorted(dup_ids)[:5])
+        warnings.append({
+            'level': 'error', 'code': 'duplicate_ids',
+            'message': f'{len(dup_ids)} duplicate feature ID(s) found (e.g. {sample}).',
+        })
+    for name, count in missing.items():
+        if count:
+            warnings.append({
+                'level': 'error', 'code': 'missing_required',
+                'message': f'Required attribute "{name}" is empty on {count} of {total} features.',
+            })
+    if zero_area:
+        warnings.append({
+            'level': 'warning', 'code': 'zero_area',
+            'message': f'{zero_area} polygon(s) have zero area (degenerate geometry).',
+        })
+    if out_of_bbox:
+        warnings.append({
+            'level': 'warning', 'code': 'out_of_bbox',
+            'message': f'{out_of_bbox} feature(s) fall outside the expected India extent '
+                       f'— check the source CRS.',
+        })
+    if empty_attrs:
+        warnings.append({
+            'level': 'warning', 'code': 'empty_attributes',
+            'message': f'{empty_attrs} feature(s) have no attributes at all.',
+        })
+    if not warnings:
+        warnings.append({
+            'level': 'info', 'code': 'ok',
+            'message': f'All {total} features passed attribute and geometry checks.',
+        })
+    return warnings
 
 
 @shared_task(bind=True, max_retries=1)

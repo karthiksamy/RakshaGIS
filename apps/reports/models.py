@@ -17,12 +17,14 @@ class ReportSchedule(models.Model):
     FEATURE_EXPORT   = 'FEATURE_EXPORT'
     ACTIVITY_LOG     = 'ACTIVITY_LOG'
     TERRAIN_SUMMARY  = 'TERRAIN_SUMMARY'
+    AI_SUMMARY       = 'AI_SUMMARY'
 
     REPORT_TYPE_CHOICES = [
         (STATUS_SUMMARY,  'Project Status Summary'),
         (FEATURE_EXPORT,  'Feature Data Export'),
         (ACTIVITY_LOG,    'User Activity Log'),
         (TERRAIN_SUMMARY, 'Terrain Analysis Summary'),
+        (AI_SUMMARY,      'AI Survey Summary'),
     ]
 
     name = models.CharField(max_length=200)

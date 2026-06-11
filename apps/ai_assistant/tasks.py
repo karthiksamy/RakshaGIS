@@ -417,6 +417,79 @@ def process_shapefile_ai(self, task_id: int):
         task.save(update_fields=['status', 'result', 'error_message', 'completed_at'])
 
 
+@shared_task(bind=True, max_retries=1)
+def validate_import_attributes(self, task_id: int):
+    """AI second-pass review of an imported layer's attributes.
+
+    Runs automatically after import_shapefile. Appends one 'info' entry with
+    the LLM's observations to the import's validation_warnings (the rule-based
+    checks are already stored by the import task). Silently skips when the
+    LLM is unavailable — the deterministic warnings stand on their own.
+    """
+    from apps.ai_assistant.models import AITask
+    from apps.ai_assistant.services import OllamaService
+    from apps.survey_projects.models import GISFeature, ShapefileImport
+
+    task = AITask.objects.get(id=task_id)
+    task.status = AITask.RUNNING
+    task.save(update_fields=['status'])
+
+    try:
+        shp_import = ShapefileImport.objects.select_related('project').get(
+            id=task.input_data['shapefile_import_id']
+        )
+        service = OllamaService()
+        if not service.is_available():
+            task.status = AITask.DONE
+            task.result = {'skipped': 'LLM unavailable'}
+            return
+
+        sample = list(
+            GISFeature.objects.filter(
+                project=shp_import.project,
+                layer_name=shp_import.layer_name,
+                is_deleted=False,
+            ).values('feature_id', 'attributes')[:15]
+        )
+        rule_findings = [w['message'] for w in (shp_import.validation_warnings or [])
+                         if w.get('code') != 'ai_review']
+        prompt = (
+            f"Layer: {shp_import.layer_name}\n"
+            f"Columns: {', '.join(shp_import.columns or [])}\n"
+            f"Feature count: {shp_import.feature_count}\n"
+            f"Rule-based findings: {'; '.join(rule_findings) or 'none'}\n\n"
+            f"Sample records:\n" +
+            '\n'.join(f"  id={s['feature_id']} {json.dumps(s['attributes'])}" for s in sample)
+        )
+        review = service.generate(
+            prompt=prompt,
+            system=(
+                'You are a GIS data-quality reviewer for DGDE RakshaGIS. In 2-4 short '
+                'sentences, point out suspicious attribute values, inconsistent naming, '
+                'unit mistakes, or columns that look mis-mapped in this imported layer. '
+                'If everything looks consistent, say so. Plain text only.'
+            ),
+        ).strip()
+
+        if review:
+            warnings = [w for w in (shp_import.validation_warnings or [])
+                        if w.get('code') != 'ai_review']
+            warnings.append({'level': 'info', 'code': 'ai_review', 'message': review})
+            shp_import.validation_warnings = warnings
+            shp_import.save(update_fields=['validation_warnings'])
+
+        task.status = AITask.DONE
+        task.result = {'review': review}
+
+    except Exception as exc:
+        task.status = AITask.FAILED
+        task.error_message = str(exc)
+
+    finally:
+        task.completed_at = timezone.now()
+        task.save(update_fields=['status', 'result', 'error_message', 'completed_at'])
+
+
 # ── RAG: Document Embedding ───────────────────────────────────────────────────
 
 @shared_task(bind=True, max_retries=1, name='ai_assistant.embed_document')

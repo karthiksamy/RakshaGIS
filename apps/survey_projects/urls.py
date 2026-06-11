@@ -9,6 +9,7 @@ from .views import (
     FeatureMergeView, FeatureSplitView, ProjectMilestoneViewSet,
     QGISUploadLogViewSet, TemporaryLayerViewSet,
     SurveyAreaAccessRequestViewSet, ReviewAnnotationViewSet,
+    FeatureCommentViewSet,
     georeference_image,
 )
 
@@ -29,6 +30,7 @@ router.register('qgis-uploads', QGISUploadLogViewSet, basename='qgis-upload-log'
 router.register('temp-layers', TemporaryLayerViewSet, basename='temp-layer')
 router.register('annotations', ReviewAnnotationViewSet, basename='review-annotation')
 router.register('topology-rules', TopologyRuleViewSet, basename='topology-rule')
+router.register('feature-comments', FeatureCommentViewSet, basename='feature-comment')
 
 urlpatterns = router.urls + [
     path('buffer/', BufferAnalysisView.as_view(), name='buffer-analysis'),

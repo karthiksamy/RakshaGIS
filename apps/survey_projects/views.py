@@ -21,14 +21,14 @@ from .models import (
     SurveyProject, SurveyArea, GISFeature, DefenceParcel, AttributeTemplate,
     ShapefileImport, ProjectLayerFolder, ProjectShare, GeoTiffLayer,
     FeatureAttachment, ProjectMilestone, SurveyAreaAccessRequest, ReviewAnnotation,
-    TopologyRule,
+    TopologyRule, FeatureComment,
 )
 from .serializers import (
     SurveyProjectSerializer, SurveyAreaSerializer, GISFeatureSerializer, DefenceParcelSerializer,
     AttributeTemplateSerializer, ShapefileImportSerializer,
     ProjectLayerFolderSerializer, ProjectShareSerializer, GeoTiffLayerSerializer,
     BufferParcelSerializer, FeatureAttachmentSerializer, ProjectMilestoneSerializer,
-    ReviewAnnotationSerializer, TopologyRuleSerializer,
+    ReviewAnnotationSerializer, TopologyRuleSerializer, FeatureCommentSerializer,
 )
 
 
@@ -41,35 +41,19 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'updated_at', 'name', 'priority']
 
     def get_queryset(self):
-        from django.db.models import Q
+        from .access import permitted_extra_project_ids
         user = self.request.user
         base_qs = SurveyProject.objects.select_related(
             'organisation', 'created_by', 'state', 'district', 'taluk', 'village'
         )
+        # Strict office isolation: every user (including DGDE/PDDE office users)
+        # sees only projects of their OWN organisation here, plus explicit
+        # grants. HQ users reach subordinate data only via the published
+        # Map Viewer endpoints — never through the projects API.
         own_qs = org_queryset_filter(user, base_qs)
-        if user.is_superadmin or user.role == 'PDDE_VIEWER':
+        if user.is_superadmin:
             return own_qs
-        # Include projects shared to this org + projects containing approved survey area grants
-        shared_ids = get_shared_project_ids(user)
-        approved_project_ids = list(
-            SurveyArea.objects.filter(id__in=get_approved_area_ids(user))
-            .values_list('project_id', flat=True)
-        )
-        # DEO offices additionally see subordinate-office projects that contain at
-        # least one opt-in (deo_visible=True) dataset — feature layer or GeoTIFF.
-        deo_sub_ids = deo_subordinate_org_ids(user)
-        deo_project_ids: list[int] = []
-        if deo_sub_ids:
-            deo_project_ids = list(set(
-                list(GISFeature.objects.filter(
-                    project__organisation_id__in=deo_sub_ids,
-                    deo_visible=True, is_deleted=False,
-                ).values_list('project_id', flat=True))
-                + list(GeoTiffLayer.objects.filter(
-                    project__organisation_id__in=deo_sub_ids, deo_visible=True,
-                ).values_list('project_id', flat=True))
-            ))
-        extra_ids = list(set(shared_ids + approved_project_ids + deo_project_ids))
+        extra_ids = permitted_extra_project_ids(user)
         if not extra_ids:
             return own_qs
         return (own_qs | base_qs.filter(id__in=extra_ids)).distinct()
@@ -369,20 +353,19 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
         from django.db.models import Q
         user = self.request.user
         base_qs = GISFeature.objects.select_related('project__organisation', 'created_by')
+        from .access import hq_level, published_map_filter
         own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation').filter(is_deleted=False)
-        # DGDE/PDDE (national/command): only features belonging to PUBLISHED + map-enabled
-        # survey areas, optionally scoped to one office via ?organisation=<id>. Viewers are
-        # always restricted; superadmins too when browsing the map office view (?organisation).
-        level = getattr(getattr(user, 'organisation', None), 'level', None)
+        # DGDE/PDDE (national/command) office users: own-org features stay fully
+        # visible; subordinate offices contribute only features inside PUBLISHED +
+        # map-enabled survey areas (PDDE limited to its command subtree).
+        level = hq_level(user)
         org_id = self.request.query_params.get('organisation')
-        if level in ('DGDE', 'PDDE') and (not user.is_superadmin or org_id):
+        if level:
             from apps.survey_projects.models import SurveyArea as _SA
-            areas = org_queryset_filter(
-                user,
-                _SA.objects.filter(status=_SA.PUBLISHED, map_enabled=True,
-                                   project__map_enabled=True, folder__isnull=False),
-                org_field='project__organisation',
-            )
+            areas = published_map_filter(user, _SA.objects.filter(
+                status=_SA.PUBLISHED, map_enabled=True,
+                project__map_enabled=True, folder__isnull=False,
+            ))
             if org_id:
                 areas = areas.filter(project__organisation_id=org_id)
             # Narrow to a single survey area when the map browser drills down
@@ -392,10 +375,13 @@ class GISFeatureViewSet(viewsets.ModelViewSet):
             folder_ids: list[int] = []
             for a in areas.only('folder_id'):
                 folder_ids.extend(_get_subtree_folder_ids(a.folder_id))
-            if not folder_ids:
-                return base_qs.none()
-            return own_qs.filter(folder_id__in=folder_ids)
-        if user.is_superadmin or user.role == 'PDDE_VIEWER':
+            pub_qs = (base_qs.filter(folder_id__in=folder_ids, is_deleted=False)
+                      if folder_ids else base_qs.none())
+            if org_id:
+                # Office drill-down view: published features of that office only
+                return pub_qs
+            return (own_qs | pub_qs).distinct()
+        if user.is_superadmin:
             # When browsing a specific office via the field browser, filter to
             # that office's PUBLISHED survey area features only.
             if org_id:
@@ -2424,21 +2410,22 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
         base_qs = SurveyArea.objects.select_related(
             'project__organisation', 'assigned_to', 'created_by', 'folder'
         )
+        from .access import hq_level, published_map_filter
         own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation')
-        # DGDE/PDDE (national/command) levels: only PUBLISHED + map-enabled areas,
-        # optionally scoped to one office via ?organisation=<id> (the office picker).
-        # Viewers are always restricted; superadmins are restricted too when browsing the
-        # map office view (?organisation present) so the simplified viewer is consistent.
-        level = getattr(getattr(user, 'organisation', None), 'level', None)
+        # DGDE/PDDE (national/command) office users: their OWN org's areas stay
+        # fully visible (HQ offices can run their own projects), while subordinate
+        # offices' data is limited to PUBLISHED + map-enabled areas (Map Viewer),
+        # PDDE additionally restricted to its command subtree.
+        level = hq_level(user)
         org_id = self.request.query_params.get('organisation')
-        if level in ('DGDE', 'PDDE') and (not user.is_superadmin or org_id):
-            qs = own_qs.filter(
+        if level:
+            pub = published_map_filter(user, base_qs.filter(
                 status=SurveyArea.PUBLISHED, map_enabled=True, project__map_enabled=True,
-            )
+            ))
             if org_id:
-                qs = qs.filter(project__organisation_id=org_id)
-            return qs
-        if user.is_superadmin or user.role == 'PDDE_VIEWER':
+                return pub.filter(project__organisation_id=org_id)
+            return (own_qs | pub).distinct()
+        if user.is_superadmin:
             # Field-browser: when a specific office is passed, return only its
             # PUBLISHED survey areas — same scope as DGDE/PDDE office browsing.
             if org_id:
@@ -3503,10 +3490,25 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         from django.db.models import Q
         user = self.request.user
+        from .access import hq_level, published_map_filter
         base_qs = ProjectLayerFolder.objects.select_related('project__organisation', 'parent', 'created_by')
         own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation')
-        if user.is_superadmin or user.role == 'PDDE_VIEWER':
+        if user.is_superadmin:
             return own_qs
+        # DGDE/PDDE office users: own-org folders + folder subtrees of PUBLISHED
+        # map-enabled survey areas (the Map Viewer layer tree), nothing else.
+        if hq_level(user):
+            from apps.survey_projects.models import SurveyArea as _SA
+            areas = published_map_filter(user, _SA.objects.filter(
+                status=_SA.PUBLISHED, map_enabled=True,
+                project__map_enabled=True, folder__isnull=False,
+            ))
+            pub_folder_ids: list[int] = []
+            for a in areas.only('folder_id'):
+                pub_folder_ids.extend(_get_subtree_folder_ids(a.folder_id))
+            if not pub_folder_ids:
+                return own_qs
+            return (own_qs | base_qs.filter(id__in=pub_folder_ids)).distinct()
         approved_area_ids = get_approved_area_ids(user)
         shared_project_ids = get_shared_project_ids(user)
         if not approved_area_ids and not shared_project_ids:
@@ -5228,3 +5230,31 @@ def georeference_image(request):
             except Exception:
                 pass
 
+
+
+class FeatureCommentViewSet(viewsets.ModelViewSet):
+    """Per-feature discussion thread (feature info drawer on the map).
+
+    GET  /projects/feature-comments/?feature=<id>  — thread for one geometry
+    POST /projects/feature-comments/               — add a remark
+    DELETE                                          — own comments only
+    """
+    serializer_class = FeatureCommentSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['feature']
+    pagination_class = None
+    http_method_names = ['get', 'post', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        qs = FeatureComment.objects.select_related('user', 'feature__project__organisation')
+        return org_queryset_filter(self.request.user, qs,
+                                   org_field='feature__project__organisation')
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+    def destroy(self, request, *args, **kwargs):
+        comment = self.get_object()
+        if comment.user_id != request.user.id and not request.user.is_superadmin:
+            raise PermissionDenied('You can only delete your own comments.')
+        return super().destroy(request, *args, **kwargs)

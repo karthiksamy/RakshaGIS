@@ -82,6 +82,7 @@ import MapAtlasModal from './MapAtlasModal'
 import TempLayersPanel, { getTempLayerColor } from './TempLayersPanel'
 import ExternalLayersPanel from './ExternalLayersPanel'
 import FeaturePhotoPanel from './FeaturePhotoPanel'
+import FeatureCommentThread from './FeatureCommentThread'
 import { makePatternFill } from './fillPatterns'
 import { resolveExtStyle, type ExtStyleResolved } from './extStyle'
 import DraggableModal from '@/components/DraggableModal'
@@ -6388,6 +6389,10 @@ export default function MapPage() {
               {/* Photo attachments — project features only */}
               {featureModalMeta?.featureId && (
                 <FeaturePhotoPanel featureId={featureModalMeta.featureId} />
+              )}
+              {/* Per-feature remark thread (Checker/Approver ↔ Surveyor) */}
+              {featureModalMeta?.featureId && (
+                <FeatureCommentThread featureId={featureModalMeta.featureId} />
               )}
               {featureModalMeta?.layerType === 'external' && (
                 <div style={{

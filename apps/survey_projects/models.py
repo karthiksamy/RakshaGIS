@@ -564,6 +564,9 @@ class ShapefileImport(models.Model):
     error              = models.TextField(blank=True)
     ai_processed       = models.BooleanField(default=False)
     ai_summary         = models.TextField(blank=True)
+    # Post-import QA results, shown inline in the import modal.
+    # List of {level: 'error'|'warning'|'info', code: str, message: str}.
+    validation_warnings = models.JSONField(default=list, blank=True)
     created_by         = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='shapefile_imports'
     )
@@ -930,6 +933,32 @@ class TopologyRule(models.Model):
 
     def __str__(self):
         return f"{self.project.project_number} / {self.rule_type} on {self.layer_a}"
+
+
+# ── Per-feature comment threads ───────────────────────────────────────────────
+
+class FeatureComment(models.Model):
+    """Discussion thread attached to a single GISFeature.
+
+    Lets Checker/Approver leave remarks directly on a geometry without opening
+    a formal dispute — replaces the WhatsApp/email back-channel.
+    """
+    feature = models.ForeignKey(
+        GISFeature, on_delete=models.CASCADE, related_name='comments'
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='feature_comments',
+    )
+    text = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [models.Index(fields=['feature', 'created_at'])]
+
+    def __str__(self):
+        return f"Comment by {self.user} on feature #{self.feature_id}"
 
 
 # ── Time-series / versioning models ──────────────────────────────────────────

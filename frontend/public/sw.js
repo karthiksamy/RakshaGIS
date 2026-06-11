@@ -90,10 +90,14 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.includes('/api/')) {
     event.respondWith(
       fetch(event.request).catch(() => {
-        return caches.match(event.request) || new Response(JSON.stringify({ detail: "You are currently offline." }), {
-          status: 503,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        // caches.match resolves to undefined on miss — must await it before
+        // falling back, otherwise respondWith may receive undefined.
+        return caches.match(event.request).then((cached) =>
+          cached || new Response(JSON.stringify({ detail: "You are currently offline." }), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' }
+          })
+        );
       })
     );
     return;

@@ -353,16 +353,11 @@ export default function TerrainPage() {
       Cesium.CesiumTerrainProvider.fromUrl(terrainUrl, { requestVertexNormals: true })
         .then((tp) => { terrainProvider = tp; initViewer(tp) })
         .catch(() => {
-          // Local terrain server not reachable (tiles not yet set up, or server
-          // not started). Fall back to Ion if a token is configured, so the
-          // globe still shows 3D terrain while the user runs setup_terrain.sh.
-          if (token) {
-            Cesium.CesiumTerrainProvider.fromIonAssetId(1)
-              .then((tp) => initViewer(tp))
-              .catch(() => initViewer(new Cesium.EllipsoidTerrainProvider()))
-          } else {
-            initViewer(new Cesium.EllipsoidTerrainProvider())
-          }
+          // Local terrain server not reachable (tiles not yet set up or server
+          // not started). Use flat ellipsoid — silently, without Ion fallback,
+          // to avoid 401 "InvalidCredentials" when no real Ion token is set.
+          // Users should run setup_terrain.sh and start terrain-server to enable 3D terrain.
+          initViewer(new Cesium.EllipsoidTerrainProvider())
         })
     } else {
       initViewer(new Cesium.EllipsoidTerrainProvider())
@@ -931,7 +926,14 @@ export default function TerrainPage() {
 
   // ── Export helpers ──────────────────────────────────────────────────────────
 
-  const exportPNG = useCallback(async () => {
+  const composeScenePNG = useCallback(async (opts: {
+    subtitle?: string
+    legendTitle?: string
+    legendItems?: { label: string; color?: string }[]
+    statsTitle?: string
+    statLines?: string[]
+    filename: string
+  }) => {
     const viewer = viewerRef.current
     if (!viewer) return
     setExporting(true)
@@ -957,60 +959,53 @@ export default function TerrainPage() {
       ctx.fillText('RakshaGIS — Terrain Analysis', pad, Math.round(fs * 2))
       ctx.fillStyle = '#999'
       ctx.font = `${Math.round(fs * 0.82)}px sans-serif`
-      ctx.fillText(`${new Date().toLocaleString()}  ·  ${terrainLabel}`, pad, Math.round(fs * 3.3))
+      const sub = opts.subtitle ? `  ·  ${opts.subtitle}` : ''
+      ctx.fillText(`${new Date().toLocaleString()}  ·  ${terrainLabel}${sub}`, pad, Math.round(fs * 3.3))
 
-      // ── Slope Legend (bottom-left) ───────────────────────────────
-      const legendItems = [
-        { label: 'Flat      0–5°',    color: '#52c41a' },
-        { label: 'Gentle   5–15°',   color: '#a0d911' },
-        { label: 'Moderate 15–30°',  color: '#faad14' },
-        { label: 'Steep    30–45°',  color: '#fa8c16' },
-        { label: 'V.Steep  ≥45°',    color: '#ff4d4f' },
-      ]
-      const legW = Math.round(fs * 14.5)
-      const legH = legendItems.length * rowH + Math.round(fs * 3.2)
-      const legX = pad, legY = H - legH - pad
-      ctx.fillStyle = 'rgba(10,12,28,0.85)'
-      ctx.fillRect(legX, legY, legW, legH)
-      ctx.fillStyle = '#4fc3f7'
-      ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
-      ctx.fillText('Slope Legend', legX + 10, legY + Math.round(fs * 1.6))
-      legendItems.forEach((it, i) => {
-        const iy = legY + Math.round(fs * 2.9) + i * rowH
-        ctx.fillStyle = it.color
-        ctx.fillRect(legX + 10, iy - Math.round(fs * 0.95), Math.round(fs * 1.1), Math.round(fs * 1.1))
-        ctx.fillStyle = '#ddd'
-        ctx.font = `${Math.round(fs * 0.82)}px monospace`
-        ctx.fillText(it.label, legX + 10 + Math.round(fs * 1.5), iy)
-      })
+      // ── Legend (bottom-left) ─────────────────────────────────────
+      if (opts.legendItems?.length) {
+        const legendItems = opts.legendItems
+        const legW = Math.round(fs * 0.62 * Math.max(
+          (opts.legendTitle ?? '').length + 4,
+          ...legendItems.map(it => it.label.length + 5),
+          22,
+        ))
+        const legH = legendItems.length * rowH + Math.round(fs * 3.2)
+        const legX = pad, legY = H - legH - pad
+        ctx.fillStyle = 'rgba(10,12,28,0.85)'
+        ctx.fillRect(legX, legY, legW, legH)
+        ctx.fillStyle = '#4fc3f7'
+        ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
+        ctx.fillText(opts.legendTitle ?? 'Legend', legX + 10, legY + Math.round(fs * 1.6))
+        legendItems.forEach((it, i) => {
+          const iy = legY + Math.round(fs * 2.9) + i * rowH
+          if (it.color) {
+            ctx.fillStyle = it.color
+            ctx.fillRect(legX + 10, iy - Math.round(fs * 0.95), Math.round(fs * 1.1), Math.round(fs * 1.1))
+          }
+          ctx.fillStyle = '#ddd'
+          ctx.font = `${Math.round(fs * 0.82)}px monospace`
+          ctx.fillText(it.label, legX + 10 + Math.round(fs * 1.5), iy)
+        })
+      }
 
-      // ── Slope Statistics (bottom-right) ─────────────────────────
-      if (slopeStats) {
-        const desc = slopeStats.avg < 5 ? 'Mostly flat'
-          : slopeStats.avg < 15 ? 'Gentle slopes'
-          : slopeStats.avg < 30 ? 'Moderate terrain' : 'Steep terrain'
-        const statLines = [
-          `Min  ${slopeStats.min.toFixed(1)}°`,
-          `Avg  ${slopeStats.avg.toFixed(1)}°  (${desc})`,
-          `Max  ${slopeStats.max.toFixed(1)}°`,
-          `Grid ${slopeStats.gridSize}×${slopeStats.gridSize} pts`,
-          `─────────────────────`,
-          `Flat      ${slopeStats.categories.flat.toFixed(1)}%`,
-          `Gentle    ${slopeStats.categories.gentle.toFixed(1)}%`,
-          `Moderate  ${slopeStats.categories.moderate.toFixed(1)}%`,
-          `Steep     ${slopeStats.categories.steep.toFixed(1)}%`,
-          `V.Steep   ${slopeStats.categories.verysteep.toFixed(1)}%`,
-        ]
-        const stW = Math.round(fs * 18.5)
+      // ── Statistics (bottom-right) ────────────────────────────────
+      if (opts.statLines?.length) {
+        const statLines = opts.statLines
+        const stW = Math.round(fs * 0.62 * Math.max(
+          (opts.statsTitle ?? '').length + 4,
+          ...statLines.map(l => l.length + 3),
+          26,
+        ))
         const stH = statLines.length * rowH + Math.round(fs * 3.2)
         const stX = W - stW - pad, stY = H - stH - pad
         ctx.fillStyle = 'rgba(10,12,28,0.85)'
         ctx.fillRect(stX, stY, stW, stH)
         ctx.fillStyle = '#4fc3f7'
         ctx.font = `bold ${Math.round(fs * 0.9)}px sans-serif`
-        ctx.fillText('Slope Statistics', stX + 10, stY + Math.round(fs * 1.6))
+        ctx.fillText(opts.statsTitle ?? 'Statistics', stX + 10, stY + Math.round(fs * 1.6))
         statLines.forEach((ln, i) => {
-          ctx.fillStyle = i === 4 ? '#333' : '#ddd'
+          ctx.fillStyle = ln.startsWith('─') ? '#333' : '#ddd'
           ctx.font = `${Math.round(fs * 0.82)}px monospace`
           ctx.fillText(ln, stX + 10, stY + Math.round(fs * 2.9) + i * rowH)
         })
@@ -1055,7 +1050,7 @@ export default function TerrainPage() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.png`
+      a.download = opts.filename
       a.click()
       URL.revokeObjectURL(url)
       message.success('PNG exported')
@@ -1064,7 +1059,55 @@ export default function TerrainPage() {
     } finally {
       setExporting(false)
     }
-  }, [slopeStats, clickedElev, terrainLabel])
+  }, [clickedElev, terrainLabel])
+
+  const exportPNG = useCallback(async () => {
+    const statLines = slopeStats ? [
+      `Min  ${slopeStats.min.toFixed(1)}°`,
+      `Avg  ${slopeStats.avg.toFixed(1)}°  (${
+        slopeStats.avg < 5 ? 'Mostly flat'
+        : slopeStats.avg < 15 ? 'Gentle slopes'
+        : slopeStats.avg < 30 ? 'Moderate terrain' : 'Steep terrain'})`,
+      `Max  ${slopeStats.max.toFixed(1)}°`,
+      `Grid ${slopeStats.gridSize}×${slopeStats.gridSize} pts`,
+      `─────────────────────`,
+      `Flat      ${slopeStats.categories.flat.toFixed(1)}%`,
+      `Gentle    ${slopeStats.categories.gentle.toFixed(1)}%`,
+      `Moderate  ${slopeStats.categories.moderate.toFixed(1)}%`,
+      `Steep     ${slopeStats.categories.steep.toFixed(1)}%`,
+      `V.Steep   ${slopeStats.categories.verysteep.toFixed(1)}%`,
+    ] : undefined
+    await composeScenePNG({
+      legendTitle: 'Slope Legend',
+      legendItems: [
+        { label: 'Flat      0–5°',   color: '#52c41a' },
+        { label: 'Gentle   5–15°',   color: '#a0d911' },
+        { label: 'Moderate 15–30°',  color: '#faad14' },
+        { label: 'Steep    30–45°',  color: '#fa8c16' },
+        { label: 'V.Steep  ≥45°',    color: '#ff4d4f' },
+      ],
+      statsTitle: 'Slope Statistics',
+      statLines,
+      filename: `rakshagis-terrain-${new Date().toISOString().slice(0, 10)}.png`,
+    })
+  }, [composeScenePNG, slopeStats])
+
+  // Scene PNG for DEM Analysis tools — same layout, tool-specific legend/stats
+  const demScenePNG = useCallback(async (
+    toolLabel: string,
+    legendItems: { label: string; color?: string }[],
+    statLines: string[],
+  ) => {
+    const slug = toolLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+    await composeScenePNG({
+      subtitle: toolLabel,
+      legendTitle: `${toolLabel} Legend`,
+      legendItems,
+      statsTitle: `${toolLabel} Statistics`,
+      statLines,
+      filename: `rakshagis-dem-${slug}-${new Date().toISOString().slice(0, 10)}.png`,
+    })
+  }, [composeScenePNG])
 
   const exportPDF = useCallback(async () => {
     setExporting(true)
@@ -1804,6 +1847,7 @@ export default function TerrainPage() {
                 referenceGrid={referenceGrid}
                 onOverlay={handleDemOverlay}
                 onClearOverlays={handleClearDemOverlays}
+                onScenePNG={demScenePNG}
               />
             )}
 

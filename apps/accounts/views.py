@@ -295,19 +295,40 @@ class CustomLoginView(APIView):
             )
             return Response({'detail': 'Account is disabled.'}, status=status.HTTP_401_UNAUTHORIZED)
 
-        # Check 2FA
+        # ── 2FA is MANDATORY ───────────────────────────────────────────────
+        # Tokens are only ever issued after a successful TOTP verification:
+        #   enabled device      → requires_2fa       (enter OTP)
+        #   no / unconfirmed    → requires_2fa_setup (forced registration)
+        pending = TwoFactorPendingAuth.objects.create(user=user)
         try:
             device = user.two_factor
-            if device.is_enabled:
-                pending = TwoFactorPendingAuth.objects.create(user=user)
-                return Response({
-                    'requires_2fa': True,
-                    'pre_auth_key': str(pending.token),
-                })
         except TwoFactorDevice.DoesNotExist:
-            pass
+            device = None
 
-        return _issue_tokens(user, ip, ua)
+        if device and device.is_enabled:
+            return Response({
+                'requires_2fa': True,
+                'pre_auth_key': str(pending.token),
+            })
+
+        return Response({
+            'requires_2fa_setup': True,
+            'pre_auth_key': str(pending.token),
+        })
+
+
+def _resolve_pending_auth(pre_auth_key):
+    """Return a valid TwoFactorPendingAuth or None (invalid/expired/garbage)."""
+    if not pre_auth_key:
+        return None
+    try:
+        pending = TwoFactorPendingAuth.objects.select_related('user').get(token=pre_auth_key)
+    except Exception:   # DoesNotExist or invalid UUID
+        return None
+    if pending.is_expired():
+        pending.delete()
+        return None
+    return pending
 
 
 class TwoFactorCompleteView(APIView):
@@ -316,28 +337,102 @@ class TwoFactorCompleteView(APIView):
     def post(self, request):
         import pyotp
         pre_auth_key = request.data.get('pre_auth_key', '')
-        totp_code = request.data.get('totp_code', '')
+        totp_code = str(request.data.get('totp_code', '')).strip().replace(' ', '')
         ip = _get_client_ip(request)
         ua = request.META.get('HTTP_USER_AGENT', '')
 
-        try:
-            pending = TwoFactorPendingAuth.objects.select_related('user').get(token=pre_auth_key)
-        except TwoFactorPendingAuth.DoesNotExist:
-            return Response({'detail': 'Invalid or expired pre-auth key.'}, status=401)
-
-        if pending.is_expired():
-            pending.delete()
-            return Response({'detail': 'Pre-auth session expired. Please log in again.'}, status=401)
+        pending = _resolve_pending_auth(pre_auth_key)
+        if not pending:
+            return Response({'detail': 'Login session expired. Please log in again.'}, status=401)
 
         user = pending.user
         try:
             device = user.two_factor
+            # valid_window=2 → ±60 s tolerance for phone/server clock drift
             totp = pyotp.TOTP(device.secret)
-            if not totp.verify(totp_code, valid_window=1):
+            if not totp.verify(totp_code, valid_window=2):
+                LoginAuditLog.objects.create(
+                    user=user, username_attempted=user.username, success=False,
+                    ip_address=ip, user_agent=ua[:500], failure_reason='Invalid 2FA code',
+                )
                 return Response({'detail': 'Invalid authenticator code.'}, status=400)
         except TwoFactorDevice.DoesNotExist:
             return Response({'detail': 'No 2FA device configured.'}, status=400)
 
+        pending.delete()
+        return _issue_tokens(user, ip, ua)
+
+
+class TwoFactorSetupBeginView(APIView):
+    """Pre-auth 2FA enrollment (mandatory 2FA, first login).
+
+    POST {pre_auth_key} → {qr_code, secret}
+    Only valid while the device is NOT yet enabled; once enabled the normal
+    OTP flow (TwoFactorCompleteView) must be used.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        import pyotp, qrcode, io, base64
+        pending = _resolve_pending_auth(request.data.get('pre_auth_key', ''))
+        if not pending:
+            return Response({'detail': 'Login session expired. Please log in again.'}, status=401)
+
+        device, _ = TwoFactorDevice.objects.get_or_create(user=pending.user)
+        if device.is_enabled:
+            return Response({'detail': '2FA already enabled. Use your authenticator code.'}, status=400)
+        if not device.secret:
+            device.secret = pyotp.random_base32()
+            device.save(update_fields=['secret'])
+
+        totp = pyotp.TOTP(device.secret)
+        uri = totp.provisioning_uri(name=pending.user.username, issuer_name='RakshaGIS')
+        img = qrcode.make(uri)
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        qr_b64 = base64.b64encode(buf.getvalue()).decode()
+        return Response({
+            'secret': device.secret,
+            'qr_code': f'data:image/png;base64,{qr_b64}',
+        })
+
+
+class TwoFactorSetupCompleteView(APIView):
+    """Verify the first TOTP code, enable the device and issue tokens.
+
+    POST {pre_auth_key, code} → {access, refresh}
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        import pyotp
+        code = str(request.data.get('code', '')).strip().replace(' ', '')
+        ip = _get_client_ip(request)
+        ua = request.META.get('HTTP_USER_AGENT', '')
+
+        pending = _resolve_pending_auth(request.data.get('pre_auth_key', ''))
+        if not pending:
+            return Response({'detail': 'Login session expired. Please log in again.'}, status=401)
+
+        user = pending.user
+        try:
+            device = user.two_factor
+        except TwoFactorDevice.DoesNotExist:
+            return Response({'detail': 'Scan the QR code first.'}, status=400)
+        if not device.secret:
+            return Response({'detail': 'Scan the QR code first.'}, status=400)
+
+        totp = pyotp.TOTP(device.secret)
+        if not totp.verify(code, valid_window=2):
+            LoginAuditLog.objects.create(
+                user=user, username_attempted=user.username, success=False,
+                ip_address=ip, user_agent=ua[:500], failure_reason='Invalid 2FA code (enrollment)',
+            )
+            return Response({'detail': 'Invalid code. Check your authenticator app and try again.'}, status=400)
+
+        device.is_enabled = True
+        device.confirmed_at = timezone.now()
+        device.save(update_fields=['is_enabled', 'confirmed_at'])
         pending.delete()
         return _issue_tokens(user, ip, ua)
 
@@ -371,14 +466,14 @@ class TwoFactorSetupView(APIView):
     def post(self, request):
         """Verify TOTP code and enable 2FA."""
         import pyotp
-        code = request.data.get('code', '')
+        code = str(request.data.get('code', '')).strip().replace(' ', '')
         try:
             device = request.user.two_factor
         except TwoFactorDevice.DoesNotExist:
             return Response({'detail': 'Run GET first to generate secret.'}, status=400)
 
         totp = pyotp.TOTP(device.secret)
-        if not totp.verify(code, valid_window=1):
+        if not totp.verify(code, valid_window=2):
             return Response({'detail': 'Invalid code.'}, status=400)
 
         device.is_enabled = True

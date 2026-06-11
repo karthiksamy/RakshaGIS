@@ -173,6 +173,124 @@ def _export_gis_features(zf: zipfile.ZipFile, folder_ids: set, base_prefix: str,
     return provenance_entries
 
 
+def _export_gis_features_dxf(zf: zipfile.ZipFile, folder_ids: set, base_prefix: str,
+                              progress_cb) -> list[dict]:
+    """
+    Write GIS features (grouped by layer_name) as AutoCAD DXF files into the ZIP.
+    Each layer becomes one .dxf under GIS_Features_DXF/{layer_name}/{layer_name}.dxf.
+    Geometry → LWPOLYLINE / POINT entities; attributes written as XDATA strings.
+    Returns a list of provenance entries.
+    """
+    import json as _json
+    from collections import defaultdict
+    from apps.survey_projects.models import GISFeature
+
+    try:
+        import ezdxf
+        from ezdxf.enums import TextEntityAlignment
+    except ImportError:
+        logger.warning("ezdxf not installed — skipping DXF export")
+        return []
+
+    features = list(
+        GISFeature.objects.filter(is_deleted=False, folder_id__in=folder_ids)
+        .only('layer_name', 'geometry', 'geometry_type', 'feature_id', 'attributes')
+    )
+    if not features:
+        return []
+
+    layers: dict[str, list] = defaultdict(list)
+    for f in features:
+        layers[f.layer_name].append(f)
+
+    provenance_entries = []
+    prefix = f"{base_prefix}GIS_Features_DXF"
+
+    for layer_name, feats in layers.items():
+        progress_cb(f"Exporting DXF layer: {layer_name}")
+        safe_layer = _safe(layer_name, 40)
+
+        doc = ezdxf.new('R2010')
+        doc.units = ezdxf.units.M
+        msp = doc.modelspace()
+
+        # Register application id for XDATA attribute storage
+        APP_ID = 'RAKSHA_GIS'
+        doc.appids.new(APP_ID)
+
+        # Create a named layer in the DXF
+        doc.layers.new(name=safe_layer, dxfattribs={'color': 2})
+
+        for feat in feats:
+            try:
+                geom = _json.loads(feat.geometry.geojson)
+                gtype = geom.get('type', '')
+                coords = geom.get('coordinates', [])
+
+                xdata_strings = [
+                    (1000, f"feature_id:{feat.feature_id or ''}"),
+                    (1000, f"layer:{feat.layer_name or ''}"),
+                ]
+                if isinstance(feat.attributes, dict):
+                    for k, v in feat.attributes.items():
+                        xdata_strings.append((1000, f"{k[:50]}:{str(v)[:100]}"))
+
+                dxf_attrs = {'layer': safe_layer}
+
+                if gtype == 'Point':
+                    lon, lat = coords[0], coords[1]
+                    pt = msp.add_point((lon, lat, 0), dxfattribs=dxf_attrs)
+                    pt.set_xdata(APP_ID, xdata_strings)
+
+                elif gtype == 'LineString':
+                    if len(coords) >= 2:
+                        pts2d = [(c[0], c[1]) for c in coords]
+                        poly = msp.add_lwpolyline(pts2d, dxfattribs=dxf_attrs)
+                        poly.set_xdata(APP_ID, xdata_strings)
+
+                elif gtype == 'Polygon':
+                    # Outer ring only; inner rings (holes) not representable in LWPOLYLINE
+                    ring = coords[0] if coords else []
+                    if len(ring) >= 2:
+                        pts2d = [(c[0], c[1]) for c in ring]
+                        poly = msp.add_lwpolyline(pts2d, close=True, dxfattribs=dxf_attrs)
+                        poly.set_xdata(APP_ID, xdata_strings)
+
+                elif gtype == 'MultiPoint':
+                    for c in coords:
+                        pt = msp.add_point((c[0], c[1], 0), dxfattribs=dxf_attrs)
+                        pt.set_xdata(APP_ID, xdata_strings)
+
+                elif gtype in ('MultiLineString', 'MultiPolygon'):
+                    rings = coords if gtype == 'MultiLineString' else [r[0] for r in coords if r]
+                    for ring in rings:
+                        if len(ring) >= 2:
+                            pts2d = [(c[0], c[1]) for c in ring]
+                            poly = msp.add_lwpolyline(pts2d, close=(gtype == 'MultiPolygon'),
+                                                      dxfattribs=dxf_attrs)
+                            poly.set_xdata(APP_ID, xdata_strings)
+
+            except Exception as exc:
+                logger.debug("DXF: skipping feature %s: %s", feat.pk, exc)
+                continue
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dxf_path = os.path.join(tmpdir, f'{safe_layer}.dxf')
+            doc.saveas(dxf_path)
+            arc = f"{prefix}/{safe_layer}/{safe_layer}.dxf"
+            zf.write(dxf_path, arc)
+
+        provenance_entries.append({
+            'type': 'gis_features_dxf',
+            'layer': layer_name,
+            'feature_count': len(feats),
+            'path': f"{prefix}/{safe_layer}/{safe_layer}.dxf",
+            'format': 'AutoCAD DXF R2010 (EPSG:4326 decimal degrees)',
+        })
+
+    return provenance_entries
+
+
 def _export_documents(zf: zipfile.ZipFile, folder_ids: set, base_prefix: str,
                       meta_base: dict, progress_cb) -> list[dict]:
     """Write Documents into the ZIP with C2PA/legacy watermarks."""
@@ -283,7 +401,8 @@ def _export_shapefile_uploads(zf: zipfile.ZipFile, folder_ids: set, base_prefix:
 
 
 def _build_area_zip_contents(zf: zipfile.ZipFile, area, base_prefix: str,
-                              meta_base: dict, progress_cb) -> list[dict]:
+                              meta_base: dict, progress_cb,
+                              include_dxf: bool = False) -> list[dict]:
     """
     Add all content for one survey area into the ZipFile under base_prefix.
     Returns a list of provenance entries for the area.
@@ -296,6 +415,8 @@ def _build_area_zip_contents(zf: zipfile.ZipFile, area, base_prefix: str,
 
     entries = []
     entries += _export_gis_features(zf, folder_ids, base_prefix, meta_base, progress_cb)
+    if include_dxf:
+        entries += _export_gis_features_dxf(zf, folder_ids, base_prefix, progress_cb)
     entries += _export_documents(zf, folder_ids, base_prefix, meta_base, progress_cb)
     entries += _export_rasters(zf, folder_ids, base_prefix, meta_base, progress_cb)
     entries += _export_shapefile_uploads(zf, folder_ids, base_prefix, meta_base, progress_cb)
@@ -364,6 +485,7 @@ def build_export_zip(self, export_task_id: int) -> None:
                     base_prefix=f"{archive_root}/",
                     meta_base=meta_base,
                     progress_cb=progress,
+                    include_dxf=et.include_dxf,
                 )
                 provenance_map[archive_root] = entries
 
@@ -405,6 +527,7 @@ def build_export_zip(self, export_task_id: int) -> None:
                         base_prefix=area_prefix,
                         meta_base=area_meta,
                         progress_cb=progress,
+                        include_dxf=et.include_dxf,
                     )
                     provenance_map[safe_area] = entries
 
@@ -481,8 +604,8 @@ def _make_readme(area_name, project_number, contents, meta_base: dict) -> str:
         "",
         "FOLDER STRUCTURE",
         "----------------",
-        "  GIS_Features/    — Vector features exported as ESRI Shapefiles (EPSG:4326)",
-        "                     One sub-folder per layer name.",
+        "  GIS_Features/     — Vector features as ESRI Shapefiles (EPSG:4326), one sub-folder per layer.",
+        "  GIS_Features_DXF/ — Same features as AutoCAD DXF R2010 (decimal degrees).",
         "  Documents/        — Uploaded documents (DOCX, PDF, etc.)",
         "  Rasters/          — GeoTIFF drone rasters",
         "  Shapefile_Uploads/ — Original shapefile ZIPs uploaded by field teams",
@@ -972,3 +1095,105 @@ def purge_expired_upload_sessions() -> None:
 
     if count:
         logger.info('purge_expired_upload_sessions: removed %d expired session(s)', count)
+
+
+# ---------------------------------------------------------------------------
+# Sentinel-2 tile pre-cache
+# ---------------------------------------------------------------------------
+
+def _tile_bounds(z: int, x: int, y: int):
+    """Return (lon_west, lat_south, lon_east, lat_north) for a slippy-map tile."""
+    import math
+    n = 2 ** z
+    lon_west  = x / n * 360.0 - 180.0
+    lon_east  = (x + 1) / n * 360.0 - 180.0
+    lat_north = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    lat_south = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+    return lon_west, lat_south, lon_east, lat_north
+
+
+def _tiles_for_bbox(west: float, south: float, east: float, north: float, zoom: int):
+    """Yield (z, x, y) tile indices that intersect the given bounding box."""
+    import math
+
+    def lon2tile(lon, z):
+        return int((lon + 180.0) / 360.0 * (2 ** z))
+
+    def lat2tile(lat, z):
+        lat_r = math.radians(lat)
+        return int((1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * (2 ** z))
+
+    x_min = lon2tile(west, zoom)
+    x_max = lon2tile(east, zoom)
+    y_min = lat2tile(north, zoom)  # note: y increases southward
+    y_max = lat2tile(south, zoom)
+
+    for x in range(x_min, x_max + 1):
+        for y in range(y_min, y_max + 1):
+            yield zoom, x, y
+
+
+@shared_task
+def cache_sentinel2_tiles() -> None:
+    """
+    Pre-fetch WMTS tiles from the configured Sentinel-2 URL for every active
+    SENTINEL2 BasemapConfig that has an AOI (bounds_*) defined.
+
+    Tiles are stored at MEDIA_ROOT/tile_cache/sentinel2/<pk>/{z}/{x}/{y}.jpg
+    so the tile_proxy view can serve them offline.
+
+    Only tiles at zoom levels 0..cache_zoom_max are fetched; this keeps the
+    cache size manageable (a 100 × 100 km area at z=13 is ~400 tiles).
+    """
+    import urllib.request
+    from apps.core.models import BasemapConfig
+
+    basemaps = BasemapConfig.objects.filter(provider=BasemapConfig.SENTINEL2, is_active=True)
+    fetched = skipped = errors = 0
+
+    for bm in basemaps:
+        # Skip if no AOI defined or no URL template
+        if None in (bm.bounds_west, bm.bounds_south, bm.bounds_east, bm.bounds_north):
+            logger.info("cache_sentinel2_tiles: basemap %s has no AOI bounds — skipping", bm.pk)
+            continue
+        if not bm.url_template:
+            logger.info("cache_sentinel2_tiles: basemap %s has no url_template — skipping", bm.pk)
+            continue
+
+        cache_root = os.path.join(settings.MEDIA_ROOT, 'tile_cache', 'sentinel2', str(bm.pk))
+        os.makedirs(cache_root, exist_ok=True)
+
+        for z in range(0, bm.cache_zoom_max + 1):
+            for _, x, y in _tiles_for_bbox(
+                bm.bounds_west, bm.bounds_south, bm.bounds_east, bm.bounds_north, z
+            ):
+                tile_path = os.path.join(cache_root, str(z), str(x), f"{y}.jpg")
+                if os.path.exists(tile_path):
+                    skipped += 1
+                    continue
+
+                # Build the tile URL from the template (supports {z}/{x}/{y} and WMTS {TileMatrix}/{TileRow}/{TileCol})
+                url = (
+                    bm.url_template
+                    .replace('{z}', str(z)).replace('{x}', str(x)).replace('{y}', str(y))
+                    .replace('{TileMatrix}', str(z))
+                    .replace('{TileCol}', str(x))
+                    .replace('{TileRow}', str(y))
+                )
+
+                try:
+                    os.makedirs(os.path.dirname(tile_path), exist_ok=True)
+                    req = urllib.request.Request(url, headers={'User-Agent': 'RakshaGIS/1.0'})
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = resp.read()
+                    with open(tile_path, 'wb') as fh:
+                        fh.write(data)
+                    fetched += 1
+                except Exception as exc:
+                    logger.debug("cache_sentinel2_tiles: failed to fetch %s: %s", url, exc)
+                    errors += 1
+
+    logger.info(
+        "cache_sentinel2_tiles complete: fetched=%d skipped=%d errors=%d",
+        fetched, skipped, errors,
+    )

@@ -39,14 +39,15 @@ def _basemap_tiff_upload_path(instance, filename):
 
 
 class BasemapConfig(models.Model):
-    OSM       = 'OSM'
-    XYZ       = 'XYZ'
-    WMS       = 'WMS'
-    WMTS      = 'WMTS'
-    BING      = 'BING'
-    BHUVAN    = 'BHUVAN'
-    ARCGIS    = 'ARCGIS'
-    LOCAL_COG = 'LOCAL_COG'   # Field-office uploaded GeoTIFF, converted to COG
+    OSM        = 'OSM'
+    XYZ        = 'XYZ'
+    WMS        = 'WMS'
+    WMTS       = 'WMTS'
+    BING       = 'BING'
+    BHUVAN     = 'BHUVAN'
+    ARCGIS     = 'ARCGIS'
+    LOCAL_COG  = 'LOCAL_COG'   # Field-office uploaded GeoTIFF, converted to COG
+    SENTINEL2  = 'SENTINEL2'   # Copernicus Sentinel-2 optical imagery (10 m, ~5-day revisit)
 
     PROVIDER_CHOICES = [
         (OSM,       'OpenStreetMap'),
@@ -57,6 +58,7 @@ class BasemapConfig(models.Model):
         (BHUVAN,    'Bhuvan (ISRO India)'),
         (ARCGIS,    'ArcGIS Map Service'),
         (LOCAL_COG, 'Local Basemap (uploaded GeoTIFF)'),
+        (SENTINEL2, 'Sentinel-2 Satellite (Copernicus, free)'),
     ]
 
     # COG processing states (used when provider == LOCAL_COG)
@@ -116,6 +118,15 @@ class BasemapConfig(models.Model):
     bounds_south  = models.FloatField(null=True, blank=True)
     bounds_east   = models.FloatField(null=True, blank=True)
     bounds_north  = models.FloatField(null=True, blank=True)
+
+    # ── SENTINEL2 fields ──────────────────────────────────────────────────────
+    # Maximum zoom level to pre-cache; tiles at z ≤ cache_zoom_max for the
+    # configured AOI (bounds_*) are fetched by the Celery beat task and stored
+    # under MEDIA_ROOT/tile_cache/sentinel2/<pk>/{z}/{x}/{y}.jpg for offline use.
+    cache_zoom_max = models.SmallIntegerField(
+        default=13, blank=True,
+        help_text='Highest zoom level to pre-cache (SENTINEL2 only, 8–15 recommended).',
+    )
 
     created_by    = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='basemap_configs',
@@ -207,6 +218,8 @@ class ExportTask(models.Model):
     # Progress message surfaced to the frontend
     progress_msg   = models.CharField(max_length=255, blank=True)
     error          = models.TextField(blank=True)
+    # When True, _export_gis_features_dxf() writes a DXF alongside the Shapefiles
+    include_dxf    = models.BooleanField(default=False)
     requested_by   = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='export_tasks'
     )

@@ -191,6 +191,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.workflow.tasks.run_encroachment_scan',
         'schedule': crontab(hour='6,14', minute=0),
     },
+    # Pre-cache Sentinel-2 tiles for configured AOIs (every 6 hours)
+    'cache-sentinel2-tiles': {
+        'task': 'apps.core.tasks.cache_sentinel2_tiles',
+        'schedule': crontab(hour='*/6', minute=30),
+    },
 }
 
 # Email (set EMAIL_BACKEND to smtp for production; console for local dev)

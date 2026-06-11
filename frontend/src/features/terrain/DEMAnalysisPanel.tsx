@@ -39,6 +39,87 @@ interface Props {
   referenceGrid: SlopeGridData | null
   onOverlay: (layer: DEMLayer) => void
   onClearOverlays: () => void
+  /** Capture the 3D globe with title bar, legend and statistics panels burnt in. */
+  onScenePNG?: (
+    toolLabel: string,
+    legendItems: { label: string; color?: string }[],
+    statLines: string[],
+  ) => Promise<void> | void
+}
+
+// ── per-tool legends for the exported scene PNG ─────────────────────────────
+
+const TOOL_LEGENDS: Record<string, { label: string; color?: string }[]> = {
+  contours:       [{ label: 'Contour line',     color: '#d97706' },
+                   { label: 'Index contour',    color: '#92400e' }],
+  aspect_map:     [{ label: 'N',  color: '#5b9bd5' }, { label: 'NE', color: '#56ccf2' },
+                   { label: 'E',  color: '#e74c3c' }, { label: 'SE', color: '#e67e22' },
+                   { label: 'S',  color: '#f1c40f' }, { label: 'SW', color: '#2ecc71' },
+                   { label: 'W',  color: '#1abc9c' }, { label: 'NW', color: '#9b59b6' }],
+  curvature:      [{ label: 'Convex (ridge)',   color: '#ef4444' },
+                   { label: 'Flat',             color: '#e5e7eb' },
+                   { label: 'Concave (valley)', color: '#3b82f6' }],
+  viewshed:       [{ label: 'Visible',          color: '#22c55e' },
+                   { label: 'Hidden',           color: '#ef4444' },
+                   { label: 'Observer',         color: '#facc15' }],
+  volume:         [{ label: 'Cut (above plane)', color: '#fa8c16' },
+                   { label: 'Fill (below plane)', color: '#2f54eb' }],
+  cut_fill:       [{ label: 'Cut',              color: '#fa8c16' },
+                   { label: 'Fill',             color: '#2f54eb' }],
+  flood:          [{ label: 'Shallow water',    color: '#60a5fa' },
+                   { label: 'Deep water',       color: '#1e3a8a' }],
+  landslide:      [{ label: 'Low risk',         color: '#22c55e' },
+                   { label: 'Moderate',         color: '#eab308' },
+                   { label: 'High',             color: '#f97316' },
+                   { label: 'Very high',        color: '#ef4444' }],
+  watershed:      [{ label: 'Drainage basin',   color: '#08979c' },
+                   { label: 'Outlet point',     color: '#facc15' }],
+  cross_section:  [{ label: 'N–S profile',      color: '#4fc3f7' },
+                   { label: 'E–W profile',      color: '#fa8c16' }],
+  twi:            [{ label: 'Dry',              color: '#d97706' },
+                   { label: 'Moist',            color: '#22c55e' },
+                   { label: 'Wet / waterlogged', color: '#1d4ed8' }],
+  solar_shadow:   [{ label: 'Sunlit',           color: '#fde047' },
+                   { label: 'Shadow',           color: '#312e81' }],
+  trafficability: [{ label: 'Easy going',       color: '#22c55e' },
+                   { label: 'Moderate',         color: '#eab308' },
+                   { label: 'Difficult',        color: '#f97316' },
+                   { label: 'Impassable',       color: '#ef4444' }],
+  change_detection: [{ label: 'Material gained', color: '#ef4444' },
+                   { label: 'No change',        color: '#e5e7eb' },
+                   { label: 'Material lost',    color: '#3b82f6' }],
+  lz_assessment:  [{ label: 'Excellent LZ',     color: '#22c55e' },
+                   { label: 'Marginal',         color: '#eab308' },
+                   { label: 'Unsuitable',       color: '#ef4444' }],
+  rf_coverage:    [{ label: 'Clear LoS',        color: '#22c55e' },
+                   { label: 'Partial Fresnel',  color: '#eab308' },
+                   { label: 'Blocked',          color: '#ef4444' },
+                   { label: 'Tower',            color: '#facc15' }],
+}
+
+/** Flatten result.stats into monospace "Label  value unit" lines for the PNG. */
+function buildStatLines(result: any): string[] {
+  const s = result?.stats
+  if (!s || typeof s !== 'object') return []
+  const UNITS: [string, string][] = [
+    ['_pct', ' %'], ['_m3', ' m³'], ['_m2', ' m²'], ['_km2', ' km²'],
+    ['_deg', '°'], ['_mhz', ' MHz'], ['_m', ' m'],
+  ]
+  const lines: string[] = []
+  for (const [k, v] of Object.entries(s)) {
+    if (v == null || typeof v === 'object') continue
+    let key = k, unit = ''
+    for (const [suf, u] of UNITS) {
+      if (key.endsWith(suf)) { key = key.slice(0, -suf.length); unit = u; break }
+    }
+    const label = key.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase())
+    const val = typeof v === 'number'
+      ? (Number.isInteger(v) ? String(v) : (v as number).toFixed(2))
+      : String(v)
+    lines.push(`${label.padEnd(16)} ${val}${unit}`)
+    if (lines.length >= 12) break
+  }
+  return lines
 }
 
 // ── tool catalogue ──────────────────────────────────────────────────────────
@@ -613,7 +694,7 @@ function ResultStats({ result }: { result: any }) {
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export default function DEMAnalysisPanel({ gridData, referenceGrid, onOverlay, onClearOverlays }: Props) {
+export default function DEMAnalysisPanel({ gridData, referenceGrid, onOverlay, onClearOverlays, onScenePNG }: Props) {
   const [selected, setSelected]   = useState<string | null>(null)
   const [params, setParams]       = useState<Record<string, any>>({})
   const [loading, setLoading]     = useState(false)
@@ -665,13 +746,29 @@ export default function DEMAnalysisPanel({ gridData, referenceGrid, onOverlay, o
 
   const datestamp = new Date().toISOString().slice(0, 10)
 
-  const downloadImage = useCallback(() => {
-    if (!result?.image) return
+  const downloadImage = useCallback(async () => {
+    if (!result) return
+    const label = tool?.label ?? result.type
+
+    // Scene capture: 3D globe + title bar + legend + statistics (like slope PNG)
+    if (onScenePNG && (result.image || result.geojson)) {
+      const alreadyOn = [...overlaid].some(id => id.startsWith(`dem-${result.type}-`))
+      if (!alreadyOn) {
+        handleOverlay()
+        // wait for the camera flyTo (1.5 s) + overlay tile to render
+        await new Promise(r => setTimeout(r, 2200))
+      }
+      await onScenePNG(label, TOOL_LEGENDS[result.type] ?? [], buildStatLines(result))
+      return
+    }
+
+    // Fallback: raw analysis raster
+    if (!result.image) return
     const a = document.createElement('a')
     a.href = result.image
     a.download = `dem-${result.type}-${datestamp}.png`
     a.click()
-  }, [result, datestamp])
+  }, [result, tool, onScenePNG, overlaid, handleOverlay, datestamp])
 
   const downloadGeoJSON = useCallback(() => {
     if (!result?.geojson) return
@@ -828,8 +925,8 @@ export default function DEMAnalysisPanel({ gridData, referenceGrid, onOverlay, o
               <Text style={{ color: '#555', fontSize: 10, alignSelf: 'center', marginRight: 2 }}>
                 Download:
               </Text>
-              {result.image && (
-                <Tooltip title="Download PNG image">
+              {(result.image || (onScenePNG && result.geojson)) && (
+                <Tooltip title="Download annotated 3D scene PNG (legend + statistics)">
                   <Button size="small" icon={<DownloadOutlined />} onClick={downloadImage}
                     style={{ background: 'transparent', borderColor: '#3a3a5e',
                              color: '#aaa', fontSize: 10 }}>

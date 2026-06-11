@@ -413,6 +413,7 @@ export default function ProjectDetailPage() {
   }
   const [exportJobs, setExportJobs] = useState<ExportJob[]>([])
   const [exportModalOpen, setExportModalOpen] = useState(false)
+  const [exportIncludeDxf, setExportIncludeDxf] = useState(false)
   const exportPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   function _stopPoll() {
@@ -442,7 +443,7 @@ export default function ProjectDetailPage() {
 
   async function startAreaExport(area: SurveyArea) {
     try {
-      const r = await api.post(`/projects/survey-areas/${area.id}/export/`)
+      const r = await api.post(`/projects/survey-areas/${area.id}/export/`, { include_dxf: exportIncludeDxf })
       const job: ExportJob = {
         task_uuid: r.data.task_uuid,
         label: area.name,
@@ -465,7 +466,7 @@ export default function ProjectDetailPage() {
 
   async function startProjectExport() {
     try {
-      const r = await api.post(`/projects/${pid}/export-full/`)
+      const r = await api.post(`/projects/${pid}/export-full/`, { include_dxf: exportIncludeDxf })
       const job: ExportJob = {
         task_uuid: r.data.task_uuid,
         label: project?.project_number || `Project ${pid}`,
@@ -1175,6 +1176,15 @@ export default function ProjectDetailPage() {
                         </Button>
                       </>
                     )}
+                    <Tooltip title="Include AutoCAD DXF files alongside the Shapefiles in the export ZIP">
+                      <Checkbox
+                        checked={exportIncludeDxf}
+                        onChange={(e) => setExportIncludeDxf(e.target.checked)}
+                        style={{ fontSize: 12, color: 'var(--text-secondary)' }}
+                      >
+                        DXF
+                      </Checkbox>
+                    </Tooltip>
                     <Button
                       icon={<DownloadOutlined />} size="small"
                       style={{ borderColor: '#95de64', color: '#95de64' }}

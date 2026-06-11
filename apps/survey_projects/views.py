@@ -337,12 +337,15 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
                 'detail': 'Your office has too many exports running. Please wait.',
             }, status=429)
 
+        include_dxf = bool(request.data.get('include_dxf', False))
+
         et = ExportTask.objects.create(
             export_type=ExportTask.PROJECT,
             object_id=project.id,
             object_name=project.project_number or str(project.id),
             requested_by=user,
             organisation_id=org_id,
+            include_dxf=include_dxf,
             progress_msg='Queued…',
         )
         build_export_zip.delay(et.pk)
@@ -1389,7 +1392,7 @@ def _import_geojson_file(folder, uploaded, layer_name, name_field, user, deo_vis
     }, status=201)
 
 
-def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='auto', deo_visible=True):
+def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='auto', deo_visible=True, extra_attributes=None):
     """Parse a GPX file and import waypoints and tracks as GISFeatures."""
     import xml.etree.ElementTree as ET
     from django.contrib.gis.geos import Point, LineString, Polygon
@@ -1418,6 +1421,13 @@ def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='
     created = 0
     errors = []
     project = folder.project
+    _extra = extra_attributes if isinstance(extra_attributes, dict) else {}
+
+    def _attrs(base: dict) -> dict:
+        """Merge surveyor-supplied extra_attributes over the auto-generated base attrs."""
+        merged = {**base}
+        merged.update(_extra)
+        return merged
 
     wpt_tag = './/gpx:wpt' if 'gpx' in ns else './/wpt'
     name_tag = 'gpx:name' if 'gpx' in ns else 'name'
@@ -1454,7 +1464,7 @@ def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='
                         geometry_type=GISFeature.POLYGON,
                         geometry=geom,
                         feature_id=fid,
-                        attributes={'name': f"{layer_name} Waypoints Polygon", 'description': 'Constructed from waypoints'},
+                        attributes=_attrs({'name': f"{layer_name} Waypoints Polygon", 'description': 'Constructed from waypoints'}),
                         deo_visible=deo_visible,
                         created_by=user,
                     )
@@ -1473,7 +1483,7 @@ def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='
                     geometry_type=GISFeature.LINE,
                     geometry=geom,
                     feature_id=fid,
-                    attributes={'name': f"{layer_name} Waypoints Line", 'description': 'Constructed from waypoints'},
+                    attributes=_attrs({'name': f"{layer_name} Waypoints Line", 'description': 'Constructed from waypoints'}),
                     deo_visible=deo_visible,
                     created_by=user,
                 )
@@ -1494,7 +1504,7 @@ def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='
                     geometry_type=GISFeature.POINT,
                     geometry=geom,
                     feature_id=fid,
-                    attributes={'name': name},
+                    attributes=_attrs({'name': name}),
                     deo_visible=deo_visible,
                     created_by=user,
                 )
@@ -1536,7 +1546,7 @@ def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='
                             geometry_type=GISFeature.POINT,
                             geometry=geom,
                             feature_id=fid,
-                            attributes={'name': f"{name} Point {i+1}", 'description': desc},
+                            attributes=_attrs({'name': f"{name} Point {i+1}", 'description': desc}),
                             deo_visible=deo_visible,
                             created_by=user,
                         )
@@ -1556,7 +1566,7 @@ def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='
                                 geometry_type=GISFeature.POLYGON,
                                 geometry=geom,
                                 feature_id=fid,
-                                attributes={'name': name, 'description': desc},
+                                attributes=_attrs({'name': name, 'description': desc}),
                                 deo_visible=deo_visible,
                                 created_by=user,
                             )
@@ -1573,7 +1583,7 @@ def _import_gpx_file(folder, uploaded, layer_name, name_field, user, geom_type='
                             geometry_type=GISFeature.LINE,
                             geometry=geom,
                             feature_id=fid,
-                            attributes={'name': name, 'description': desc},
+                            attributes=_attrs({'name': name, 'description': desc}),
                             deo_visible=deo_visible,
                             created_by=user,
                         )
@@ -2699,12 +2709,15 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
                 'detail': 'Your office has too many exports running. Please wait.',
             }, status=429)
 
+        include_dxf = bool(request.data.get('include_dxf', False))
+
         et = ExportTask.objects.create(
             export_type=ExportTask.SURVEY_AREA,
             object_id=area.id,
             object_name=area.name,
             requested_by=user,
             organisation_id=org_id,
+            include_dxf=include_dxf,
             progress_msg='Queued…',
         )
         build_export_zip.delay(et.pk)
@@ -3629,6 +3642,16 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
         deo_visible = str(request.data.get('deo_visible', 'true')).lower() not in ('false', '0', 'no')
         geom_type = request.data.get('geom_type', 'auto').strip().lower()
 
+        # Optional surveyor-defined attributes (JSON object, GPX only)
+        import json as _json
+        _extra_raw = request.data.get('extra_attributes', '')
+        try:
+            extra_attributes = _json.loads(_extra_raw) if _extra_raw else {}
+            if not isinstance(extra_attributes, dict):
+                extra_attributes = {}
+        except (ValueError, TypeError):
+            extra_attributes = {}
+
         if geom_type not in ('auto', 'point', 'line', 'polygon'):
             return Response(
                 {'detail': f'Invalid geom_type "{geom_type}". Expected one of: auto, point, line, polygon'},
@@ -3644,7 +3667,8 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
         if ext in ('.kml', '.gpkg'):
             return _import_via_gdal(folder, uploaded, layer_name, name_field, request.user, ext.lstrip('.'), deo_visible=deo_visible)
         if ext == '.gpx':
-            return _import_gpx_file(folder, uploaded, layer_name, name_field, request.user, geom_type=geom_type, deo_visible=deo_visible)
+            return _import_gpx_file(folder, uploaded, layer_name, name_field, request.user,
+                                    geom_type=geom_type, deo_visible=deo_visible, extra_attributes=extra_attributes)
         if ext == '.csv':
             return _import_csv_file(folder, uploaded, layer_name, name_field, request.user, geom_type=geom_type, deo_visible=deo_visible)
         return Response(

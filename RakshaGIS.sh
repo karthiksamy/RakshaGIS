@@ -374,8 +374,10 @@ do_restart() {
   fi
   if [[ -n "$OPTIONAL_PROFILES" ]]; then
     echo ">>> Restarting optional services…"
+    # Use 'up -d' instead of 'restart' so containers are created if missing
+    # (e.g. terrain-server removed after a docker compose down)
     # shellcheck disable=SC2086
-    $COMPOSE $OPTIONAL_PROFILES restart
+    $COMPOSE $OPTIONAL_PROFILES up -d
   fi
   if [[ -n "$DOCKER_PROFILES" ]]; then
     echo ">>> Restarting Docker AI backends…"

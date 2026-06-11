@@ -511,13 +511,16 @@ class TerrainConfigView(APIView):
 
     def get(self, request):
         from django.conf import settings
-        ion_token = getattr(settings, 'CESIUM_ION_TOKEN', '')
-        terrain_url = getattr(settings, 'TERRAIN_TILE_URL', '')
+        raw_token   = getattr(settings, 'CESIUM_ION_TOKEN', '') or ''
+        terrain_url = getattr(settings, 'TERRAIN_TILE_URL', '') or ''
+
+        # Treat obvious placeholder values as "no token" so the frontend
+        # doesn't accidentally fall back to Cesium Ion with an invalid key
+        # and surface a 401 / "InvalidCredentials" error.
+        _PLACEHOLDERS = ('YOUR_TOKEN_HERE', 'your_token_here', 'changeme', 'REPLACE_ME', '')
+        ion_token = '' if raw_token.strip() in _PLACEHOLDERS else raw_token.strip()
 
         # Local terrain takes priority over Ion (offline-first design).
-        # When terrain-server is running with real tiles, analysis works
-        # without internet. If local URL is set but server is unreachable,
-        # the frontend falls back to Ion automatically.
         source = 'none'
         if terrain_url:
             source = 'local'
@@ -729,6 +732,16 @@ class TerrainExportGeoTIFFView(APIView):
             ab.WriteArray(arr.astype(np.float32))
             ab.SetDescription(desc)
             ab.SetNoDataValue(-9999)
+            # Embed statistics so QGIS/ArcGIS auto-stretch instead of showing
+            # a blank/flat render (Float32 data has no implicit 0-255 range).
+            # Written as band metadata → stored inside the .tif (a SetStatistics
+            # call would end up in a .aux.xml sidecar lost when zipping).
+            a64 = arr.astype(np.float64)
+            ab.SetMetadataItem('STATISTICS_MINIMUM', f'{a64.min():.6f}')
+            ab.SetMetadataItem('STATISTICS_MAXIMUM', f'{a64.max():.6f}')
+            ab.SetMetadataItem('STATISTICS_MEAN',    f'{a64.mean():.6f}')
+            ab.SetMetadataItem('STATISTICS_STDDEV',  f'{a64.std():.6f}')
+        ana_ds.GetRasterBand(1).SetColorInterpretation(gdal.GCI_GrayIndex)
 
         # ── Metadata on both files ────────────────────────────────────────────
         meta = {
@@ -757,6 +770,28 @@ class TerrainExportGeoTIFFView(APIView):
         vis_ds.FlushCache(); vis_ds = None
         ana_ds.FlushCache(); ana_ds = None
 
+        readme = (
+            'RakshaGIS Terrain Analysis Export\n'
+            '=================================\n\n'
+            f'CRS    : EPSG:4326 (WGS84)\n'
+            f'BBox   : {min_lon:.6f}, {min_lat:.6f} -> {max_lon:.6f}, {max_lat:.6f}\n'
+            f'Size   : {target_n} x {target_n} px\n\n'
+            'terrain-visualization.tif\n'
+            '  3-band 8-bit RGB. Slope colour ramp (green->amber->red) blended\n'
+            '  with hillshade. Opens in any image viewer or GIS software.\n\n'
+            'terrain-analysis.tif\n'
+            '  3-band Float32 DATA raster - NOT a picture. Ordinary image\n'
+            '  viewers (Windows Photos, browsers) cannot display Float32 and\n'
+            '  show a blank/transparent image. Open it in QGIS or ArcGIS:\n'
+            '    Band 1: Elevation (m)        - Singleband gray / pseudocolor\n'
+            '    Band 2: Slope (degrees)      - Singleband pseudocolor\n'
+            '    Band 3: Aspect (deg, 0=N, clockwise, -1=flat)\n'
+            '  QGIS: Layer Properties -> Symbology -> Render type\n'
+            '        "Singleband pseudocolor", pick the band, classify.\n'
+            '  Use it with the Raster Calculator for cut/fill, visibility,\n'
+            '  flood-level and other raster analyses.\n'
+        )
+
         import zipfile, io as _io
         zip_buf = _io.BytesIO()
         with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -764,6 +799,7 @@ class TerrainExportGeoTIFFView(APIView):
                 zf.writestr('terrain-visualization.tif', f.read())
             with open(tmp_ana, 'rb') as f:
                 zf.writestr('terrain-analysis.tif', f.read())
+            zf.writestr('README.txt', readme)
         os.unlink(tmp_vis)
         os.unlink(tmp_ana)
 
@@ -2141,12 +2177,15 @@ def start_export(request):
     except Exception:
         object_name = str(object_id)
 
+    include_dxf = bool(request.data.get('include_dxf', False))
+
     et = ExportTask.objects.create(
         export_type=export_type,
         object_id=object_id,
         object_name=object_name,
         requested_by=user,
         organisation_id=org_id,
+        include_dxf=include_dxf,
         progress_msg='Queued — waiting for worker…',
     )
     build_export_zip.delay(et.pk)
@@ -2372,3 +2411,64 @@ class LidarUploadView(APIView):
                 _os.unlink(tmp_path)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Sentinel-2 tile proxy
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def sentinel2_tile(request, pk: int, z: int, x: int, y: int):
+    """
+    GET /api/core/sentinel2-tiles/{pk}/{z}/{x}/{y}/
+
+    Serves a cached Sentinel-2 tile if available, otherwise fetches it live
+    from the configured url_template and caches it for future requests.
+    Returns the tile image with an appropriate content-type.
+    """
+    import urllib.request
+    from django.http import HttpResponse, Http404
+    from apps.core.models import BasemapConfig
+    from django.conf import settings as _s
+
+    try:
+        bm = BasemapConfig.objects.get(pk=pk, provider=BasemapConfig.SENTINEL2, is_active=True)
+    except BasemapConfig.DoesNotExist:
+        raise Http404
+
+    if not bm.url_template:
+        raise Http404
+
+    tile_path = os.path.join(
+        _s.MEDIA_ROOT, 'tile_cache', 'sentinel2', str(pk), str(z), str(x), f"{y}.jpg"
+    )
+
+    if os.path.exists(tile_path):
+        with open(tile_path, 'rb') as fh:
+            return HttpResponse(fh.read(), content_type='image/jpeg')
+
+    # Live fetch and cache
+    url = (
+        bm.url_template
+        .replace('{z}', str(z)).replace('{x}', str(x)).replace('{y}', str(y))
+        .replace('{TileMatrix}', str(z))
+        .replace('{TileCol}', str(x))
+        .replace('{TileRow}', str(y))
+    )
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'RakshaGIS/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+            content_type = resp.headers.get('Content-Type', 'image/jpeg')
+    except Exception:
+        raise Http404
+
+    os.makedirs(os.path.dirname(tile_path), exist_ok=True)
+    try:
+        with open(tile_path, 'wb') as fh:
+            fh.write(data)
+    except OSError:
+        pass
+
+    return HttpResponse(data, content_type=content_type)

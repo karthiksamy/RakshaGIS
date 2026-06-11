@@ -190,16 +190,23 @@ convert_to_terrain() {
   local merged="${TERRAIN_DIR}/india_dem_merged.vrt"
   local lowres="${TERRAIN_DIR}/india_dem_lowres.tif"
 
-  # Use local GDAL if available; fall back to Docker GDAL
+  # Use local GDAL if available; fall back to Docker GDAL.
+  # When running in Docker, translate all TERRAIN_DIR host paths to /data
+  # (the container mount point) so the GDAL command sees valid paths.
   _gdal_run() {
     if command -v "$1" &>/dev/null; then
       "$@"
     else
       local cmd="$1"; shift
+      local -a docker_args=()
+      for arg in "$@"; do
+        # Replace TERRAIN_DIR prefix with /data (the bind-mount target)
+        docker_args+=("${arg/${TERRAIN_DIR}//data}")
+      done
       docker run --rm \
         -v "${TERRAIN_DIR}:/data" \
         ghcr.io/osgeo/gdal:ubuntu-small-latest \
-        "$cmd" "$@"
+        "${cmd}" "${docker_args[@]}"
     fi
   }
 
@@ -281,11 +288,17 @@ convert_to_terrain() {
 start_server() {
   echo "==> Starting terrain-server Docker profile…"
   cd "${SCRIPT_DIR}"
+  # Read port from .env (DATA_DIR-aware) rather than relying on a possibly-unset env var
+  local _http_port
+  _http_port=$(grep "^RAKSHAGIS_HTTP_PORT=" "${SCRIPT_DIR}/.env" 2>/dev/null \
+               | cut -d= -f2 | tr -d '\r' || echo "80")
+  _http_port="${_http_port:-80}"
   docker compose --profile terrain up -d terrain-server
   echo ""
   echo "==> Terrain server started."
-  echo "    Verify with: curl -s http://localhost:${RAKSHAGIS_HTTP_PORT:-80}/terrain-tiles/layer.json"
-  echo "    Then restart web: docker compose restart web nginx"
+  echo "    Tile root : ${DATA_DIR}/terrain/"
+  echo "    Verify   : curl -s http://localhost:${_http_port}/terrain-tiles/layer.json"
+  echo "    Restart web if needed: docker compose restart web nginx"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

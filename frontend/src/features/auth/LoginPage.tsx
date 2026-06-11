@@ -57,11 +57,13 @@ export default function LoginPage() {
   const branding = useBranding()
   const { t } = useTranslation()
 
-  const [step, setStep] = useState<'credentials' | '2fa'>('credentials')
+  const [step, setStep] = useState<'credentials' | '2fa' | '2fa-setup'>('credentials')
   const [preAuthKey, setPreAuthKey] = useState('')
   const [totpCode, setTotpCode] = useState('')
   const [totpError, setTotpError] = useState('')
   const [totpLoading, setTotpLoading] = useState(false)
+  const [setupQr, setSetupQr] = useState('')
+  const [setupSecret, setSetupSecret] = useState('')
 
   const mutation = useMutation({
     mutationFn: async (values: LoginForm) => {
@@ -95,6 +97,17 @@ export default function LoginPage() {
         setStep('2fa')
         return null
       }
+      if (data.requires_2fa_setup) {
+        // Mandatory 2FA: first login → forced authenticator registration
+        setPreAuthKey(data.pre_auth_key)
+        const { data: setup } = await axios.post('/api/accounts/auth/2fa/setup-begin/', {
+          pre_auth_key: data.pre_auth_key,
+        })
+        setSetupQr(setup.qr_code)
+        setSetupSecret(setup.secret)
+        setStep('2fa-setup')
+        return null
+      }
       localStorage.setItem('access_token', data.access)
       localStorage.setItem('refresh_token', data.refresh)
       const me: User = await api.get('/accounts/users/me/').then((r) => r.data)
@@ -108,6 +121,15 @@ export default function LoginPage() {
     },
   })
 
+  async function finishLogin(data: { access: string; refresh: string }) {
+    localStorage.setItem('access_token', data.access)
+    localStorage.setItem('refresh_token', data.refresh)
+    const me: User = await api.get('/accounts/users/me/').then((r) => r.data)
+    setUser(me)
+    qc.setQueryData(qk.me(), me)
+    navigate('/')
+  }
+
   async function handleTotpSubmit() {
     if (!totpCode || totpCode.length !== 6) {
       setTotpError('Enter the 6-digit code from your authenticator app')
@@ -120,17 +142,40 @@ export default function LoginPage() {
         pre_auth_key: preAuthKey,
         totp_code: totpCode,
       })
-      localStorage.setItem('access_token', data.access)
-      localStorage.setItem('refresh_token', data.refresh)
-      const me: User = await api.get('/accounts/users/me/').then((r) => r.data)
-      setUser(me)
-      qc.setQueryData(qk.me(), me)
-      navigate('/')
+      await finishLogin(data)
     } catch (e: any) {
       setTotpError(e?.response?.data?.detail || 'Invalid code. Please try again.')
     } finally {
       setTotpLoading(false)
     }
+  }
+
+  async function handleSetupSubmit() {
+    if (!totpCode || totpCode.length !== 6) {
+      setTotpError('Enter the 6-digit code from your authenticator app')
+      return
+    }
+    setTotpError('')
+    setTotpLoading(true)
+    try {
+      const { data } = await axios.post('/api/accounts/auth/2fa/setup-complete/', {
+        pre_auth_key: preAuthKey,
+        code: totpCode,
+      })
+      await finishLogin(data)
+    } catch (e: any) {
+      setTotpError(e?.response?.data?.detail || 'Invalid code. Please try again.')
+    } finally {
+      setTotpLoading(false)
+    }
+  }
+
+  function backToSignIn() {
+    setStep('credentials')
+    setTotpCode('')
+    setTotpError('')
+    setSetupQr('')
+    setSetupSecret('')
   }
 
   const primaryColor = branding.primary_color || '#1890ff'
@@ -236,7 +281,7 @@ export default function LoginPage() {
         <div style={{ marginTop: 32, display: 'flex', alignItems: 'center', gap: 8 }}>
           <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 13 }} />
           <Typography.Text style={{ color: '#556f8a', fontSize: 12 }}>
-            Secured with JWT + optional 2FA. All activity is audit-logged.
+            Secured with JWT + mandatory 2FA. All activity is audit-logged.
           </Typography.Text>
         </div>
       </div>
@@ -255,11 +300,15 @@ export default function LoginPage() {
       >
         <div style={{ marginBottom: 32 }}>
           <Typography.Title level={3} style={{ color: '#e8eeff', margin: 0, marginBottom: 4 }}>
-            {step === 'credentials' ? 'Sign In' : 'Two-Factor Auth'}
+            {step === 'credentials' ? 'Sign In'
+              : step === '2fa-setup' ? 'Set Up Two-Factor Auth'
+              : 'Two-Factor Auth'}
           </Typography.Title>
           <Typography.Text style={{ color: '#556f8a', fontSize: 13 }}>
             {step === 'credentials'
               ? 'Enter your credentials to access the platform'
+              : step === '2fa-setup'
+              ? '2FA is mandatory. Scan the QR code with an authenticator app to continue.'
               : 'Enter the 6-digit code from your authenticator app'}
           </Typography.Text>
         </div>
@@ -327,6 +376,65 @@ export default function LoginPage() {
               For access requests contact your DEO / ADEO Admin
             </Typography.Text>
           </>
+        ) : step === '2fa-setup' ? (
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            {totpError && <Alert type="error" message={totpError} showIcon />}
+
+            <div style={{ textAlign: 'center' }}>
+              {setupQr ? (
+                <img
+                  src={setupQr}
+                  alt="2FA QR code"
+                  style={{ width: 180, height: 180, borderRadius: 8, background: '#fff', padding: 6 }}
+                />
+              ) : (
+                <Typography.Text style={{ color: '#556f8a' }}>Loading QR code…</Typography.Text>
+              )}
+              {setupSecret && (
+                <Typography.Paragraph
+                  copyable={{ text: setupSecret }}
+                  style={{ color: '#8ab0d0', fontSize: 11, marginTop: 8, marginBottom: 0 }}
+                >
+                  Manual key: <span style={{ fontFamily: 'monospace' }}>{setupSecret}</span>
+                </Typography.Paragraph>
+              )}
+            </div>
+
+            <Typography.Text style={{ color: '#556f8a', fontSize: 12 }}>
+              1. Install Google Authenticator / Microsoft Authenticator / FreeOTP.<br />
+              2. Scan the QR code (or enter the manual key).<br />
+              3. Enter the 6-digit code shown in the app to activate your account.
+            </Typography.Text>
+
+            <Input
+              size="large"
+              maxLength={6}
+              placeholder="000000"
+              value={totpCode}
+              onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ''))}
+              onPressEnter={handleSetupSubmit}
+              style={{
+                textAlign: 'center', letterSpacing: 12, fontSize: 24, fontWeight: 700,
+                background: '#0d1526', borderColor: '#1e3050', color: '#dde8f8', height: 56,
+              }}
+              autoFocus
+            />
+
+            <Button
+              type="primary"
+              block
+              size="large"
+              loading={totpLoading}
+              onClick={handleSetupSubmit}
+              style={{ height: 46, fontWeight: 600 }}
+            >
+              Activate &amp; Sign In
+            </Button>
+
+            <Button type="text" block onClick={backToSignIn} style={{ color: '#556f8a', fontSize: 12 }}>
+              Back to Sign In
+            </Button>
+          </Space>
         ) : (
           <Space direction="vertical" size={20} style={{ width: '100%' }}>
             <div style={{ textAlign: 'center', padding: '12px 0' }}>
@@ -360,12 +468,7 @@ export default function LoginPage() {
               Verify Code
             </Button>
 
-            <Button
-              type="text"
-              block
-              onClick={() => { setStep('credentials'); setTotpCode(''); setTotpError('') }}
-              style={{ color: '#556f8a', fontSize: 12 }}
-            >
+            <Button type="text" block onClick={backToSignIn} style={{ color: '#556f8a', fontSize: 12 }}>
               Back to Sign In
             </Button>
           </Space>

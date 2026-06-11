@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     OrganisationViewSet, UserViewSet,
     AuthChallengeView, CustomLoginView, TwoFactorCompleteView, TwoFactorSetupView,
+    TwoFactorSetupBeginView, TwoFactorSetupCompleteView,
     UserSessionViewSet, LoginAuditLogViewSet, ExportAuditLogViewSet,
 )
 
@@ -18,4 +19,6 @@ urlpatterns = router.urls + [
     path('auth/login/', CustomLoginView.as_view(), name='custom-login'),
     path('auth/2fa/complete/', TwoFactorCompleteView.as_view(), name='2fa-complete'),
     path('auth/2fa/setup/', TwoFactorSetupView.as_view(), name='2fa-setup'),
+    path('auth/2fa/setup-begin/', TwoFactorSetupBeginView.as_view(), name='2fa-setup-begin'),
+    path('auth/2fa/setup-complete/', TwoFactorSetupCompleteView.as_view(), name='2fa-setup-complete'),
 ]

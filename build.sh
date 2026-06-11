@@ -1429,7 +1429,7 @@ if [[ "$OPT_TERRAIN" == true && "$OPT_TERRAIN_SKIP_DOWNLOAD" == false ]]; then
   fi
 elif [[ "$OPT_TERRAIN" == true && "$OPT_TERRAIN_SKIP_DOWNLOAD" == true ]]; then
   echo ""
-  echo -e "  ${GREEN}✓ Terrain data present — terrain server will be started.${RESET}"
+  echo -e "  ${GREEN}✓ Terrain data present — server will be (re)started after build.${RESET}"
 fi
 
 # ── Step 9: Build frontend (skip when source files unchanged) ────────────────
@@ -1591,3 +1591,21 @@ echo "║  Multi-project isolation: all resources are prefixed    ║"
 echo "║  'rakshagis_' — other projects on this host are safe.   ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
+
+# ── Auto-start terrain server ─────────────────────────────────────────────────
+# Ensures terrain comes back up after every build without requiring a manual
+# ./RakshaGIS.sh start when OPT_TERRAIN is enabled and tiles are present.
+if [[ "$OPT_TERRAIN" == true ]]; then
+  _TILE_CHECK=$(find "$DATA_DIR/terrain" -name "*.terrain" 2>/dev/null | head -1)
+  if [[ -n "$_TILE_CHECK" ]]; then
+    echo ">>> Terrain tiles found — starting terrain server…"
+    docker compose --profile terrain up -d terrain-server
+    echo -e "  ${GREEN}✓ Terrain server is running${RESET}"
+  else
+    echo -e "  ${YELLOW}⚠  Terrain enabled (RAKSHA_OPT_TERRAIN=true) but no .terrain files found at:${RESET}"
+    echo "     ${DATA_DIR}/terrain/"
+    echo "     Run:  DATA_DIR=\"${DATA_DIR}\" ./setup_terrain.sh --all"
+    echo "     to download SRTM data and generate terrain tiles."
+  fi
+  echo ""
+fi

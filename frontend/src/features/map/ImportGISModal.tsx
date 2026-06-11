@@ -14,6 +14,7 @@ import {
 import {
   InboxOutlined, FileZipOutlined, GlobalOutlined,
   CheckCircleOutlined, WarningOutlined, CloseCircleOutlined,
+  PlusOutlined, MinusCircleOutlined,
 } from '@ant-design/icons'
 import api from '@/services/api'
 import type { SurveyArea } from '@/types'
@@ -107,6 +108,17 @@ export default function ImportGISModal({
     fd.append('layer_name', values.layer_name.trim())
     if (values.name_field?.trim()) fd.append('name_field', values.name_field.trim())
     if (values.geom_type) fd.append('geom_type', values.geom_type)
+
+    if (fileExt === '.gpx' && Array.isArray(values.extra_attrs) && values.extra_attrs.length > 0) {
+      const extraObj: Record<string, string> = {}
+      for (const row of values.extra_attrs) {
+        const k = row?.key?.trim()
+        if (k) extraObj[k] = row.value ?? ''
+      }
+      if (Object.keys(extraObj).length > 0) {
+        fd.append('extra_attributes', JSON.stringify(extraObj))
+      }
+    }
 
     setLoading(true)
     setResult(null)
@@ -316,6 +328,55 @@ export default function ImportGISModal({
                   { value: 'polygon', label: 'Polygon (Closed boundary)' },
                 ]}
               />
+            </Form.Item>
+          )}
+
+          {/* Surveyor-defined attributes (GPX only) */}
+          {fileExt === '.gpx' && (
+            <Form.Item
+              label="Feature Attributes (optional)"
+              tooltip="Key–value pairs added to every imported feature. Useful for tagging survey type, officer name, date, etc."
+              style={{ marginBottom: 8 }}
+            >
+              <Form.List name="extra_attrs">
+                {(fields, { add, remove }) => (
+                  <>
+                    {fields.map(({ key, name, ...restField }) => (
+                      <Space key={key} style={{ display: 'flex', marginBottom: 4 }} align="baseline">
+                        <Form.Item
+                          {...restField}
+                          name={[name, 'key']}
+                          rules={[{ required: true, message: 'Key required' }]}
+                          style={{ marginBottom: 0 }}
+                        >
+                          <Input placeholder="key (e.g. survey_type)" style={{ width: 160 }} />
+                        </Form.Item>
+                        <Form.Item
+                          {...restField}
+                          name={[name, 'value']}
+                          style={{ marginBottom: 0 }}
+                        >
+                          <Input placeholder="value (e.g. boundary)" style={{ width: 180 }} />
+                        </Form.Item>
+                        <MinusCircleOutlined
+                          onClick={() => remove(name)}
+                          style={{ color: '#ff4d4f', cursor: 'pointer' }}
+                        />
+                      </Space>
+                    ))}
+                    <Button
+                      type="dashed"
+                      onClick={() => add()}
+                      icon={<PlusOutlined />}
+                      size="small"
+                      block
+                      style={{ marginTop: 4 }}
+                    >
+                      Add attribute
+                    </Button>
+                  </>
+                )}
+              </Form.List>
             </Form.Item>
           )}
 

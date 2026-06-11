@@ -6,6 +6,7 @@ from .views import (
     DroneDatasetViewSet, LidarUploadView,
     export_map, map_styles, print_pdf, watermark_file,
     start_export, export_status, export_download,
+    sentinel2_tile,
 )
 
 router = DefaultRouter()
@@ -27,4 +28,6 @@ urlpatterns = router.urls + [
     path('export/start/', start_export, name='export-start'),
     path('export/status/<uuid:task_uuid>/', export_status, name='export-status'),
     path('export/download/<uuid:task_uuid>/', export_download, name='export-download'),
+    # Sentinel-2 tile proxy (serves cached tiles or fetches live)
+    path('sentinel2-tiles/<int:pk>/<int:z>/<int:x>/<int:y>/', sentinel2_tile, name='sentinel2-tile'),
 ]

@@ -329,7 +329,9 @@ export interface BrandingConfig {
   logo_url: string
 }
 
-export type BasemapProvider = 'OSM' | 'XYZ' | 'WMS' | 'WMTS' | 'BING' | 'BHUVAN' | 'ARCGIS'
+export type BasemapProvider =
+  | 'OSM' | 'XYZ' | 'WMS' | 'WMTS' | 'BING' | 'BHUVAN' | 'ARCGIS'
+  | 'LOCAL_COG' | 'SENTINEL2'
 
 export interface BasemapConfig {
   id: number
@@ -341,6 +343,11 @@ export interface BasemapConfig {
   is_active: boolean
   is_default: boolean
   is_system: boolean
+  cache_zoom_max?: number
+  bounds_west?: number | null
+  bounds_south?: number | null
+  bounds_east?: number | null
+  bounds_north?: number | null
 }
 
 export interface ChatMessage {

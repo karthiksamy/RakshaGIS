@@ -14,9 +14,20 @@ import { qk } from '@/services/queryKeys'
 import { useAppStore } from '@/app/store'
 import type { BasemapConfig } from '@/types'
 
-const GLOBAL_PROVIDERS = ['OSM', 'XYZ', 'WMS', 'WMTS', 'BING', 'BHUVAN', 'ARCGIS']
-const GLOBAL_PROVIDER_OPTIONS = GLOBAL_PROVIDERS.map((p) => ({ label: p, value: p }))
+const GLOBAL_PROVIDERS = ['OSM', 'XYZ', 'WMS', 'WMTS', 'BING', 'BHUVAN', 'ARCGIS', 'SENTINEL2']
+const GLOBAL_PROVIDER_OPTIONS = [
+  { label: 'OpenStreetMap',                      value: 'OSM'       },
+  { label: 'Custom XYZ Tiles',                   value: 'XYZ'       },
+  { label: 'WMS Service',                        value: 'WMS'       },
+  { label: 'WMTS Service',                       value: 'WMTS'      },
+  { label: 'Bing Maps',                          value: 'BING'      },
+  { label: 'Bhuvan (ISRO India)',                value: 'BHUVAN'    },
+  { label: 'ArcGIS Map Service',                 value: 'ARCGIS'    },
+  { label: 'Sentinel-2 Satellite (Copernicus, free)', value: 'SENTINEL2' },
+]
 const PROVIDERS_WITH_API_KEY = ['ARCGIS', 'BING']
+const SENTINEL2_DEFAULT_URL =
+  'https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023/default/GoogleMapsCompatible/{TileMatrix}/{TileRow}/{TileCol}.jpg'
 
 function CogStatusTag({ status, error }: { status?: string; error?: string | null }) {
   if (!status || status === 'PENDING')
@@ -38,6 +49,17 @@ export default function BasemapsPage() {
   const [form] = Form.useForm()
   const [uploadForm] = Form.useForm()
   const [formProvider, setFormProvider] = useState<string>('')
+
+  function handleProviderChange(v: string) {
+    setFormProvider(v)
+    if (v === 'SENTINEL2') {
+      form.setFieldsValue({
+        url_template: SENTINEL2_DEFAULT_URL,
+        attribution: '© EOX IT Services GmbH & Sentinel Hub, contains modified Copernicus Sentinel data',
+        cache_zoom_max: 13,
+      })
+    }
+  }
   const [tiffFile, setTiffFile] = useState<File | null>(null)
   const [uploading, setUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
@@ -159,17 +181,23 @@ export default function BasemapsPage() {
     {
       title: 'Provider',
       dataIndex: 'provider',
-      render: (p) => (
-        <Tag color={p === 'LOCAL_COG' ? 'purple' : 'default'}>
-          {p === 'LOCAL_COG' ? 'Local TIFF' : p}
-        </Tag>
-      ),
+      render: (p) => {
+        const colors: Record<string, string> = {
+          LOCAL_COG: 'purple', SENTINEL2: 'geekblue',
+        }
+        const labels: Record<string, string> = {
+          LOCAL_COG: 'Local TIFF', SENTINEL2: 'Sentinel-2',
+        }
+        return <Tag color={colors[p] ?? 'default'}>{labels[p] ?? p}</Tag>
+      },
     },
     {
       title: 'Status',
       key: 'status',
       render: (_, r) => r.provider === 'LOCAL_COG'
         ? <CogStatusTag status={(r as any).cog_status} error={(r as any).cog_error} />
+        : r.provider === 'SENTINEL2'
+        ? <Tag color="geekblue" icon={<SyncOutlined />}>Live + cache</Tag>
         : <Tag color="success">Ready</Tag>,
     },
     {
@@ -284,25 +312,66 @@ export default function BasemapsPage() {
             <Input />
           </Form.Item>
           <Form.Item name="provider" label="Provider" rules={[{ required: true }]}>
-            <Select options={GLOBAL_PROVIDER_OPTIONS} onChange={(v) => setFormProvider(v)} />
+            <Select options={GLOBAL_PROVIDER_OPTIONS} onChange={handleProviderChange} />
           </Form.Item>
+          {formProvider === 'SENTINEL2' && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="Sentinel-2 free imagery (10 m, ~5-day revisit)"
+              description={
+                <>
+                  The default URL uses the EOX Sentinel-2 cloudless annual mosaic — no API key required.
+                  For live updated imagery configure the Sentinel Hub WMTS URL with your free account token.
+                  Set <strong>AOI bounds</strong> below to enable offline tile pre-caching.
+                </>
+              }
+            />
+          )}
           <Form.Item
             name="url_template"
-            label={formProvider === 'ARCGIS' ? 'MapServer Base URL' : 'URL Template'}
+            label={formProvider === 'ARCGIS' ? 'MapServer Base URL' : 'URL / WMTS Template'}
             rules={[{ required: true }]}
             extra={formProvider === 'ARCGIS'
               ? 'Enter the MapServer URL, e.g. https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer'
+              : formProvider === 'SENTINEL2'
+              ? 'Supports {z}/{x}/{y} (XYZ) and {TileMatrix}/{TileRow}/{TileCol} (WMTS) placeholders'
               : undefined}
           >
-            <Input placeholder={formProvider === 'ARCGIS'
-              ? 'https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer'
-              : 'https://{a-c}.tile.openstreetmap.org/{z}/{x}/{y}.png'}
-            />
+            <Input placeholder={
+              formProvider === 'ARCGIS'
+                ? 'https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer'
+                : formProvider === 'SENTINEL2'
+                ? SENTINEL2_DEFAULT_URL
+                : 'https://{a-c}.tile.openstreetmap.org/{z}/{x}/{y}.png'
+            } />
           </Form.Item>
           {PROVIDERS_WITH_API_KEY.includes(formProvider) && (
             <Form.Item name="api_key" label="API Key / Token" rules={[{ required: true }]}>
               <Input.Password placeholder="Paste your ArcGIS token here" />
             </Form.Item>
+          )}
+          {formProvider === 'SENTINEL2' && (
+            <>
+              <Form.Item
+                name="cache_zoom_max"
+                label="Max cache zoom level"
+                extra="Tiles at zoom 0–N for the AOI below are pre-fetched by the Celery beat task (8–15 recommended, higher = more disk)"
+                initialValue={13}
+              >
+                <Input type="number" min={8} max={15} style={{ width: 100 }} />
+              </Form.Item>
+              <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+                AOI bounds for tile pre-caching (leave blank to skip offline caching)
+              </Typography.Text>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <Form.Item name="bounds_west"  label="West lon"  style={{ marginBottom: 8 }}><Input type="number" step="0.001" /></Form.Item>
+                <Form.Item name="bounds_east"  label="East lon"  style={{ marginBottom: 8 }}><Input type="number" step="0.001" /></Form.Item>
+                <Form.Item name="bounds_south" label="South lat" style={{ marginBottom: 8 }}><Input type="number" step="0.001" /></Form.Item>
+                <Form.Item name="bounds_north" label="North lat" style={{ marginBottom: 8 }}><Input type="number" step="0.001" /></Form.Item>
+              </div>
+            </>
           )}
           <Form.Item name="attribution" label="Attribution">
             <Input />

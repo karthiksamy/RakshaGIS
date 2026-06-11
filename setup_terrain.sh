@@ -266,13 +266,12 @@ convert_to_terrain() {
   echo ""
   echo "==> Done! Generated ${tile_count} quantized-mesh tiles."
 
-  if [[ ! -f "${OUTPUT_DIR}/layer.json" ]]; then
-    echo "    layer.json not created by ctb-tile — writing it now…"
-    docker run --rm \
-      -v "${TERRAIN_DIR}:/data" \
-      alpine sh -c \
-      'printf "%s\n" "{" "  \"tilejson\": \"2.1.0\"," "  \"name\": \"India SRTM Terrain\"," "  \"version\": \"1.0.0\"," "  \"format\": \"quantized-mesh-1.0\"," "  \"attribution\": \"CGIAR-CSI SRTM v4.1\"," "  \"scheme\": \"tms\"," "  \"tiles\": [\"{z}/{x}/{y}.terrain\"]," "  \"projection\": \"EPSG:4326\"," "  \"bounds\": [-180.0, -90.0, 180.0, 90.0]" "}" > /data/layer.json'
-  fi
+  # Always (re)generate layer.json with the "available" tile index by scanning
+  # the tiles on disk. Cesium fails without it:
+  #   "TypeError: can't access property computeChildMaskForTile,
+  #    e.availability is undefined"
+  echo "    Generating layer.json with availability index…"
+  python3 "${SCRIPT_DIR}/scripts/generate_terrain_layer.py" "${OUTPUT_DIR}"
   echo "    layer.json : ${OUTPUT_DIR}/layer.json  ✓"
   echo ""
   echo "==> Next steps:"

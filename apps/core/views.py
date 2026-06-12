@@ -2393,7 +2393,14 @@ class TerrainVectorUploadView(APIView):
                                     continue
                                 geom = fiona.transform.transform_geom(
                                     src_crs, 'EPSG:4326', feat.geometry)
-                                geom = _json.loads(_json.dumps(geom))  # plain dict
+                                # fiona ≥1.9 returns fiona.model.Geometry objects —
+                                # convert to a plain GeoJSON dict
+                                try:
+                                    from fiona.model import to_dict as _to_dict
+                                    geom = _to_dict(geom)
+                                except ImportError:
+                                    geom = dict(geom)
+                                geom = _json.loads(_json.dumps(geom))
                                 props = {}
                                 for k, v in dict(feat.properties or {}).items():
                                     props[str(k)] = (v if isinstance(v, (int, float, bool))

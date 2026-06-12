@@ -68,6 +68,13 @@ def import_shapefile(self, job_id: int):
                     geom_geojson = fiona.transform.transform_geom(
                         src_crs, 'EPSG:4326', feat.geometry
                     )
+                    # fiona ≥1.9 returns fiona.model.Geometry objects — convert
+                    # to a plain dict or json.dumps fails ("not JSON serializable")
+                    try:
+                        from fiona.model import to_dict as _to_dict
+                        geom_geojson = _to_dict(geom_geojson)
+                    except ImportError:
+                        pass
 
                     geom_type = geom_type_map.get(geom_geojson['type'], GISFeature.POLYGON)
                     geos_geom = GEOSGeometry(json.dumps(geom_geojson), srid=4326)

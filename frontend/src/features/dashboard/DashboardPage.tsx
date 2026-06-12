@@ -1,10 +1,10 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Card, Col, Row, Statistic, Table, Tag, Typography, Progress, Space, Badge, Timeline, Spin, Button, List, message } from 'antd'
+import { Alert, Card, Col, Row, Statistic, Table, Tag, Typography, Progress, Space, Badge, Timeline, Spin, Button, List, message, Empty } from 'antd'
 import {
   FolderOutlined, EnvironmentOutlined, TeamOutlined, BankOutlined,
   CheckCircleOutlined, ClockCircleOutlined, SyncOutlined, ArrowUpOutlined,
-  AlertOutlined, WarningOutlined,
+  AlertOutlined, WarningOutlined, GlobalOutlined, SendOutlined, ExclamationCircleOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
@@ -132,6 +132,230 @@ function StatusBarChart({ stats }: { stats?: { draft: number; submitted: number;
           </div>
         )
       })}
+    </div>
+  )
+}
+
+// ── My Work (SDO / Surveyor personal dashboard) ───────────────────────────────
+
+interface MyWorkArea {
+  id: number
+  name: string
+  area_code: string
+  status: string
+  project_id: number
+  project_number: string
+  project_name: string
+  updated_at: string
+  return_remark?: string
+}
+
+interface MyWorkData {
+  assigned: MyWorkArea[]
+  returned: MyWorkArea[]
+  in_progress: MyWorkArea[]
+}
+
+function MyWorkCard() {
+  const navigate = useNavigate()
+  const qc = useQueryClient()
+
+  const { data, isLoading } = useQuery<MyWorkData>({
+    queryKey: ['my-work'],
+    queryFn: () => api.get('/projects/my-work/').then(r => r.data),
+    refetchInterval: 60_000,
+  })
+
+  const submitMutation = useMutation({
+    mutationFn: (areaId: number) =>
+      api.post(`/workflow/steps/area-transition/${areaId}/submit/`),
+    onSuccess: () => {
+      message.success('Survey area submitted for checking')
+      qc.invalidateQueries({ queryKey: ['my-work'] })
+    },
+    onError: (e: any) => message.error(e?.response?.data?.detail || 'Submit failed'),
+  })
+
+  if (isLoading) return <Spin style={{ display: 'block', margin: '32px auto' }} />
+
+  const { assigned = [], returned = [], in_progress = [] } = data ?? {}
+  const hasWork = assigned.length + returned.length + in_progress.length > 0
+
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <Title level={4} style={{ color: '#4fc3f7', marginBottom: 16 }}>
+        My Work
+      </Title>
+
+      {/* ── Returned items — need fix ───────────────────────────────────────── */}
+      {returned.map(area => (
+        <Alert
+          key={area.id}
+          type="error"
+          showIcon
+          icon={<ExclamationCircleOutlined />}
+          style={{ marginBottom: 10, background: '#1a0505', border: '1px solid #7f1d1d' }}
+          message={
+            <Space size={8}>
+              <Text strong style={{ color: '#fca5a5' }}>{area.name}</Text>
+              <Text style={{ color: '#888', fontSize: 12 }}>{area.project_number}</Text>
+              <Tag color="error">Returned</Tag>
+            </Space>
+          }
+          description={
+            <div>
+              {area.return_remark && (
+                <Text style={{ color: '#fca5a5', fontSize: 12, display: 'block', marginBottom: 8 }}>
+                  Checker remark: "{area.return_remark}"
+                </Text>
+              )}
+              <Space size={8}>
+                <Button
+                  size="small"
+                  icon={<GlobalOutlined />}
+                  onClick={() => navigate(`/map?project=${area.project_id}`)}
+                >
+                  Open in Map
+                </Button>
+                <Button
+                  size="small"
+                  type="primary"
+                  icon={<SendOutlined />}
+                  onClick={() => submitMutation.mutate(area.id)}
+                  loading={submitMutation.isPending}
+                >
+                  Fix &amp; Resubmit
+                </Button>
+              </Space>
+            </div>
+          }
+        />
+      ))}
+
+      <Row gutter={[16, 16]}>
+        {/* ── Assigned areas ───────────────────────────────────────────────── */}
+        <Col xs={24} md={14}>
+          <Card
+            size="small"
+            title={
+              <Space>
+                <FolderOutlined style={{ color: '#4fc3f7' }} />
+                <Text style={{ color: '#aaa' }}>My Assigned Areas</Text>
+                {assigned.length > 0 && <Badge count={assigned.length} color="#1677ff" />}
+              </Space>
+            }
+            style={{ background: '#0e1a2e', border: '1px solid #1a3050', minHeight: 180 }}
+          >
+            {assigned.length === 0 ? (
+              <Empty
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description={<Text style={{ color: '#555' }}>No areas assigned to you</Text>}
+              />
+            ) : (
+              <List
+                size="small"
+                dataSource={assigned}
+                renderItem={area => (
+                  <List.Item
+                    style={{ borderColor: '#1a3050', padding: '8px 0' }}
+                    actions={[
+                      <Button
+                        key="map"
+                        size="small"
+                        icon={<GlobalOutlined />}
+                        onClick={() => navigate(`/map?project=${area.project_id}`)}
+                      >
+                        Map
+                      </Button>,
+                      area.status === 'DRAFT' && (
+                        <Button
+                          key="submit"
+                          size="small"
+                          type="primary"
+                          icon={<SendOutlined />}
+                          onClick={() => submitMutation.mutate(area.id)}
+                          loading={submitMutation.isPending}
+                        >
+                          Submit
+                        </Button>
+                      ),
+                    ].filter(Boolean)}
+                  >
+                    <List.Item.Meta
+                      title={
+                        <Space size={6}>
+                          <Text style={{ color: '#e0e0e0', fontSize: 13 }}>{area.name}</Text>
+                          <Tag color={STATUS_COLOR[area.status] || 'default'} style={{ fontSize: 10 }}>
+                            {area.status}
+                          </Tag>
+                        </Space>
+                      }
+                      description={
+                        <Text style={{ color: '#6a9fc8', fontSize: 11 }}>
+                          {area.project_number} · {area.project_name}
+                        </Text>
+                      }
+                    />
+                  </List.Item>
+                )}
+              />
+            )}
+          </Card>
+        </Col>
+
+        {/* ── In-progress (submitted / under review) ───────────────────────── */}
+        <Col xs={24} md={10}>
+          <Card
+            size="small"
+            title={
+              <Space>
+                <SyncOutlined spin={in_progress.length > 0} style={{ color: '#fa8c16' }} />
+                <Text style={{ color: '#aaa' }}>Awaiting Review</Text>
+                {in_progress.length > 0 && <Badge count={in_progress.length} color="#fa8c16" />}
+              </Space>
+            }
+            style={{ background: '#0e1a2e', border: '1px solid #1a3050', minHeight: 180 }}
+          >
+            {in_progress.length === 0 ? (
+              <Empty
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description={<Text style={{ color: '#555' }}>Nothing pending review</Text>}
+              />
+            ) : (
+              <List
+                size="small"
+                dataSource={in_progress}
+                renderItem={area => (
+                  <List.Item style={{ borderColor: '#1a3050', padding: '6px 0' }}>
+                    <List.Item.Meta
+                      title={
+                        <Space size={6}>
+                          <Text style={{ color: '#e0e0e0', fontSize: 12 }}>{area.name}</Text>
+                          <Tag color={STATUS_COLOR[area.status] || 'default'} style={{ fontSize: 10 }}>
+                            {area.status === 'SUBMITTED' ? 'Submitted' : 'Under Review'}
+                          </Tag>
+                        </Space>
+                      }
+                      description={
+                        <Text style={{ color: '#6a9fc8', fontSize: 11 }}>
+                          {area.project_number} · {dayjs(area.updated_at).fromNow()}
+                        </Text>
+                      }
+                    />
+                  </List.Item>
+                )}
+              />
+            )}
+          </Card>
+        </Col>
+      </Row>
+
+      {!hasWork && (
+        <Card size="small" style={{ background: '#0a1a0a', border: '1px solid #1a4020', textAlign: 'center', padding: 24 }}>
+          <CheckCircleOutlined style={{ fontSize: 28, color: '#52c41a', marginBottom: 8 }} />
+          <div><Text style={{ color: '#52c41a' }}>All clear — no pending work assigned to you.</Text></div>
+        </Card>
+      )}
     </div>
   )
 }
@@ -282,6 +506,7 @@ export default function DashboardPage() {
   const { t } = useTranslation()
   const { user } = useAppStore()
   const isAdmin = user && ['SUPERADMIN', 'DEO_ADMIN', 'CEO_ADMIN', 'ADEO_ADMIN'].includes(user.role)
+  const isFieldUser = user?.role === 'SDO' || user?.role === 'SURVEYOR'
 
   const { data, isLoading } = useQuery<DashboardStats>({
     queryKey: ['dashboard-stats'],
@@ -302,6 +527,9 @@ export default function DashboardPage() {
   return (
     <div style={{ padding: '20px 24px', overflowY: 'auto', height: '100%', background: '#050510' }}>
       <Title level={4} style={{ color: '#4fc3f7', marginBottom: 20 }}>{t('dashboard.title')}</Title>
+
+      {/* ── SDO / Surveyor: personal My Work section at the top ────────────── */}
+      {isFieldUser && <MyWorkCard />}
 
       {/* Stats Cards */}
       <Row gutter={[16, 16]}>

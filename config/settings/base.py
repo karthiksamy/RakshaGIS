@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'apps.backups',
     'apps.external_data',
     'apps.revenue_connectors',
+    'apps.field_ops',
 
     # Django Channels
     'channels',

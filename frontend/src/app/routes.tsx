@@ -38,6 +38,9 @@ const AccessRequestsPage = lazy(() => import('@/features/projects/AccessRequests
 const ProvenanceVerifyPage = lazy(() => import('@/features/provenance/ProvenanceVerifyPage'))
 const DroneDatasetsPage = lazy(() => import('@/features/drone/DroneDatasetsPage'))
 const SLAPage            = lazy(() => import('@/features/sla/SLAPage'))
+const EncroachmentPage   = lazy(() => import('@/features/encroachment/EncroachmentPage'))
+const FieldDiaryPage     = lazy(() => import('@/features/field-diary/FieldDiaryPage'))
+const EquipmentPage      = lazy(() => import('@/features/equipment/EquipmentPage'))
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const user = useAppStore((s) => s.user)
@@ -95,6 +98,9 @@ export default function AppRoutes() {
           <Route path="settings/external-data" element={<ExternalDatabasePage />} />
           <Route path="settings/security"      element={<SecurityPage />} />
           <Route path="sla" element={<SLAPage />} />
+          <Route path="encroachments" element={<EncroachmentPage />} />
+          <Route path="field-diary" element={<FieldDiaryPage />} />
+          <Route path="equipment" element={<EquipmentPage />} />
           <Route path="qgis-sync" element={<QGISSyncPage />} />
           <Route path="verify" element={<ProvenanceVerifyPage />} />
         </Route>

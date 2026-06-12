@@ -11,7 +11,7 @@ import {
   BellOutlined, DashboardOutlined, BarChartOutlined, AuditOutlined, ApartmentOutlined,
   CheckCircleOutlined, SearchOutlined, BgColorsOutlined, EyeOutlined, EnvironmentOutlined,
   ShareAltOutlined, ImportOutlined, CompassOutlined, SafetyOutlined, CloudServerOutlined,
-  SafetyCertificateOutlined, ClockCircleOutlined,
+  SafetyCertificateOutlined, ClockCircleOutlined, WarningOutlined, BookOutlined, ToolOutlined,
 } from '@ant-design/icons'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
@@ -32,6 +32,9 @@ const NAV_ITEMS = [
   { key: '/terrain', icon: <CompassOutlined />, label: '3D Terrain' },
   { key: '/drone', icon: <CloudServerOutlined />, label: 'Drone Survey' },
   { key: '/field', icon: <EnvironmentOutlined />, label: 'Field Companion' },
+  { key: '/encroachments', icon: <WarningOutlined />, label: 'Encroachments' },
+  { key: '/field-diary', icon: <BookOutlined />, label: 'Field Diary (DPR)' },
+  { key: '/equipment', icon: <ToolOutlined />, label: 'Equipment Register' },
   { key: '/projects', icon: <FolderOutlined />, label: 'Projects' },
   { key: '/documents', icon: <FileOutlined />, label: 'Documents' },
   { key: '/basemaps', icon: <AppstoreOutlined />, label: 'Basemaps' },
@@ -175,6 +178,15 @@ export default function AppLayout() {
 
   const isSuperAdmin = user?.role === 'SUPERADMIN'
 
+  // Which main-nav keys each role group needs
+  const FIELD_NAV_KEYS  = new Set(['/dashboard', '/map', '/projects', '/field', '/ai-chat', '/documents'])
+  const REVIEW_NAV_KEYS = new Set(['/dashboard', '/map', '/projects', '/ai-chat', '/documents', '/ai-vision'])
+  const VIEWER_NAV_KEYS = new Set(['/dashboard', '/drilldown', '/map'])
+
+  const isFieldUser  = user?.role === 'SDO' || user?.role === 'SURVEYOR'
+  const isReviewer   = user?.role === 'CHECKER' || user?.role === 'APPROVER'
+  const isViewerOnly = user?.role === 'VIEWER' || user?.role === 'PDDE_VIEWER'
+
   function handleLogout() {
     localStorage.removeItem('access_token')
     localStorage.removeItem('refresh_token')
@@ -248,7 +260,15 @@ export default function AppLayout() {
   const translatedMasterItems = MASTER_NAV_ITEMS.map(item => ({ ...item, label: t(`nav.${item.key.replace('/master/','').replace(/-/g,'_')}`, item.label) }))
   const translatedSettingsItems = SETTINGS_NAV_ITEMS.map(item => ({ ...item, label: t(`nav.${item.key.replace('/settings/','').replace(/-/g,'_')}`, item.label) }))
 
-  const navItemsWithBadgeTranslated = translatedNavItems.map(item => {
+  // Filter nav items based on the logged-in user's role
+  const roleFilteredNavItems = translatedNavItems.filter(item => {
+    if (isFieldUser)  return FIELD_NAV_KEYS.has(item.key)
+    if (isReviewer)   return REVIEW_NAV_KEYS.has(item.key)
+    if (isViewerOnly) return VIEWER_NAV_KEYS.has(item.key)
+    return true // admins and superadmin see everything
+  })
+
+  const navItemsWithBadgeTranslated = roleFilteredNavItems.map(item => {
     if (item.key === '/access-requests' && pendingAccessCount > 0) {
       return { ...item, label: <Badge count={pendingAccessCount} size="small" offset={[6, 0]}>{item.label}</Badge> }
     }

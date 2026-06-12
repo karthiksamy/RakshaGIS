@@ -10,6 +10,7 @@ from .views import (
     QGISUploadLogViewSet, TemporaryLayerViewSet,
     SurveyAreaAccessRequestViewSet, ReviewAnnotationViewSet,
     FeatureCommentViewSet,
+    MyWorkView,
     georeference_image,
 )
 
@@ -40,4 +41,5 @@ urlpatterns = router.urls + [
     path('features/merge/', FeatureMergeView.as_view(), name='feature-merge'),
     path('features/<int:pk>/split/', FeatureSplitView.as_view(), name='feature-split'),
     path('georeference/', georeference_image, name='georeference-image'),
+    path('my-work/', MyWorkView.as_view(), name='my-work'),
 ]

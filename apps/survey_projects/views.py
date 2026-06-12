@@ -5267,3 +5267,71 @@ class FeatureCommentViewSet(viewsets.ModelViewSet):
         if comment.user_id != request.user.id and not request.user.is_superadmin:
             raise PermissionDenied('You can only delete your own comments.')
         return super().destroy(request, *args, **kwargs)
+
+
+class MyWorkView(APIView):
+    """
+    Personal work summary for the logged-in SDO / Surveyor.
+
+    Returns three buckets:
+      assigned    — areas where this user is the assignee, not yet published
+      returned    — areas returned for revision (with the most recent return remark)
+      in_progress — areas submitted or under review by this user
+    """
+
+    def get(self, request):
+        from django.db.models import Q, Prefetch
+        from apps.workflow.models import WorkflowStep
+
+        user = request.user
+        base = SurveyArea.objects.select_related('project')
+
+        assigned = list(
+            base.filter(assigned_to=user)
+            .exclude(status__in=[SurveyArea.PUBLISHED, SurveyArea.APPROVED])
+            .order_by('status', 'updated_at')
+        )
+
+        returned = list(
+            base.filter(
+                Q(assigned_to=user) | Q(created_by=user),
+                status=SurveyArea.RETURNED,
+            ).prefetch_related(
+                Prefetch(
+                    'workflow_steps',
+                    queryset=WorkflowStep.objects.filter(
+                        action=WorkflowStep.RETURN
+                    ).order_by('-timestamp'),
+                    to_attr='return_steps',
+                )
+            )
+        )
+
+        in_progress = list(
+            base.filter(
+                Q(assigned_to=user) | Q(created_by=user),
+                status__in=[SurveyArea.SUBMITTED, SurveyArea.UNDER_REVIEW],
+            ).order_by('updated_at')
+        )
+
+        def _serialize(area, include_remark=False):
+            d = {
+                'id': area.id,
+                'name': area.name,
+                'area_code': area.area_code,
+                'status': area.status,
+                'project_id': area.project_id,
+                'project_number': area.project.project_number,
+                'project_name': area.project.name,
+                'updated_at': area.updated_at.isoformat(),
+            }
+            if include_remark:
+                steps = getattr(area, 'return_steps', [])
+                d['return_remark'] = steps[0].remarks if steps else ''
+            return d
+
+        return Response({
+            'assigned':    [_serialize(a) for a in assigned],
+            'returned':    [_serialize(a, include_remark=True) for a in returned],
+            'in_progress': [_serialize(a) for a in in_progress],
+        })

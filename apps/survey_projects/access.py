@@ -19,13 +19,13 @@ from apps.accounts.models import Organisation
 
 
 def hq_level(user):
-    """Return 'DGDE' or 'PDDE' for non-superadmin users at those office levels.
+    """Return 'DGDE' or 'PDDE' for users at those office levels.
 
-    These users are Map-Viewer-only with respect to subordinate offices.
-    Returns None for superadmins and all field-office users.
+    These users are Map-Viewer-only with respect to subordinate offices and
+    have no rights to view/add/edit/remove subordinate content. This applies
+    to SUPERADMIN accounts too when they are attached to an HQ office — only
+    a superadmin with NO organisation (pure system account) is exempt.
     """
-    if user.is_superadmin:
-        return None
     level = getattr(getattr(user, 'organisation', None), 'level', None)
     return level if level in (Organisation.DGDE, Organisation.PDDE) else None
 
@@ -76,17 +76,18 @@ def ai_project_ids(user):
     """
     from .models import SurveyProject
 
-    if user.is_superadmin:
-        return None
     org = getattr(user, 'organisation', None)
     if org is None:
-        return []
+        # Pure system account (superadmin without office) → unrestricted
+        return None if user.is_superadmin else []
     if org.level == Organisation.DGDE:
         return None
     if org.level == Organisation.PDDE:
         return list(SurveyProject.objects.filter(
             organisation_id__in=org.get_subtree_ids()
         ).values_list('id', flat=True))
+    if user.is_superadmin:
+        return None
     own_ids = list(SurveyProject.objects.filter(organisation=org)
                    .values_list('id', flat=True))
     return list(set(own_ids + permitted_extra_project_ids(user)))

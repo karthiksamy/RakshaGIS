@@ -1298,6 +1298,9 @@ export default function MapPage() {
   const [offlineQueueCount, setOfflineQueueCount] = useState(0)
   const [offlineDownloading, setOfflineDownloading] = useState(false)
   const [gpsActive, setGpsActive] = useState(false)
+  // Collapsed by default — both tools expand on icon click
+  const [pwaPanelOpen, setPwaPanelOpen] = useState(false)
+  const [coordPanelOpen, setCoordPanelOpen] = useState(false)
   const [gpsAutoTrack, setGpsAutoTrack] = useState(false)
   const [gpsCoords, setGpsCoords] = useState<[number, number] | null>(null)
   const gpsWatchId = useRef<number | null>(null)
@@ -5498,7 +5501,25 @@ export default function MapPage() {
           />
         </Tooltip>
 
-        {/* PWA Offline & GPS Panel */}
+        {/* PWA Offline & GPS Panel — collapsed to an icon until clicked */}
+        {!pwaPanelOpen && (
+          <Tooltip title={`Offline Field PWA — ${isOnline ? 'Online' : 'OFFLINE'}`
+            + (offlineQueueCount ? ` · ${offlineQueueCount} edit(s) pending sync` : '')}
+            placement="left">
+            <Badge count={offlineQueueCount} size="small" style={{ alignSelf: 'flex-end' }}>
+              <Button
+                icon={<WifiOutlined />} size="small"
+                onClick={() => setPwaPanelOpen(true)}
+                style={{
+                  background: 'rgba(20,20,30,0.85)',
+                  border: `1px solid ${isOnline ? '#333' : '#fbbf24'}`,
+                  color: isOnline ? '#ddd' : '#fbbf24',
+                }}
+              />
+            </Badge>
+          </Tooltip>
+        )}
+        {pwaPanelOpen && (
         <div style={{
           background: 'rgba(10, 16, 30, 0.95)',
           border: '1px solid #1e293b',
@@ -5517,9 +5538,16 @@ export default function MapPage() {
           {/* Header & Status */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #334155', paddingBottom: 6 }}>
             <span style={{ fontWeight: 600, letterSpacing: '0.05em', color: '#38bdf8' }}>OFFLINE FIELD PWA</span>
-            <Tooltip title={isOnline ? 'Online' : 'Offline Mode'}>
-              <Badge status={isOnline ? 'success' : 'warning'} text={isOnline ? <span style={{ color: '#4ade80', fontSize: 11 }}>Online</span> : <span style={{ color: '#fbbf24', fontSize: 11 }}>Offline</span>} />
-            </Tooltip>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Tooltip title={isOnline ? 'Online' : 'Offline Mode'}>
+                <Badge status={isOnline ? 'success' : 'warning'} text={isOnline ? <span style={{ color: '#4ade80', fontSize: 11 }}>Online</span> : <span style={{ color: '#fbbf24', fontSize: 11 }}>Offline</span>} />
+              </Tooltip>
+              <Button
+                type="text" size="small" icon={<CloseOutlined />}
+                onClick={() => setPwaPanelOpen(false)}
+                style={{ color: '#64748b', width: 18, height: 18, minWidth: 18 }}
+              />
+            </span>
           </div>
 
           {/* Sync & Download Buttons */}
@@ -5606,10 +5634,25 @@ export default function MapPage() {
             )}
           </div>
         </div>
+        )}
       </div>
 
+      {/* Coordinate tool — collapsed to an icon until clicked */}
+      {mapCoords && !coordPanelOpen && (
+        <Tooltip title={`Coordinates: ${formatCoords()} — click to open the Coordinate Tool`} placement="left">
+          <Button
+            icon={<AimOutlined />} size="small"
+            onClick={() => setCoordPanelOpen(true)}
+            style={{
+              position: 'absolute', bottom: 32, right: 12, zIndex: 100,
+              background: 'rgba(20,20,30,0.85)', border: '1px solid #333', color: '#ddd',
+            }}
+          />
+        </Tooltip>
+      )}
+
       {/* Coordinate display & interactive converter/jump tool */}
-      {mapCoords && (
+      {mapCoords && coordPanelOpen && (
         <div style={{
           position: 'absolute',
           bottom: 32,
@@ -5627,9 +5670,16 @@ export default function MapPage() {
           {/* header */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: 4 }}>
             <span style={{ fontSize: 10, fontWeight: 600, color: '#38bdf8', textTransform: 'uppercase', letterSpacing: 0.5 }}>Coordinate Tool</span>
-            <Tooltip title="Type coordinates below and press enter to jump. Supports Lat,Lon (DD/DMS) or UTM (Easting Northing Zone)">
-              <InfoCircleOutlined style={{ fontSize: 11, color: '#64748b', cursor: 'help' }} />
-            </Tooltip>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Tooltip title="Type coordinates below and press enter to jump. Supports Lat,Lon (DD/DMS) or UTM (Easting Northing Zone)">
+                <InfoCircleOutlined style={{ fontSize: 11, color: '#64748b', cursor: 'help' }} />
+              </Tooltip>
+              <Button
+                type="text" size="small" icon={<CloseOutlined />}
+                onClick={() => setCoordPanelOpen(false)}
+                style={{ color: '#64748b', width: 18, height: 18, minWidth: 18 }}
+              />
+            </span>
           </div>
           
           {/* displays */}

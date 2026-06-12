@@ -64,6 +64,14 @@ class CanEditProject(BasePermission):
             return True
         user = request.user
         if user.role == User.SUPERADMIN:
+            # HQ-attached superadmin (DGDE/PDDE office): may modify own-office
+            # content only — HQ has no add/edit/remove rights over sub offices.
+            org = getattr(user, 'organisation', None)
+            if org is not None and org.level in ('DGDE', 'PDDE'):
+                obj_org_id = getattr(obj, 'organisation_id', None)
+                if obj_org_id is None and getattr(obj, 'project', None) is not None:
+                    obj_org_id = obj.project.organisation_id
+                return obj_org_id == org.id
             return True
         if not user.role in (User.SDO, User.SURVEYOR):
             return False
@@ -134,6 +142,13 @@ def org_queryset_filter(user, qs, org_field='organisation'):
     SurveyAreaAccessRequest, deo_visible opt-in) added by the viewsets.
     """
     if user.role == User.SUPERADMIN:
+        # A superadmin ATTACHED to a DGDE/PDDE office is an HQ user and gets
+        # the same isolation as everyone else there — HQ has no rights over
+        # subordinate offices' content. Only a superadmin with NO organisation
+        # (pure system account) retains global visibility.
+        org = getattr(user, 'organisation', None)
+        if org is not None and org.level in ('DGDE', 'PDDE'):
+            return qs.filter(**{org_field: org})
         return qs
     return qs.filter(**{org_field: user.organisation})
 

@@ -51,7 +51,8 @@ class DashboardStatsView(APIView):
         user = request.user
 
         if user.is_superadmin:
-            projects = SurveyProject.objects.all()
+            from apps.accounts.permissions import org_queryset_filter
+            projects = org_queryset_filter(user, SurveyProject.objects.all())
         elif user.organisation:
             org_ids = _visible_org_ids(user)
             projects = SurveyProject.objects.filter(
@@ -99,13 +100,20 @@ class DashboardStatsView(APIView):
             .order_by('month')
         )
 
-        # Recent workflow actions — primary at survey-area level
-        if user.is_superadmin:
+        # Recent workflow actions — primary at survey-area level.
+        # HQ (DGDE/PDDE) users ARE allowed to monitor ongoing ACTIVITY of their
+        # offices (who forwarded/approved/published what) — DGDE across all
+        # offices, PDDE across its command — even though project content
+        # itself stays isolated.
+        from apps.survey_projects.access import hq_level as _hq
+        _level = _hq(user)
+        if (user.is_superadmin and not _level) or _level == 'DGDE':
             recent_actions = WorkflowStep.objects.select_related(
                 'project', 'survey_area__project', 'actor'
             ).order_by('-timestamp')[:12]
         elif user.organisation:
-            org_ids = _visible_org_ids(user)
+            org_ids = (user.organisation.get_subtree_ids() if _level == 'PDDE'
+                       else _visible_org_ids(user))
             recent_actions = WorkflowStep.objects.filter(
                 Q(project__organisation_id__in=org_ids) |
                 Q(survey_area__project__organisation_id__in=org_ids)
@@ -216,7 +224,8 @@ class SurveyAreaProgressView(APIView):
         project_id = request.query_params.get('project')
 
         if user.is_superadmin:
-            projects = SurveyProject.objects.all()
+            from apps.accounts.permissions import org_queryset_filter
+            projects = org_queryset_filter(user, SurveyProject.objects.all())
         elif user.organisation:
             org_ids = _visible_org_ids(user)
             projects = SurveyProject.objects.filter(
@@ -254,7 +263,8 @@ class GlobalSearchView(APIView):
         user = request.user
 
         if user.is_superadmin:
-            projects = SurveyProject.objects.all()
+            from apps.accounts.permissions import org_queryset_filter
+            projects = org_queryset_filter(user, SurveyProject.objects.all())
         elif user.organisation:
             # Search returns concrete project/feature/area records — scope it
             # exactly like the projects API: own org + explicit grants only.
@@ -359,7 +369,8 @@ class SLAReportView(APIView):
         page_size = min(int(request.query_params.get('page_size', 200)), 500)
 
         if user.is_superadmin:
-            projects = SurveyProject.objects.all()
+            from apps.accounts.permissions import org_queryset_filter
+            projects = org_queryset_filter(user, SurveyProject.objects.all())
         elif user.organisation:
             org_ids = _visible_org_ids(user)
             projects = SurveyProject.objects.filter(organisation_id__in=org_ids)
@@ -541,11 +552,11 @@ class OrgDrilldownView(APIView):
 
     def get(self, request):
         user = request.user
-        if user.is_superadmin:
-            home = (Organisation.objects.filter(level=Organisation.DGDE).first()
-                    or user.organisation)
-        else:
-            home = user.organisation
+        # Org-attached users (incl. superadmins at an HQ office) start at their
+        # own office; only an org-less superadmin starts at the national root.
+        home = user.organisation
+        if home is None and user.is_superadmin:
+            home = Organisation.objects.filter(level=Organisation.DGDE).first()
         if home is None:
             return Response({'detail': 'No organisation assigned.'}, status=403)
 

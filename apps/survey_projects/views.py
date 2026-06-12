@@ -64,8 +64,13 @@ class SurveyProjectViewSet(viewsets.ModelViewSet):
         return [permissions.IsAuthenticated()]
 
     def perform_create(self, serializer):
-        # SUPERADMIN may send an explicit organisation; everyone else uses their own
+        from .access import hq_level
+        # SUPERADMIN may send an explicit organisation; everyone else uses their
+        # own. HQ-attached users (DGDE/PDDE, incl. superadmins) always create in
+        # their OWN office — never in a subordinate one.
         org = serializer.validated_data.get('organisation') or self.request.user.organisation
+        if hq_level(self.request.user):
+            org = self.request.user.organisation
         if org is None:
             from rest_framework.exceptions import ValidationError
             raise ValidationError({'organisation': 'Organisation is required.'})
@@ -2457,7 +2462,12 @@ class SurveyAreaViewSet(viewsets.ModelViewSet):
         # Only SDO/SURVEYOR/SUPERADMIN can create survey areas
         if user.role not in (User.SDO, User.SURVEYOR, User.SUPERADMIN):
             raise PermissionDenied('Only SDO/Surveyor can create survey areas.')
-        if user.role != User.SUPERADMIN and project.organisation != user.organisation:
+        from .access import hq_level
+        if user.role == User.SUPERADMIN:
+            # HQ-attached superadmin may only create within their own office
+            if hq_level(user) and project.organisation_id != user.organisation_id:
+                raise PermissionDenied('HQ offices cannot create content in subordinate offices.')
+        elif project.organisation != user.organisation:
             raise PermissionDenied('Permission denied.')
         area = serializer.save(created_by=user)
         # Auto-create the default folder tree so features are always area-scoped
@@ -3493,10 +3503,9 @@ class ProjectLayerFolderViewSet(viewsets.ModelViewSet):
         from .access import hq_level, published_map_filter
         base_qs = ProjectLayerFolder.objects.select_related('project__organisation', 'parent', 'created_by')
         own_qs = org_queryset_filter(user, base_qs, org_field='project__organisation')
-        if user.is_superadmin:
-            return own_qs
-        # DGDE/PDDE office users: own-org folders + folder subtrees of PUBLISHED
-        # map-enabled survey areas (the Map Viewer layer tree), nothing else.
+        # DGDE/PDDE office users (incl. org-attached superadmins): own-org folders
+        # + folder subtrees of PUBLISHED map-enabled survey areas (the Map Viewer
+        # layer tree), nothing else.
         if hq_level(user):
             from apps.survey_projects.models import SurveyArea as _SA
             areas = published_map_filter(user, _SA.objects.filter(

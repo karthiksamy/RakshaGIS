@@ -188,6 +188,14 @@ export default function TerrainPage() {
   const [gpxLoaded, setGpxLoaded] = useState(false)
   const [gpxName, setGpxName] = useState<string | null>(null)
 
+  // Ad-hoc vector layer (shapefile zip / GeoJSON / KML / KMZ / GPKG) draped on terrain
+  const vectorDsRef = useRef<Cesium.GeoJsonDataSource | null>(null)
+  const vectorFileInputRef = useRef<HTMLInputElement>(null)
+  const vectorBboxRef = useRef<[number, number, number, number] | null>(null)
+  const [vectorLoaded, setVectorLoaded] = useState(false)
+  const [vectorName, setVectorName] = useState<string | null>(null)
+  const [vectorUploading, setVectorUploading] = useState(false)
+
   // ── LiDAR point cloud ──────────────────────────────────────────────────────
   const lidarFileInputRef = useRef<HTMLInputElement>(null)
   const lidarPointsRef = useRef<Cesium.PointPrimitiveCollection | null>(null)
@@ -732,6 +740,14 @@ export default function TerrainPage() {
     }
     setGpxLoaded(false)
     setGpxName(null)
+    // Remove uploaded vector layer
+    if (vectorDsRef.current) {
+      viewer.dataSources.remove(vectorDsRef.current)
+      vectorDsRef.current = null
+    }
+    vectorBboxRef.current = null
+    setVectorLoaded(false)
+    setVectorName(null)
     // Remove LiDAR point cloud
     if (lidarPointsRef.current) {
       viewer.scene.primitives.remove(lidarPointsRef.current)
@@ -920,6 +936,85 @@ export default function TerrainPage() {
       message.error(err?.response?.data?.error || 'LiDAR upload failed')
     } finally {
       setLidarUploading(false)
+    }
+  }, [])
+
+  // ── Ad-hoc vector layer upload (shapefile/GeoJSON/KML/GPKG → drape on terrain) ──
+  const handleVectorImport = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    const viewer = viewerRef.current
+    if (!file || !viewer) return
+    e.target.value = ''
+    setVectorUploading(true)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const res = await api.post('/core/terrain/vector-upload/', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      const { geojson, bbox, feature_count, truncated } = res.data
+
+      if (vectorDsRef.current) {
+        viewer.dataSources.remove(vectorDsRef.current, true)
+        vectorDsRef.current = null
+      }
+      const ds = await Cesium.GeoJsonDataSource.load(geojson, {
+        clampToGround: true,
+        stroke: Cesium.Color.fromCssColorString('#4fc3f7'),
+        fill: Cesium.Color.fromCssColorString('#4fc3f7').withAlpha(0.25),
+        strokeWidth: 2,
+        markerColor: Cesium.Color.fromCssColorString('#4fc3f7'),
+      })
+      ds.name = 'uploaded-vector'
+      await viewer.dataSources.add(ds)
+      vectorDsRef.current = ds
+      vectorBboxRef.current = bbox
+
+      const [minLon, minLat, maxLon, maxLat] = bbox
+      const padLon = Math.max((maxLon - minLon) * 0.3, 0.005)
+      const padLat = Math.max((maxLat - minLat) * 0.3, 0.005)
+      viewer.camera.flyTo({
+        destination: Cesium.Rectangle.fromDegrees(
+          Math.max(minLon - padLon, -180), Math.max(minLat - padLat, -90),
+          Math.min(maxLon + padLon, 180), Math.min(maxLat + padLat, 90),
+        ),
+        duration: 1.5,
+      })
+      setVectorLoaded(true)
+      setVectorName(file.name)
+      message.success(
+        `${feature_count} feature(s) loaded from ${file.name}` +
+        `${truncated ? ' (truncated)' : ''} — press Analyze to run terrain analysis`,
+      )
+    } catch (err: any) {
+      message.error(err?.response?.data?.error || 'Failed to load vector file')
+    } finally {
+      setVectorUploading(false)
+    }
+  }, [])
+
+  // Run the slope/DEM analysis pipeline over the uploaded layer's extent —
+  // fills slope statistics and enables every DEM Tools analysis.
+  const analyzeVectorExtent = useCallback(async () => {
+    const viewer = viewerRef.current
+    const bbox = vectorBboxRef.current
+    if (!viewer || !bbox) return
+    const [minLon, minLat, maxLon, maxLat] = bbox
+    setSlopeBuilding(true)
+    setPanelOpen(true)
+    try {
+      const { stats, gridData } = await computeSlopeStats(
+        viewer,
+        Cesium.Cartesian3.fromDegrees(minLon, minLat),
+        Cesium.Cartesian3.fromDegrees(maxLon, maxLat),
+      )
+      setSlopeStats(stats)
+      setSlopeGridData(gridData)
+      message.success('Analysis grid ready — slope statistics and DEM tools now cover the uploaded layer')
+    } catch {
+      message.error('Terrain analysis failed for this extent')
+    } finally {
+      setSlopeBuilding(false)
     }
   }, [])
 
@@ -1612,6 +1707,35 @@ export default function TerrainPage() {
           style={{ display: 'none' }}
           onChange={handleGpxImport}
         />
+
+        <Tooltip title={vectorLoaded
+          ? `Layer: ${vectorName} — click to replace`
+          : 'Upload shapefile (.zip), GeoJSON, KML/KMZ or GPKG and drape it on the 3D terrain'}>
+          <Button
+            size="small"
+            icon={<UploadOutlined />}
+            type={vectorLoaded ? 'primary' : 'default'}
+            loading={vectorUploading}
+            onClick={() => vectorFileInputRef.current?.click()}
+            disabled={!ready}
+          >
+            Vector
+          </Button>
+        </Tooltip>
+        <input
+          ref={vectorFileInputRef}
+          type="file"
+          accept=".zip,.geojson,.json,.kml,.kmz,.gpkg"
+          style={{ display: 'none' }}
+          onChange={handleVectorImport}
+        />
+        {vectorLoaded && (
+          <Tooltip title="Sample the terrain across the uploaded layer's extent — enables slope statistics and all DEM analysis tools">
+            <Button size="small" type="primary" ghost onClick={analyzeVectorExtent} disabled={!ready}>
+              Analyze
+            </Button>
+          </Tooltip>
+        )}
 
         <Tooltip title={lidarLoaded ? `LiDAR: ${lidarName} — click to reload` : 'Upload .las / .laz point cloud — displays in 3D and derives DEM'}>
           <Button

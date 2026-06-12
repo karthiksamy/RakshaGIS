@@ -2293,6 +2293,137 @@ def export_download(request, task_uuid):
 
 
 
+# ── Terrain viewer: ad-hoc vector upload ───────────────────────────────────────
+
+class TerrainVectorUploadView(APIView):
+    """
+    POST /api/core/terrain/vector-upload/   (multipart: file)
+
+    Parse an uploaded vector file and return WGS84 GeoJSON for draping on the
+    3D terrain viewer. Nothing is written to the database — this is a viewing/
+    analysis aid, not an import.
+
+    Supported: .zip (shapefile or KML inside), .geojson/.json, .kml, .kmz, .gpkg
+    Response:  { name, feature_count, truncated, bbox: [minLon,minLat,maxLon,maxLat],
+                 geojson: FeatureCollection }
+    """
+    parser_classes = [parsers.MultiPartParser]
+    permission_classes = [permissions.IsAuthenticated]
+
+    MAX_FEATURES = 10_000
+    MAX_SIZE_MB = 100
+
+    @staticmethod
+    def _walk_coords(coords, bbox):
+        """Update bbox [minLon,minLat,maxLon,maxLat] from nested coordinates."""
+        if not coords:
+            return
+        if isinstance(coords[0], (int, float)):
+            lon, lat = coords[0], coords[1]
+            bbox[0] = min(bbox[0], lon); bbox[1] = min(bbox[1], lat)
+            bbox[2] = max(bbox[2], lon); bbox[3] = max(bbox[3], lat)
+        else:
+            for c in coords:
+                TerrainVectorUploadView._walk_coords(c, bbox)
+
+    def post(self, request):
+        import json as _json
+        import tempfile
+        import zipfile as _zipfile
+        try:
+            import fiona
+            import fiona.transform
+        except ImportError:
+            return Response({'error': 'GDAL/fiona not available on server'}, status=503)
+
+        up = request.FILES.get('file')
+        if not up:
+            return Response({'error': 'No file uploaded'}, status=400)
+        if up.size > self.MAX_SIZE_MB * 1024 * 1024:
+            return Response({'error': f'File exceeds {self.MAX_SIZE_MB} MB limit'}, status=400)
+
+        ext = (up.name.lower().rsplit('.', 1)[-1] if '.' in up.name else '')
+        if ext not in ('zip', 'geojson', 'json', 'kml', 'kmz', 'gpkg'):
+            return Response({'error': f'Unsupported format ".{ext}". '
+                                      'Use shapefile .zip, GeoJSON, KML/KMZ or GPKG.'}, status=400)
+
+        features: list = []
+        bbox = [180.0, 90.0, -180.0, -90.0]
+        truncated = False
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src_path = os.path.join(tmpdir, os.path.basename(up.name))
+                with open(src_path, 'wb') as f:
+                    for chunk in up.chunks():
+                        f.write(chunk)
+
+                # Archives: extract and locate the actual vector layer(s)
+                if ext in ('zip', 'kmz'):
+                    with _zipfile.ZipFile(src_path) as zf:
+                        zf.extractall(tmpdir)
+                    paths = []
+                    for root, _, files in os.walk(tmpdir):
+                        for fn in files:
+                            if fn.lower().endswith(('.shp', '.kml', '.geojson', '.gpkg')):
+                                paths.append(os.path.join(root, fn))
+                    if not paths:
+                        return Response({'error': 'No supported vector layer '
+                                                  '(.shp/.kml/.geojson/.gpkg) found in archive'}, status=400)
+                else:
+                    paths = [src_path]
+
+                for path in paths:
+                    try:
+                        layers = fiona.listlayers(path)
+                    except Exception:
+                        layers = [None]
+                    for layer in layers:
+                        try:
+                            src = fiona.open(path, layer=layer) if layer else fiona.open(path)
+                        except Exception:
+                            continue
+                        with src:
+                            src_crs = src.crs_wkt or 'EPSG:4326'
+                            for feat in src:
+                                if len(features) >= self.MAX_FEATURES:
+                                    truncated = True
+                                    break
+                                if feat.geometry is None:
+                                    continue
+                                geom = fiona.transform.transform_geom(
+                                    src_crs, 'EPSG:4326', feat.geometry)
+                                geom = _json.loads(_json.dumps(geom))  # plain dict
+                                props = {}
+                                for k, v in dict(feat.properties or {}).items():
+                                    props[str(k)] = (v if isinstance(v, (int, float, bool))
+                                                     or v is None else str(v))
+                                self._walk_coords(geom.get('coordinates'), bbox)
+                                features.append({'type': 'Feature',
+                                                 'geometry': geom,
+                                                 'properties': props})
+                        if truncated:
+                            break
+                    if truncated:
+                        break
+        except _zipfile.BadZipFile:
+            return Response({'error': 'Corrupt archive'}, status=400)
+        except Exception as exc:
+            logger.exception('terrain vector-upload parse error')
+            return Response({'error': f'Could not parse file: {exc}'}, status=400)
+
+        if not features:
+            return Response({'error': 'No features with geometry found in the file'}, status=400)
+
+        return Response({
+            'name': up.name,
+            'feature_count': len(features),
+            'truncated': truncated,
+            'bbox': bbox,
+            'geojson': {'type': 'FeatureCollection', 'features': features},
+        })
+
+
 # ── LiDAR point cloud upload ───────────────────────────────────────────────────
 
 class LidarUploadView(APIView):

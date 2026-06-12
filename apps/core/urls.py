@@ -3,7 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     BasemapConfigViewSet, BrandingConfigView, TerrainConfigView,
     TerrainExportGeoTIFFView, DEMAnalysisView, ElevationLookupView,
-    DroneDatasetViewSet, LidarUploadView,
+    DroneDatasetViewSet, LidarUploadView, TerrainVectorUploadView,
     export_map, map_styles, print_pdf, watermark_file,
     start_export, export_status, export_download,
     sentinel2_tile,
@@ -20,6 +20,7 @@ urlpatterns = router.urls + [
     path('terrain/export-geotiff/', TerrainExportGeoTIFFView.as_view(), name='terrain-export-geotiff'),
     path('terrain/dem-analysis/',   DEMAnalysisView.as_view(),          name='terrain-dem-analysis'),
     path('terrain/lidar-upload/',   LidarUploadView.as_view(),          name='terrain-lidar-upload'),
+    path('terrain/vector-upload/',  TerrainVectorUploadView.as_view(),  name='terrain-vector-upload'),
     path('export-map/', export_map, name='export-map'),
     path('map-styles/', map_styles, name='map-styles'),
     path('print-pdf/', print_pdf, name='print-pdf'),

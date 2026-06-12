@@ -121,7 +121,7 @@ export default function OrgDrilldownPage() {
             {data.children.length === 0 ? (
               <Empty
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description={<span style={{ color: '#556f8a' }}>No subordinate offices — this is the lowest level.</span>}
+                description={<span style={{ color: '#556f8a' }}>Drilldown ends here — only this office's own statistics are shown. Sub-office data is not aggregated.</span>}
               />
             ) : (
               <Table<DrilldownChild>

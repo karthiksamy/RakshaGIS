@@ -500,18 +500,26 @@ class OrgDrilldownView(APIView):
             cur = cur.parent
         return False
 
-    @staticmethod
-    def _descendant_ids(org) -> list:
-        """org.id + ALL descendants (any depth — BFS over parent links)."""
+    # Offices at or below DEO show their OWN statistics only — sub-office
+    # (CEO/ADEO) data is never aggregated upward or listed in the drilldown.
+    _LEAF_LEVELS = (Organisation.DEO, Organisation.CEO, Organisation.ADEO)
+
+    @classmethod
+    def _scope_ids(cls, org) -> list:
+        """org.id + descendants, stopping the descent at DEO level."""
+        if org.level in cls._LEAF_LEVELS:
+            return [org.id]
         ids = [org.id]
         frontier = [org.id]
         while frontier:
             children = list(
                 Organisation.objects.filter(parent_id__in=frontier)
-                .exclude(id__in=ids).values_list('id', flat=True)
+                .exclude(id__in=ids).values('id', 'level')
             )
-            ids.extend(children)
-            frontier = children
+            new_ids = [c['id'] for c in children]
+            ids.extend(new_ids)
+            frontier = [c['id'] for c in children
+                        if c['level'] not in cls._LEAF_LEVELS]
         return ids
 
     @staticmethod
@@ -552,19 +560,26 @@ class OrgDrilldownView(APIView):
         else:
             target = home
 
-        children = list(
-            Organisation.objects.filter(parent=target).order_by('level', 'name')
-        )
+        # Drilldown stops at DEO level: a DEO shows its own statistics only,
+        # its CEO/ADEO sub-offices are neither listed nor aggregated.
+        if target.level in self._LEAF_LEVELS:
+            children = []
+        else:
+            children = list(
+                Organisation.objects.filter(parent=target).order_by('level', 'name')
+            )
         child_rows = []
         for child in children:
-            sub_ids = self._descendant_ids(child)
             child_rows.append({
                 'id': child.id,
                 'name': child.name,
                 'level': child.level,
                 'level_display': child.get_level_display(),
-                'has_children': Organisation.objects.filter(parent=child).exists(),
-                'stats': self._org_stats(sub_ids),
+                'has_children': (
+                    child.level not in self._LEAF_LEVELS
+                    and Organisation.objects.filter(parent=child).exists()
+                ),
+                'stats': self._org_stats(self._scope_ids(child)),
             })
 
         # Breadcrumb: home → … → target (always stops at the user's own office)
@@ -582,6 +597,6 @@ class OrgDrilldownView(APIView):
                     'level_display': target.get_level_display()},
             'breadcrumb': breadcrumb,
             'own_stats': self._org_stats([target.id]),
-            'total_stats': self._org_stats(self._descendant_ids(target)),
+            'total_stats': self._org_stats(self._scope_ids(target)),
             'children': child_rows,
         })

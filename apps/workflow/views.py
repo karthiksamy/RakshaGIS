@@ -607,15 +607,18 @@ class EncroachmentSummaryView(APIView):
         qs = DisputeReport.objects.filter(
             status=DisputeReport.HAS_DISPUTES, acknowledged=False
         ).select_related('survey_area__project__organisation').order_by('-checked_at')
-        if not user.is_superadmin and user.organisation:
-            from apps.survey_projects.access import hq_level
-            # HQ (DGDE/PDDE) users: own org only — dispute details of
-            # subordinate offices are not their scope.
+        from apps.survey_projects.access import hq_level
+        if user.organisation:
+            # HQ (DGDE/PDDE) users including org-attached superadmins: own org only.
             if hq_level(user):
                 org_ids = [user.organisation_id]
+            elif user.is_superadmin:
+                # Global superadmin (no HQ restriction): sees all
+                org_ids = None
             else:
                 org_ids = user.organisation.get_subtree_ids()
-            qs = qs.filter(survey_area__project__organisation_id__in=org_ids)
+            if org_ids is not None:
+                qs = qs.filter(survey_area__project__organisation_id__in=org_ids)
         elif not user.is_superadmin:
             qs = qs.none()
         return qs

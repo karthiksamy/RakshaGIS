@@ -18,6 +18,9 @@ class ReportSchedule(models.Model):
     ACTIVITY_LOG     = 'ACTIVITY_LOG'
     TERRAIN_SUMMARY  = 'TERRAIN_SUMMARY'
     AI_SUMMARY       = 'AI_SUMMARY'
+    SURVEY_STATS     = 'SURVEY_STATS'
+    OWNERSHIP_SUM    = 'OWNERSHIP_SUM'
+    ENCROACHMENT     = 'ENCROACHMENT'
 
     REPORT_TYPE_CHOICES = [
         (STATUS_SUMMARY,  'Project Status Summary'),
@@ -25,6 +28,9 @@ class ReportSchedule(models.Model):
         (ACTIVITY_LOG,    'User Activity Log'),
         (TERRAIN_SUMMARY, 'Terrain Analysis Summary'),
         (AI_SUMMARY,      'AI Survey Summary'),
+        (SURVEY_STATS,    'Ministry Survey Statistics (PDF)'),
+        (OWNERSHIP_SUM,   'Ministry Ownership Summary (PDF)'),
+        (ENCROACHMENT,    'Ministry Encroachment Analysis (PDF)'),
     ]
 
     name = models.CharField(max_length=200)

@@ -4319,10 +4319,10 @@ class FeatureAttachmentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         feature_id = self.kwargs.get('feature_pk') or self.request.query_params.get('feature')
-        qs = FeatureAttachment.objects.select_related('uploaded_by', 'feature__project')
+        qs = FeatureAttachment.objects.select_related('uploaded_by', 'feature__project__organisation')
         if feature_id:
             qs = qs.filter(feature_id=feature_id)
-        return qs
+        return org_queryset_filter(self.request.user, qs, org_field='feature__project__organisation')
 
     def perform_create(self, request_file=None, **kwargs):
         pass  # handled in create()

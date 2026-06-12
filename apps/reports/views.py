@@ -20,13 +20,10 @@ class ReportScheduleViewSet(viewsets.ModelViewSet):
         return [IsSuperAdmin()]
 
     def get_queryset(self):
+        from apps.accounts.permissions import org_queryset_filter
         user = self.request.user
         qs = ReportSchedule.objects.select_related('organisation', 'created_by').all()
-        if user.is_superadmin:
-            return qs
-        if user.organisation:
-            return qs.filter(organisation=user.organisation)
-        return qs.none()
+        return org_queryset_filter(user, qs)
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)

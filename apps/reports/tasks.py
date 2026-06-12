@@ -25,6 +25,12 @@ def send_scheduled_reports():
                 _send_terrain_report(schedule, recipients, now)
             elif schedule.report_type == 'AI_SUMMARY':
                 _send_ai_summary_report(schedule, recipients, now)
+            elif schedule.report_type == 'SURVEY_STATS':
+                _send_ministry_report(schedule, recipients, now, 'SURVEY_STATS')
+            elif schedule.report_type == 'OWNERSHIP_SUM':
+                _send_ministry_report(schedule, recipients, now, 'OWNERSHIP_SUM')
+            elif schedule.report_type == 'ENCROACHMENT':
+                _send_ministry_report(schedule, recipients, now, 'ENCROACHMENT')
             else:
                 body = _build_report_body(schedule)
                 send_mail(
@@ -474,6 +480,432 @@ def _build_report_body(schedule):
 
     lines += ['', '---', 'Sent by RakshaGIS automated reporting system.']
     return '\n'.join(lines)
+
+
+# ── Ministry-format report suite ─────────────────────────────────────────────
+
+_MINISTRY_FILENAMES = {
+    'SURVEY_STATS': 'survey-statistics',
+    'OWNERSHIP_SUM': 'ownership-summary',
+    'ENCROACHMENT': 'encroachment-analysis',
+}
+_MINISTRY_SUBJECTS = {
+    'SURVEY_STATS': 'Ministry Survey Statistics',
+    'OWNERSHIP_SUM': 'Ministry Ownership Summary',
+    'ENCROACHMENT': 'Ministry Encroachment Analysis',
+}
+
+
+def _send_ministry_report(schedule, recipients, now, report_type):
+    builders = {
+        'SURVEY_STATS': _build_survey_stats_pdf,
+        'OWNERSHIP_SUM': _build_ownership_summary_pdf,
+        'ENCROACHMENT': _build_encroachment_analysis_pdf,
+    }
+    pdf_bytes = builders[report_type](schedule, now)
+    label = _MINISTRY_SUBJECTS[report_type]
+    subject = f'RakshaGIS {label}: {schedule.name} — {now.strftime("%d %b %Y")}'
+    body = (
+        f'RakshaGIS {label}\n'
+        f'Schedule    : {schedule.name}\n'
+        f'Organisation: {schedule.organisation.name}\n'
+        f'Generated   : {now.strftime("%d %B %Y %H:%M UTC")}\n\n'
+        f'The ministry-format PDF is attached.\n\n'
+        f'— RakshaGIS automated reporting system'
+    )
+    msg = EmailMessage(subject=subject, body=body,
+                       from_email=settings.DEFAULT_FROM_EMAIL, to=recipients)
+    if pdf_bytes:
+        slug = _MINISTRY_FILENAMES[report_type]
+        msg.attach(f'{slug}-{now.strftime("%Y%m%d")}.pdf', pdf_bytes, 'application/pdf')
+    msg.send(fail_silently=True)
+
+
+def _ministry_table_style(dark_blue, light_grey, grid_grey, total_row=False):
+    base = [
+        ('BACKGROUND', (0, 0), (-1, 0), dark_blue),
+        ('TEXTCOLOR', (0, 0), (-1, 0), 'white'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), ['white', light_grey]),
+        ('GRID', (0, 0), (-1, -1), 0.5, grid_grey),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+        ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+    ]
+    if total_row:
+        base += [
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('BACKGROUND', (0, -1), (-1, -1), '#e8eef4'),
+        ]
+    return base
+
+
+def _ministry_pdf_setup(schedule, now, title, buf):
+    """Return (doc, styles dict, story with header) for a ministry PDF."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, HRFlowable
+
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=2*cm, rightMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    base = getSampleStyleSheet()
+    DARK_BLUE = colors.HexColor('#1a2a4a')
+    s = {
+        'title': ParagraphStyle('T', parent=base['Heading1'], fontSize=16,
+                                spaceAfter=4, textColor=DARK_BLUE),
+        'sub': ParagraphStyle('S', parent=base['Normal'], fontSize=9, textColor=colors.grey),
+        'h': ParagraphStyle('H', parent=base['Heading3'], fontSize=11,
+                            textColor=DARK_BLUE, spaceBefore=10),
+        'warn': ParagraphStyle('W', parent=base['Normal'], fontSize=9,
+                               textColor=colors.HexColor('#c0392b')),
+        'DARK_BLUE': DARK_BLUE,
+        'LIGHT_GREY': colors.HexColor('#f5f5f5'),
+        'GRID_GREY': colors.HexColor('#cccccc'),
+        'cm': cm,
+        'colors': colors,
+    }
+    story = [
+        Paragraph('Ministry of Defence — Defence Geo-Data Engine (DGDE)', s['sub']),
+        Paragraph(title, s['title']),
+        Paragraph(
+            f'Organisation: <b>{schedule.organisation.name}</b> &nbsp;|&nbsp; '
+            f'Generated: {now.strftime("%d %B %Y %H:%M UTC")} &nbsp;|&nbsp; '
+            f'Schedule: <b>{schedule.name}</b>',
+            s['sub'],
+        ),
+        HRFlowable(width='100%', thickness=1, color=DARK_BLUE, spaceAfter=8),
+    ]
+    return doc, s, story
+
+
+def _build_survey_stats_pdf(schedule, now):
+    """Survey statistics: project counts by status/type, area totals, feature breakdown, monthly trend."""
+    try:
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable,
+        )
+        import io
+    except ImportError:
+        return None
+
+    from apps.survey_projects.models import SurveyProject, GISFeature
+    from django.db.models import Count, Q, Sum
+    from datetime import timedelta
+
+    org = schedule.organisation
+    projects = SurveyProject.objects.filter(organisation=org)
+    status_stats = projects.aggregate(
+        total=Count('id'),
+        draft=Count('id', filter=Q(status='DRAFT')),
+        submitted=Count('id', filter=Q(status='SUBMITTED')),
+        under_review=Count('id', filter=Q(status='UNDER_REVIEW')),
+        approved=Count('id', filter=Q(status='APPROVED')),
+        published=Count('id', filter=Q(status='PUBLISHED')),
+    )
+    total_area = float(projects.aggregate(s=Sum('total_area_hectares'))['s'] or 0)
+    type_stats = (
+        projects.values('survey_type')
+        .annotate(count=Count('id'), area=Sum('total_area_hectares'))
+        .order_by('survey_type')
+    )
+    TYPE_LABELS = {
+        'BOUNDARY': 'Boundary Survey', 'TOPOGRAPHIC': 'Topographic Survey',
+        'CANTONMENT': 'Cantonment Survey', 'REVENUE': 'Revenue Survey',
+        'LAYOUT': 'Layout Survey',
+    }
+    features = GISFeature.objects.filter(project__organisation=org, is_deleted=False)
+    feat = features.aggregate(
+        total=Count('id'),
+        points=Count('id', filter=Q(geometry_type='POINT')),
+        lines=Count('id', filter=Q(geometry_type='LINE')),
+        polygons=Count('id', filter=Q(geometry_type='POLYGON')),
+    )
+    monthly = []
+    for i in range(5, -1, -1):
+        m_start = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                   if i == 0 else None)
+        if i > 0:
+            import calendar
+            shifted = now.month - i
+            year = now.year + (shifted - 1) // 12
+            month = ((shifted - 1) % 12) + 1
+            m_start = now.replace(year=year, month=month, day=1,
+                                  hour=0, minute=0, second=0, microsecond=0)
+        next_month = m_start.month % 12 + 1
+        next_year = m_start.year + (1 if m_start.month == 12 else 0)
+        m_end = m_start.replace(year=next_year, month=next_month)
+        count = projects.filter(created_at__gte=m_start, created_at__lt=m_end).count()
+        monthly.append((m_start.strftime('%b %Y'), count))
+
+    buf = io.BytesIO()
+    doc, s, story = _ministry_pdf_setup(schedule, now, 'Survey Statistics Report', buf)
+    DARK_BLUE, LIGHT_GREY, GRID_GREY = s['DARK_BLUE'], s['LIGHT_GREY'], s['GRID_GREY']
+
+    def tbl(data, widths, total=False):
+        t = Table(data, colWidths=widths)
+        t.setStyle(TableStyle(_ministry_table_style(DARK_BLUE, LIGHT_GREY, GRID_GREY, total)))
+        return t
+
+    total = status_stats['total'] or 1
+    story += [
+        Paragraph('1. Project Status Distribution', s['h']),
+        tbl([
+            ['Status', 'Count', '% of Total'],
+            ['Draft',        str(status_stats['draft']),        f"{100*status_stats['draft']//total}%"],
+            ['Submitted',    str(status_stats['submitted']),    f"{100*status_stats['submitted']//total}%"],
+            ['Under Review', str(status_stats['under_review']), f"{100*status_stats['under_review']//total}%"],
+            ['Approved',     str(status_stats['approved']),     f"{100*status_stats['approved']//total}%"],
+            ['Published',    str(status_stats['published']),    f"{100*status_stats['published']//total}%"],
+            ['TOTAL',        str(status_stats['total']),        '100%'],
+        ], [8*cm, 4*cm, 3*cm], total=True),
+        Spacer(1, 0.3*cm),
+        Paragraph('2. Survey Type Breakdown', s['h']),
+    ]
+    type_data = [['Survey Type', 'Projects', 'Area (ha)']]
+    for row in type_stats:
+        type_data.append([TYPE_LABELS.get(row['survey_type'], row['survey_type']),
+                          str(row['count']), f"{float(row['area'] or 0):,.2f}"])
+    type_data.append(['TOTAL', str(status_stats['total']), f"{total_area:,.2f}"])
+    story += [
+        tbl(type_data, [8*cm, 4*cm, 3*cm], total=True),
+        Spacer(1, 0.3*cm),
+        Paragraph('3. GIS Feature Statistics', s['h']),
+        tbl([
+            ['Geometry Type', 'Count', '% of Total'],
+            ['Points',              str(feat['points']),   f"{100*(feat['points'] or 0)//(feat['total'] or 1)}%"],
+            ['Lines (Boundaries)',  str(feat['lines']),    f"{100*(feat['lines'] or 0)//(feat['total'] or 1)}%"],
+            ['Polygons (Parcels)',  str(feat['polygons']), f"{100*(feat['polygons'] or 0)//(feat['total'] or 1)}%"],
+            ['TOTAL',              str(feat['total']),     '100%'],
+        ], [8*cm, 4*cm, 3*cm], total=True),
+        Spacer(1, 0.3*cm),
+        Paragraph('4. Monthly Project Creation (Last 6 Months)', s['h']),
+        tbl([['Month', 'New Projects']] + [[m, str(c)] for m, c in monthly], [9*cm, 6*cm]),
+        Spacer(1, 0.8*cm),
+        HRFlowable(width='100%', thickness=0.5, color=s['colors'].grey),
+        Spacer(1, 0.2*cm),
+        Paragraph('Generated by RakshaGIS Automated Reporting — Defence Geo-Data Engine (DGDE). '
+                  'Classification: FOR OFFICIAL USE ONLY.', s['sub']),
+    ]
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _build_ownership_summary_pdf(schedule, now):
+    """Ownership summary: DefenceParcel holdings by category, classification and area."""
+    try:
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable,
+        )
+        import io
+    except ImportError:
+        return None
+
+    from apps.survey_projects.models import DefenceParcel
+    from django.db.models import Count, Sum
+    from datetime import timedelta
+
+    org = schedule.organisation
+    parcels = DefenceParcel.objects.filter(organisation=org)
+    total_parcels = parcels.count()
+    total_ha = float(parcels.aggregate(s=Sum('area_hectares'))['s'] or 0)
+
+    CATEGORY_LABELS = {
+        'CANTONMENT': 'Cantonment', 'RANGE': 'Firing / Training Range',
+        'AIRFIELD': 'Airfield / Helipad', 'DEPOT': 'Depot / Storehouse',
+        'TRAINING_AREA': 'Training Area', 'HOSPITAL': 'Military Hospital',
+        'OFFICE': 'Office / HQ', 'RESIDENTIAL': 'Residential Colony', 'OTHER': 'Other',
+    }
+    CLASS_LABELS = {
+        'UNCLASSIFIED': 'Unclassified', 'RESTRICTED': 'Restricted',
+        'CONFIDENTIAL': 'Confidential', 'SECRET': 'Secret',
+    }
+    cat_stats = (parcels.values('category')
+                 .annotate(count=Count('id'), area=Sum('area_hectares'))
+                 .order_by('category'))
+    class_stats = (parcels.values('classification')
+                   .annotate(count=Count('id'), area=Sum('area_hectares'))
+                   .order_by('classification'))
+    recent = list(
+        parcels.filter(created_at__gte=now - timedelta(days=30))
+        .order_by('-created_at')
+        .values('parcel_id', 'name', 'category', 'area_hectares')[:10]
+    )
+
+    buf = io.BytesIO()
+    doc, s, story = _ministry_pdf_setup(schedule, now, 'Defence Land Ownership Summary Report', buf)
+    DARK_BLUE, LIGHT_GREY, GRID_GREY = s['DARK_BLUE'], s['LIGHT_GREY'], s['GRID_GREY']
+    total_ha_safe = total_ha or 0.001
+
+    def tbl(data, widths, total=False):
+        t = Table(data, colWidths=widths)
+        t.setStyle(TableStyle(_ministry_table_style(DARK_BLUE, LIGHT_GREY, GRID_GREY, total)))
+        return t
+
+    # Section 1: Category breakdown
+    cat_data = [['Land Category', 'Parcels', 'Area (ha)', 'Area (acres)']]
+    for row in cat_stats:
+        ha = float(row['area'] or 0)
+        cat_data.append([CATEGORY_LABELS.get(row['category'], row['category']),
+                         str(row['count']), f"{ha:,.2f}", f"{ha * 2.47105:,.2f}"])
+    cat_data.append(['TOTAL', str(total_parcels),
+                     f"{total_ha:,.2f}", f"{total_ha * 2.47105:,.2f}"])
+
+    # Section 2: Classification matrix
+    cls_data = [['Classification', 'Parcels', 'Area (ha)', '% of Total']]
+    for row in class_stats:
+        ha = float(row['area'] or 0)
+        cls_data.append([CLASS_LABELS.get(row['classification'], row['classification']),
+                         str(row['count']), f"{ha:,.2f}", f"{100*ha/total_ha_safe:.1f}%"])
+
+    story += [
+        Paragraph('1. Holdings by Land Category', s['h']),
+        tbl(cat_data, [7*cm, 2.5*cm, 3*cm, 3*cm], total=True),
+        Spacer(1, 0.3*cm),
+        Paragraph('2. Classification Matrix', s['h']),
+        tbl(cls_data, [7*cm, 2.5*cm, 3*cm, 3*cm]),
+    ]
+
+    if recent:
+        recent_data = [['Parcel ID', 'Name', 'Category', 'Area (ha)']]
+        for p in recent:
+            recent_data.append([p['parcel_id'] or '—', (p['name'] or '')[:35],
+                                 CATEGORY_LABELS.get(p['category'], p['category']),
+                                 f"{float(p['area_hectares'] or 0):,.2f}"])
+        story += [
+            Spacer(1, 0.3*cm),
+            Paragraph('3. Recently Registered Parcels (Last 30 Days)', s['h']),
+            tbl(recent_data, [3*cm, 6*cm, 4*cm, 2.5*cm]),
+        ]
+
+    story += [
+        Spacer(1, 0.8*cm),
+        HRFlowable(width='100%', thickness=0.5, color=s['colors'].grey),
+        Spacer(1, 0.2*cm),
+        Paragraph('Generated by RakshaGIS Automated Reporting — Defence Geo-Data Engine (DGDE). '
+                  'Classification: FOR OFFICIAL USE ONLY.', s['sub']),
+    ]
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _build_encroachment_analysis_pdf(schedule, now):
+    """Encroachment analysis: DisputeReport counts, overlap areas, open vs acknowledged."""
+    try:
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable,
+        )
+        import io
+    except ImportError:
+        return None
+
+    from apps.workflow.models import DisputeReport
+    from apps.survey_projects.models import SurveyArea
+    from django.db.models import Count
+
+    org = schedule.organisation
+    area_ids = list(
+        SurveyArea.objects.filter(project__organisation=org).values_list('id', flat=True)
+    )
+    disputes_qs = DisputeReport.objects.filter(survey_area_id__in=area_ids)
+    total_reports = disputes_qs.count()
+    disputed_count = disputes_qs.filter(status='HAS_DISPUTES').count()
+    clean_count = disputes_qs.filter(status='CLEAN').count()
+    open_qs = disputes_qs.filter(status='HAS_DISPUTES', acknowledged=False)
+    acked_qs = disputes_qs.filter(status='HAS_DISPUTES', acknowledged=True)
+
+    total_overlap_sqm = 0.0
+    open_rows = []
+    for dr in open_qs.select_related('survey_area__project').order_by('-checked_at')[:50]:
+        row_overlap = sum(float(d.get('overlap_sqm', 0)) for d in (dr.disputes or []))
+        total_overlap_sqm += row_overlap
+        open_rows.append({
+            'area': dr.survey_area.name,
+            'project': (dr.survey_area.project.project_number or dr.survey_area.project.name),
+            'dispute_count': len(dr.disputes or []),
+            'overlap_sqm': row_overlap,
+            'date': dr.checked_at.strftime('%d %b %Y'),
+        })
+    for dr in acked_qs.order_by('-checked_at')[:100]:
+        total_overlap_sqm += sum(float(d.get('overlap_sqm', 0)) for d in (dr.disputes or []))
+
+    buf = io.BytesIO()
+    doc, s, story = _ministry_pdf_setup(schedule, now, 'Encroachment Analysis Report', buf)
+    DARK_BLUE, LIGHT_GREY, GRID_GREY = s['DARK_BLUE'], s['LIGHT_GREY'], s['GRID_GREY']
+
+    def tbl(data, widths):
+        t = Table(data, colWidths=widths)
+        t.setStyle(TableStyle(_ministry_table_style(DARK_BLUE, LIGHT_GREY, GRID_GREY)))
+        return t
+
+    summary_data = [
+        ['Metric', 'Value'],
+        ['Total spatial overlap checks run',      str(total_reports)],
+        ['Survey areas: Clean (no disputes)',      str(clean_count)],
+        ['Survey areas: Disputes detected',        str(disputed_count)],
+        ['Open (unacknowledged) dispute reports',  str(open_qs.count())],
+        ['Acknowledged dispute reports',           str(acked_qs.count())],
+        ['Total overlapping area (sq. m)',         f"{total_overlap_sqm:,.1f}"],
+        ['Total overlapping area (ha)',            f"{total_overlap_sqm / 10000:,.4f}"],
+    ]
+    story += [
+        Paragraph('1. Encroachment Summary', s['h']),
+        tbl(summary_data, [11*cm, 4.5*cm]),
+    ]
+
+    if open_qs.count():
+        story.append(Spacer(1, 0.2*cm))
+        story.append(Paragraph(
+            f'WARNING: {open_qs.count()} dispute report(s) remain unacknowledged and require attention.',
+            s['warn'],
+        ))
+
+    if open_rows:
+        open_data = [['Survey Area', 'Project No.', 'Disputes', 'Overlap (sq.m)', 'Detected']]
+        for r in open_rows:
+            open_data.append([r['area'][:30], r['project'][:20],
+                              str(r['dispute_count']), f"{r['overlap_sqm']:,.1f}", r['date']])
+        story += [
+            Spacer(1, 0.3*cm),
+            Paragraph('2. Open (Unacknowledged) Encroachments', s['h']),
+            tbl(open_data, [5*cm, 3.5*cm, 2*cm, 3.5*cm, 2.5*cm]),
+        ]
+
+    acked_rows = list(
+        acked_qs.select_related('survey_area__project', 'acknowledged_by')
+        .order_by('-acknowledged_at')[:20]
+    )
+    if acked_rows:
+        acked_data = [['Survey Area', 'Project No.', 'Disputes', 'Acknowledged By', 'Date']]
+        for dr in acked_rows:
+            acked_data.append([
+                dr.survey_area.name[:28],
+                (dr.survey_area.project.project_number or dr.survey_area.project.name)[:20],
+                str(len(dr.disputes or [])),
+                str(dr.acknowledged_by or '—')[:25],
+                dr.acknowledged_at.strftime('%d %b %Y') if dr.acknowledged_at else '—',
+            ])
+        story += [
+            Spacer(1, 0.3*cm),
+            Paragraph('3. Acknowledged Encroachments (Most Recent)', s['h']),
+            tbl(acked_data, [4.5*cm, 3*cm, 2*cm, 4*cm, 3*cm]),
+        ]
+
+    story += [
+        Spacer(1, 0.8*cm),
+        HRFlowable(width='100%', thickness=0.5, color=s['colors'].grey),
+        Spacer(1, 0.2*cm),
+        Paragraph('Generated by RakshaGIS Automated Reporting — Defence Geo-Data Engine (DGDE). '
+                  'Classification: FOR OFFICIAL USE ONLY.', s['sub']),
+    ]
+    doc.build(story)
+    return buf.getvalue()
 
 
 def _calc_next_run(frequency, from_dt):

@@ -182,6 +182,9 @@ export default function ReportsPage() {
                     { value: 'ACTIVITY_LOG',    label: 'User Activity Log' },
                     { value: 'TERRAIN_SUMMARY', label: '🗺 Terrain Analysis Summary (PDF)' },
                     { value: 'AI_SUMMARY',      label: '🤖 AI Survey Summary (PDF)' },
+                    { value: 'SURVEY_STATS',    label: '📋 Ministry Survey Statistics (PDF)' },
+                    { value: 'OWNERSHIP_SUM',   label: '🏛 Ministry Ownership Summary (PDF)' },
+                    { value: 'ENCROACHMENT',    label: '⚠️ Ministry Encroachment Analysis (PDF)' },
                   ]}
                 />
               </Form.Item>
@@ -246,6 +249,32 @@ export default function ReportsPage() {
                 </div>
               </Form.Item>
             </>
+          )}
+
+          {reportType === 'SURVEY_STATS' && (
+            <div style={{ fontSize: 11, color: '#888', marginBottom: 12 }}>
+              Generates a ministry-format PDF with project status distribution, survey-type breakdown,
+              GIS feature counts by geometry type, and a 6-month project creation trend — compiled
+              for the selected organisation and sent as a PDF attachment.
+            </div>
+          )}
+
+          {reportType === 'OWNERSHIP_SUM' && (
+            <div style={{ fontSize: 11, color: '#888', marginBottom: 12 }}>
+              Generates a ministry-format Defence Land Ownership Summary PDF: registered parcels
+              grouped by land category (Cantonment, Range, Airfield, Depot…) and security
+              classification, with area totals in hectares and acres, plus any parcels registered
+              in the last 30 days.
+            </div>
+          )}
+
+          {reportType === 'ENCROACHMENT' && (
+            <div style={{ fontSize: 11, color: '#888', marginBottom: 12 }}>
+              Generates a ministry-format Encroachment Analysis PDF: total dispute checks run, clean
+              vs. contested survey areas, total overlapping area (sq. m / ha), a table of open
+              (unacknowledged) encroachments, and a list of recently acknowledged ones — ready for
+              submission to DGDE / MoD.
+            </div>
           )}
 
           <Form.Item name="is_active" label="Active" valuePropName="checked" initialValue={true}>

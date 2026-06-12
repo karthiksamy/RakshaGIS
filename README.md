@@ -39,12 +39,13 @@ Everything runs on-premise. No commercial cloud services, no internet dependency
 21. [External Data Layers](#external-data-layers)
 22. [Map Printing & High-Resolution Export](#map-printing--high-resolution-export)
 23. [Boundary Extraction & Review](#boundary-extraction--review)
-24. [Contributing](#contributing)
-25. [Production Deployment Checklist](#production-deployment-checklist)
-26. [Troubleshooting](#troubleshooting)
-27. [Maintenance Notes & Resolved Issues](#maintenance-notes--resolved-issues)
-28. [Project Background (DGDE)](#project-background-dgde)
-29. [Licence](#licence)
+24. [Offline PWA Field Companion](#offline-pwa-field-companion)
+25. [Contributing](#contributing)
+26. [Production Deployment Checklist](#production-deployment-checklist)
+27. [Troubleshooting](#troubleshooting)
+28. [Maintenance Notes & Resolved Issues](#maintenance-notes--resolved-issues)
+29. [Project Background (DGDE)](#project-background-dgde)
+30. [Licence](#licence)
 
 ---
 
@@ -54,13 +55,19 @@ RakshaGIS is an enterprise-grade web GIS platform purpose-built for DGDE to digi
 
 - Field surveying and GIS feature editing
 - Survey-area-wise internal review and approval routing
-- AI-assisted document processing and boundary extraction from scanned maps
+- AI-assisted document processing, boundary extraction, attribute validation, and report generation
 - In-browser document editing (OnlyOffice)
 - Real-time collaborative editing by multiple surveyors
-- 3D terrain and elevation analysis (Cesium.js + SRTM/Cartosat DEM)
+- 3D terrain and elevation analysis (Cesium.js + SRTM/Cartosat DEM) with vector overlay and DEM analysis tools
+- Offline-first Progressive Web App (PWA) field companion for GPS-guided feature collection
+- Per-feature comment threads for collaborative annotation
+- C2PA and Living Provenance DNA watermarking on all exports
+- Strict org-level data isolation: DGDE/PDDE see only their own org's content; subordinate data visible only through the published Map Viewer
+- Hierarchical Office Drilldown dashboard (DGDE → PDDE command → DEO)
+- Mandatory TOTP two-factor authentication enforced at first login
 - Automated encrypted backups with rotation
 - Multi-language UI (English, Hindi, Tamil, Telugu, Bengali, Kannada, Marathi)
-- Public-facing layer publishing — all hosted on-premise with **zero cloud dependency**
+- Published-layer sharing — all hosted on-premise with **zero cloud dependency**
 
 ---
 
@@ -107,24 +114,39 @@ RakshaGIS is an enterprise-grade web GIS platform purpose-built for DGDE to digi
 - Broadcasts: `feature_created`, `feature_updated`, `feature_deleted`, `feature_locked`, `feature_unlocked`
 - Auto-reconnect with exponential backoff; locks auto-released on disconnect
 
-### 3D Terrain & Elevation Overlay
+### 3D Terrain & Elevation Analysis
 - Full Cesium.js 3D globe at `/terrain`
 - Load project GIS features as 3D extruded polygons/lines/points
 - **Elevation query**: click any point to see lat/lon/elevation
 - **Elevation profile**: draw a multi-segment line, see SVG elevation chart with min/max/length
-- **Slope analysis**: click 2 corners to define an area, sample 15×15 grid, see min/avg/max slope in degrees
+- **DEM (Digital Elevation Model) analysis**: 16 analysis tools including slope, aspect, hillshade, curvature, TPI, TRI, roughness, flow direction, viewshed, and more — each produces a colour-rendered scene PNG with legend and statistics panel
+- **Slope analysis**: sample a configurable grid (up to 50×50 = 2,500 points) over any drawn area, see min/avg/max slope in degrees with colour-coded overlay
+- **Vector file upload**: import Shapefile (.zip), GeoJSON, KML/KMZ, or GeoPackage directly into the 3D viewer; Cesium renders the features as a 3D overlay for analysis
+- **Terrain-area slope analysis from vector**: after loading a vector layer, trigger slope analysis over the bounding box in one click
+- **PNG export with watermarking**: all scene captures (DEM analysis, slope, elevation) include C2PA + LP-DNA watermarks via the `/core/watermark-file/` pipeline
 - Terrain sources: Ellipsoid (flat, default) · Local SRTM/Cartosat server (profile `terrain`) · Cesium ION (set token)
-- Offline SRTM DEM setup via `./setup_terrain.sh`
+- Offline SRTM DEM setup via `./setup_terrain.sh`; `scripts/generate_terrain_layer.py` generates the correct `layer.json` availability index
+- PWA and Coordinate Tool panels are collapsed to icon-only by default; click to expand
 
 ### Version Comparison
 - Split-screen map view comparing any two VERSION folders side-by-side
 - Shared OL `View` instance — pan/zoom syncs both panels simultaneously
 
-### Organisation-Wise Data Isolation & Cross-Org Access
-- **Strict data isolation**: each organisation sees only its own projects, survey areas, features, folders, and documents
-- **DGDE** — reads all data across all organisations (all-India)
-- **PDDE** — reads all data within its command jurisdiction (subtree)
+### Strict Org-Level Data Isolation
+- **Per-office isolation**: every project, survey area, GIS feature, folder, document, GeoTiff, and shapefile import is visible **only** to the office that created it
+- **DGDE** — creates and manages its own org's content; reaches subordinate offices **only** through the published Map Viewer (read-only, published areas only); has no add/edit/delete rights over sub-office content
+- **PDDE** — same as DGDE but scoped to its command subtree
+- **SUPERADMIN accounts** attached to a DGDE/PDDE org are treated identically to DGDE/PDDE users (no bypass); only a superadmin with **no organisation** retains global system access
 - Cross-org access request workflow: DEO can request read access to another org's survey area
+- Explicit project sharing via `ProjectShare` grants; DEO-visible opt-in for CEO/ADEO sub-office layers
+- All isolation enforced centrally via `hq_level()` + `org_queryset_filter()` — applies to viewsets, actions, dashboard, search, AI assistant, reports, and workflow
+
+### Office Drilldown Dashboard
+- Hierarchical stats dashboard: DGDE sees national → command level; click a command to see its DEO offices
+- PDDE sees its own command → its DEO offices
+- Each level shows: project counts by status, survey area counts, feature counts, document counts, active user counts
+- Breadcrumb navigation; DEO is the terminal level (no sub-office breakdown)
+- All aggregates are scoped to the visible subtree — HQ cannot see per-content details, only aggregate numbers
 
 ### Online Document Editing (OnlyOffice)
 - OnlyOffice Community Document Server integrated as a Docker service — no licence required, fully offline
@@ -163,11 +185,45 @@ RakshaGIS is an enterprise-grade web GIS platform purpose-built for DGDE to digi
 - Ant Design component strings translated for Hindi (`antd/locale/hi_IN`)
 - All untranslated keys fall back to English — no broken UI
 
+### Mandatory Two-Factor Authentication (2FA)
+- **Enforced TOTP** (Time-based One-Time Password) for all users
+- First login: user must scan QR code with any TOTP app (Google Authenticator, Authy, etc.) and confirm a valid code before the session token is issued — no bypass
+- Subsequent logins: OTP entry required; `±60 s` clock tolerance (`valid_window=2`)
+- Backend: `pyotp` + `TOTPDevice` model; setup flow via `/api/accounts/auth/2fa/setup-begin/` → `/api/accounts/auth/2fa/setup-complete/`
+- Login never issues tokens directly — always returns `requires_2fa_setup` or `requires_2fa` status
+
+### C2PA & Living Provenance DNA Watermarking
+- All terrain analysis exports (DEM PNG, slope PNG, GeoJSON, CSV), uploaded documents, and report PDFs are watermarked before download
+- **C2PA** (Content Authenticity Initiative): embeds cryptographic provenance assertions readable by Adobe and other C2PA-aware tools
+- **LP-DNA** (Living Provenance DNA): invisible steganographic metadata binding the export to the project, uploader, and timestamp
+- Central watermark pipeline at `/api/core/watermark-file/` — used by all export paths
+- PDF reports use LP-DNA only (C2PA is limited to image/office formats)
+
+### Per-Feature Comment Threads
+- Any GIS feature can carry a threaded discussion visible to all users with project access
+- Comments stored in `FeatureComment` (feature FK, user, text, timestamp)
+- Shown in the **Feature Info drawer** on the Map page with role-coloured user tags and an inline reply box
+- REST API: `/api/projects/feature-comments/?feature=<id>`
+
+### Attribute Auto-Validator
+- Runs automatically after every shapefile import completes
+- Checks for: duplicate feature IDs, missing required attributes, zero-area polygons, features outside the India bounding box
+- Results stored in `ShapefileImport.validation_warnings` (JSON list)
+- Summary emailed to the uploader; shown in the Import Status UI
+- An AI review task is also queued to check attribute completeness against the project's `AttributeTemplate`
+
+### AI Survey Report Generator
+- Generate a structured AI-authored survey report from any project in one click
+- Backend gathers project stats (area counts by status, feature counts, document inventory) and asks the local LLM to write a narrative summary with findings and recommendations
+- Output: formatted PDF (LP-DNA watermarked) + `.docx` stored as a project document
+- Accessible from the Reports page (`AI_SUMMARY` report type) or the AI Assistant panel
+- Fully local — LLM runs on-premise via Ollama
+
 ### User & Organisation Management
 - Hierarchical organisations: DGDE → PDDE → DEO → CEO → ADEO
 - 10 roles: SUPERADMIN, PDDE_VIEWER, VIEWER, DEO_ADMIN, CEO_ADMIN, ADEO_ADMIN, SDO, SURVEYOR, CHECKER, APPROVER
 - Force-logout, per-user password change, admin-initiated password reset
-- Two-factor authentication (TOTP) for admin roles
+- Mandatory TOTP two-factor authentication enforced at first login for all users
 
 ### Master Data (SuperAdmin)
 - CRUD for State, District, Taluk, Village with cascading dropdowns
@@ -996,6 +1052,31 @@ ollama pull llava:7b        # 4.7 GB — best quality
 ollama pull moondream       # 850 MB — faster, lower detail
 ```
 
+### AI Survey Report Generator
+
+Generate a full AI-authored survey report for any project:
+
+```
+1. Go to Reports → New Schedule
+2. Set type = "AI Survey Summary"
+3. Click "Send Now" (or schedule)
+4. The task gathers project stats, feature counts, document inventory, and asks the
+   local LLM to write a structured narrative
+5. Output: PDF (LP-DNA watermarked) + .docx saved as a project document
+```
+
+### Attribute Auto-Validator
+
+Runs automatically after every shapefile import:
+
+```
+1. Import a Shapefile (.zip) via Projects → Shapefile Import
+2. The Celery task imports features then calls _validate_imported_features()
+3. Checks: duplicate IDs, missing required attributes, zero-area polygons, out-of-India bbox
+4. Results appear in the Import Status row (validation_warnings field)
+5. AI review is also queued to check attribute completeness vs. the project AttributeTemplate
+```
+
 ### DGDE Domain Model
 
 Creates an Ollama model specialised in DGDE/survey domain knowledge:
@@ -1020,6 +1101,10 @@ Output: /data/media/training/<project_id>_training.jsonl
 ```
 
 ---
+
+## API Reference (additions)
+
+See also the [Offline PWA section](#offline-pwa-field-companion) and [Contributing](#contributing).
 
 ## API Reference
 
@@ -1062,6 +1147,13 @@ Interactive API documentation: `http://localhost/api/schema/swagger-ui/`
 | `/api/external/gis-server-layers/` | GIS Server layers — CRUD, features, tile-config |
 | `/api/core/basemaps/` | Basemap configurations |
 | `/api/core/terrain-config/` | Terrain/Cesium configuration |
+| `/api/core/terrain/vector-upload/` | Upload Shapefile/GeoJSON/KML/KMZ/GPKG for 3D terrain overlay |
+| `/api/core/watermark-file/` | Embed C2PA + LP-DNA watermark in a file before download |
+| `/api/core/elevation/` | Batch elevation lookup (up to 5,000 points) |
+| `/api/accounts/auth/2fa/setup-begin/` | Start TOTP 2FA registration — returns QR URI |
+| `/api/accounts/auth/2fa/setup-complete/` | Complete 2FA registration with first OTP |
+| `/api/projects/feature-comments/` | Per-feature comment threads (CRUD) |
+| `/api/dashboard/org-drilldown/` | Hierarchical org stats (DGDE→command→office) |
 | `/tiles/` | MVT vector tiles via pg_tileserv |
 | `/osm-tiles/{z}/{x}/{y}.png` | Offline India raster tiles |
 | `/terrain-tiles/` | SRTM/Cartosat quantized-mesh terrain tiles |
@@ -1092,24 +1184,27 @@ curl -X POST http://localhost/api/accounts/token/refresh/ \
 
 | Role | Capabilities |
 |---|---|
-| **SUPERADMIN** | Full system access, master data, all backup operations, LLM config, create DGDE model; add global External DB layers and global GIS Server layers (visible to all users) |
+| **SUPERADMIN (no org)** | Global system access — master data, all org's data, all backup operations, LLM config, create DGDE model; add global External DB layers and global GIS Server layers |
+| **SUPERADMIN (DGDE/PDDE org)** | Treated identically to DGDE/PDDE office users — own-org content only; no rights over subordinate offices |
+| **DGDE / PDDE users** | Create and manage own org's projects/areas/documents; view subordinate offices' **published maps** (Map Viewer only); cannot add/edit/delete sub-office content |
 | **DEO_ADMIN / CEO_ADMIN / ADEO_ADMIN** | Manage users/orgs within own hierarchy; publish approved survey areas; approve/reject cross-org access requests; download own org backups; add org-scoped GIS Server layers |
-| **PDDE_VIEWER** | Read-only access to all data within own command jurisdiction; download command backups |
+| **PDDE_VIEWER** | Read-only access within own command jurisdiction |
 | **SDO / SURVEYOR / CHECKER / APPROVER / VIEWER** | Standard survey workflow access; can add org-scoped GIS Server layers for their own organisation |
 
-> **GIS Server Layers:** Any authenticated user can register GIS server connections and add layers. Layers added by SUPERADMIN have `organisation = null` and are visible globally. Layers added by any other user are automatically scoped to their own organisation and visible only within that organisation.
+> **GIS Server Layers:** Any authenticated user can register GIS server connections and add layers. Layers added by a global SUPERADMIN have `organisation = null` and are visible globally. Layers added by any other user are automatically scoped to their own organisation.
 
 ---
 
 ## Data Access Rules
 
-| Actor | Visible data |
-|---|---|
-| DGDE | All organisations, all projects, all survey areas (India-wide) |
-| PDDE | All orgs within own command jurisdiction (subtree) |
-| DEO / CEO / ADEO | Own organisation's data only |
-| Any org (approved) | Survey areas approved via cross-org access request |
-| Any user | Projects explicitly shared to them via ProjectShare |
+| Actor | Projects / Survey Areas / Features / Docs | Published Map Viewer | Add / Edit / Delete sub-office content |
+|---|---|---|---|
+| **DGDE / DGDE-org superadmin** | Own org only | All offices (India-wide) | ✗ Blocked |
+| **PDDE / PDDE-org superadmin** | Own org only | Own command subtree | ✗ Blocked |
+| **DEO / CEO / ADEO** | Own org only | Own published areas | ✓ Within own org |
+| **Any org (approved cross-org)** | Survey areas approved via access request | — | ✗ Read-only |
+| **Any user (ProjectShare)** | Projects explicitly shared to them | — | ✗ Read-only |
+| **Global superadmin (no org)** | All organisations | All | ✓ All |
 
 ---
 
@@ -1118,16 +1213,17 @@ curl -X POST http://localhost/api/accounts/token/refresh/ \
 ```
 RakshaGIS/
 ├── apps/
-│   ├── accounts/          # Users, Organisations, RBAC, 2FA
-│   ├── ai_assistant/      # Ollama/LocalAI chat, RAG, vision extraction, report generation
+│   ├── accounts/          # Users, Organisations, RBAC, mandatory TOTP 2FA
+│   ├── ai_assistant/      # Ollama/LocalAI chat, RAG, vision extraction, AI report generation, attribute validation
 │   ├── backups/           # Backup jobs, schedules, Celery tasks, encryption
 │   ├── collaboration/     # WebSocket consumers, JWT middleware, routing
-│   ├── core/              # Basemap configs, terrain config, branding
-│   ├── documents/         # File upload, OnlyOffice integration, AI processing
+│   ├── core/              # Basemap configs, terrain config, watermark pipeline, terrain vector upload
+│   ├── documents/         # File upload, OnlyOffice integration, AI processing, LP-DNA watermarking
 │   ├── gis_layers/        # State/District/Taluk/Village master data, boundary import
-│   ├── reports/           # Scheduled reports
-│   ├── survey_projects/   # Projects, Survey Areas, Features, Folders, Parcels, Access Requests
-│   ├── dashboard/         # Dashboard stats
+│   ├── reports/           # Scheduled reports, AI Survey Report Generator
+│   ├── survey_projects/   # Projects, Survey Areas, Features, Folders, FeatureComments, Access Requests
+│   │   └── access.py      # Central HQ isolation helpers: hq_level(), org_queryset_filter(), ai_project_ids()
+│   ├── dashboard/         # Dashboard stats, Office Drilldown (OrgDrilldownView)
 │   └── workflow/          # Survey-area state machine, dispute detection, audit log, notifications
 ├── config/
 │   ├── asgi.py            # ASGI application (Channels + ProtocolTypeRouter)
@@ -1141,14 +1237,17 @@ RakshaGIS/
 ├── frontend/              # React 18 + TypeScript SPA (Vite)
 │   └── src/
 │       ├── features/
-│       │   ├── map/               # MapPage, CollabPresence, terrain/
-│       │   ├── terrain/           # Cesium 3D viewer, ElevationChart
+│       │   ├── map/               # MapPage, CollabPresence, FeatureCommentThread
+│       │   ├── terrain/           # Cesium 3D viewer, DEMAnalysisPanel (16 tools + legend/stats), vector upload
 │       │   ├── projects/          # ProjectDetailPage, DisputeModal, etc.
 │       │   ├── ai-chat/           # AI chat page with RAG selector
 │       │   ├── ai-vision/         # Vision boundary extraction page
 │       │   ├── backups/           # Backup management page
 │       │   ├── master/            # State/District/Taluk/Village CRUD + Boundary Import
-│       │   ├── auth/              # LoginPage
+│       │   ├── auth/              # LoginPage with TOTP 2FA setup (QR code + confirm step)
+│       │   ├── field/             # FieldCompanionPage — offline PWA, GPS tracking, feature queue
+│       │   ├── dashboard/         # OrgDrilldownPage (DGDE → command → DEO hierarchy)
+│       │   ├── reports/           # ReportsPage (AI_SUMMARY report type added)
 │       │   ├── users/             # User management
 │       │   └── organisations/     # Organisation management
 │       ├── hooks/
@@ -1157,8 +1256,11 @@ RakshaGIS/
 │       │   ├── index.ts           # i18next configuration
 │       │   └── locales/           # en.json, hi.json, ta.json, te.json, bn.json, kn.json, mr.json
 │       ├── components/
-│       │   ├── AppLayout.tsx      # Main layout, sidebar, header, language switcher
+│       │   ├── AppLayout.tsx      # Main layout, sidebar (Field Companion + Office Drilldown added)
 │       │   └── LanguageSwitcher.tsx
+│       ├── utils/
+│       │   ├── watermarkDownload.ts  # C2PA + LP-DNA watermark pipeline (posts to /core/watermark-file/)
+│       │   └── offlineStore.ts       # IndexedDB helpers for PWA offline cache and feature outbox
 │       ├── app/                   # Routes, Zustand store
 │       ├── services/              # Axios instance, query keys
 │       └── types/                 # Shared TypeScript interfaces
@@ -1172,8 +1274,11 @@ RakshaGIS/
 ├── requirements.txt       # Python dependencies
 ├── entrypoint.sh          # Container entrypoint (migrations, collectstatic)
 ├── build.sh               # Build + --import-osm + --save/load-images
+├── update.sh              # Quick deploy: backend restart / frontend build+sync / all
 ├── RakshaGIS.sh           # Service manager (start/stop/backup/restore)
 ├── setup_terrain.sh       # SRTM DEM download + quantized-mesh conversion
+├── scripts/
+│   └── generate_terrain_layer.py  # Scans tile dir, writes layer.json with correct available[] index
 └── generate_writeup.py    # Generates project writeup .docx
 ```
 
@@ -1207,10 +1312,12 @@ Django Apps  [raksha-net network — internal, no outbound internet]
 
 Background Workers (Celery + Redis)
   ├── COG conversion (GeoTIFF → Cloud-Optimized)
-  ├── Shapefile import
+  ├── Shapefile import + attribute auto-validation
   ├── AI document processing (pdfplumber + Ollama)
   ├── RAG document embedding (Ollama /api/embed)
   ├── Vision boundary extraction (Ollama /api/chat with images)
+  ├── AI Survey Report generation (stats gather → LLM narrative → PDF + .docx)
+  ├── Attribute validation (duplicate IDs, missing fields, bbox, zero-area)
   ├── Backup jobs (dumpdata + encrypt + zip)
   ├── Backup rotation (delete expired files)
   └── Scheduled backup runner (check BackupSchedule every hour)
@@ -1432,7 +1539,38 @@ Entry points: **AI → GeoTiff Polygon Extraction** (`/ai-vision`) → run Class
 
 ---
 
-## Contributing
+## Offline PWA Field Companion
+
+The Field Companion (`/field-companion`) is a Progressive Web App (PWA) designed for surveyors who work in areas with intermittent or no connectivity.
+
+### Features
+
+- **Offline-first OpenLayers map** — project layers are cached to IndexedDB when online; the map continues to work without a network
+- **Project caching** — tap "Cache for offline" on any project to store its features, survey areas, and attribute templates locally
+- **GPS tracking** — real-time position indicator; tap any point on the map to add a geo-referenced note with automatically recorded coordinates
+- **Offline feature queue** — new features added while offline are stored in a local outbox (IndexedDB) and synced automatically when connectivity is restored
+- **Pending-sync badge** — the PWA icon on the Map toolbar shows the count of features waiting to sync
+- **Auto-sync on reconnect** — when the browser regains connectivity, the outbox flushes to the backend (`POST /api/projects/features/`) without user intervention
+
+### Architecture
+
+```
+Browser (service worker)
+  ├── Cache API → tiles, static assets
+  ├── IndexedDB (offlineStore.ts)
+  │     ├── projects       (cached project + features)
+  │     ├── feature_outbox (pending creates)
+  │     └── settings       (last project, GPS state)
+  └── Online auto-sync (connectivity event → flush outbox)
+```
+
+### Access
+
+The Field Companion is available from the sidebar menu (**Field Companion** → EnvironmentOutlined icon) or directly at `/field-companion`. No special role is required.
+
+---
+
+## API Reference (additions)
 
 See the developer workflow below (full history in `docs/archive/CONTRIBUTING.md`).
 
@@ -1583,6 +1721,15 @@ A condensed history of notable fixes. The original per-issue notes are preserved
 |------|---------|------------|
 | **Cesium (3D)** | Blank globe / `Cannot find module` for Cesium assets in TerrainPage | Correct Cesium static asset path + import; `fix-cesium-path.sh` runs in the build. See `CESIUM_ASSET_PATH_FIX.md`, `CESIUM_IMPORT_FIX.md`. |
 | **3D Terrain** | Features draped wrong / globe halts after "Load Features" | Drape polygons (clamp-to-ground) instead of extrude+clamp; guard null `layer_name`; per-feature try/catch. See `TERRAIN_FIX_COMPLETE.md`. |
+| **3D Terrain rendering** | Terrain viewer showed flat 2D — no elevation relief visible | nginx `proxy_pass` with variable doesn't rewrite URI; added `rewrite ^/terrain-tiles/(.*)$ /$1 break;` in `nginx-docker.conf`. |
+| **Cesium availability** | "terrain availability error" on load | `layer.json` lacked the `available` array; `scripts/generate_terrain_layer.py` now scans the tile tree and writes the correct index. |
+| **Slope analysis** | "Invalid grid data" error for any grid larger than ~22×22 | `ElevationLookupView` was capped at 500 points; raised to 5,000 so a 50×50 grid works. |
+| **OTP validation** | TOTP code rejected on login | Root cause: device existed with a different secret than what the authenticator scanned. Added `valid_window=2` (±60 s tolerance) and stripped spaces before comparison. |
+| **OnlyOffice save callback** | 400 errors on document save | `nginx` was not in `ALLOWED_HOSTS`; fix: `ALLOWED_HOSTS=localhost,127.0.0.1,nginx` and `docker compose up -d web celery` (NOT docker restart — env is baked at container creation). |
+| **fiona ≥1.9 geometry** | `Object of type Geometry is not JSON serializable` in vector upload / shapefile import | Used `from fiona.model import to_dict as _to_dict; geom = _to_dict(geom)` before JSON serialisation. |
+| **DGDE/PDDE seeing sub-office data** | HQ and org-attached superadmins bypassed org filtering | `hq_level()` + `org_queryset_filter()` now applied universally; superadmin role no longer exempt when attached to an HQ org. Affects all viewsets, dashboard, search, AI, reports, and workflow. |
+| **DEO sub-office stats in drilldown** | DEO drilldown showed CEO/ADEO data | Replaced `_descendant_ids()` with `_scope_ids()` that stops descent at DEO level. |
+| **"Send Now" not working** | Manual report trigger skipped | Only sent due schedules; fix: force `next_run=None` before triggering. |
 | **OnlyOffice** | Document editor opened in a cramped modal | Open documents in a new browser tab. See `ONLYOFFICE_FIX_SUMMARY.md`. |
 | **Docker build** | `<none>` image tags, migration permission errors on WSL2 | Fixed image naming + entrypoint permissions. See `DOCKER_BUILD_FIXES.md`. |
 | **Mapnik** | `import mapnik` fails / export 503 | Install system `libmapnik` + `python-mapnik` (baked into the Docker image); see [Map Printing](#map-printing--high-resolution-export). |
@@ -1617,15 +1764,24 @@ Several items first identified as "future scope" are now **delivered**:
 | Automated boundary dispute detection | ✅ Pre-submission PostGIS overlap check vs other orgs' PUBLISHED features (`DisputeReport`) |
 | Advanced AI integration | ✅ GeoTIFF/scanned-map parcel extraction + Survey-Number OCR; local-LLM training-export / fine-tune tooling |
 | Admin boundary data load | ✅ State/District/Taluk/Village master + shapefile import |
-| 3D terrain & elevation overlay | ✅ Cesium viewer — elevation/profile/slope over SRTM/Cartosat DEM |
+| 3D terrain & elevation overlay | ✅ Cesium viewer — elevation/profile/slope, 16 DEM analysis tools, vector overlay, C2PA-watermarked PNG export |
 | Real-time collaborative editing | ✅ WebSocket (Channels/Daphne) concurrent editing + presence |
 | Multi-language UI | ✅ English, Hindi, Tamil, Telugu, Bengali, Kannada, Marathi |
 | Automated DR backups | ✅ Encrypted PostgreSQL dumps + rotation (off-site replication pending) |
 | Regulatory reporting | ◑ Survey-area `.docx` + proximity/encroachment reports done; ministry-format templates in progress |
 | GIS Server Layers (all-user) | ✅ Any authenticated user can add WMS/WFS/ArcGIS/XYZ server layers; org-scoped or global (SUPERADMIN) |
 | 300 DPI map export | ✅ Client-side GeoTIFF/PNG export at 300 DPI with tile-load wait before canvas composite |
+| Mandatory 2FA (TOTP) | ✅ First-login QR setup + OTP enforcement on every login; no bypass |
+| C2PA + LP-DNA watermarking | ✅ All terrain exports, uploaded documents, and report PDFs carry provenance watermarks |
+| AI Survey Report Generator | ✅ LLM-authored narrative PDF + .docx from project data |
+| Attribute Auto-Validator | ✅ Post-import checks: duplicate IDs, missing fields, zero-area polygons, out-of-India bbox |
+| Offline PWA Field Companion | ✅ IndexedDB cache, GPS tracking, offline feature queue, auto-sync on reconnect |
+| Per-Feature Comment Threads | ✅ Threaded discussion on any GIS feature with role-coloured tags |
+| Office Drilldown Dashboard | ✅ DGDE → command → DEO aggregates with breadcrumb navigation |
+| Strict HQ data isolation | ✅ DGDE/PDDE and org-attached superadmins see only own-org content; sub-office data never leaks |
+| 3D Vector File Upload | ✅ Shapefile/GeoJSON/KML/KMZ/GeoPackage loaded as Cesium 3D overlay |
 
-**Still planned:** mobile field-survey PWA/React-Native app with offline sync · DILRMP (national land registry) connectors · PKI / smart-card (mutual-TLS) authentication · off-site backup replication to NIC Meghraj · ministry-prescribed report templates.
+**Still planned:** DILRMP (national land registry) connectors · PKI / smart-card (mutual-TLS) authentication · off-site backup replication to NIC Meghraj · ministry-prescribed report templates.
 
 ---
 

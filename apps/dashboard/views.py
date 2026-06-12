@@ -77,13 +77,19 @@ class DashboardStatsView(APIView):
 
         user_count = None
         org_count = None
-        if user.is_superadmin:
+        from apps.survey_projects.access import hq_level as _hq_level
+        _sa_level = _hq_level(user)
+        if user.is_superadmin and not _sa_level:
             user_count = User.objects.filter(is_active=True).count()
             org_count = Organisation.objects.count()
         elif user.organisation:
             user_count = User.objects.filter(
                 organisation_id__in=_visible_org_ids(user), is_active=True
             ).count()
+            if user.is_superadmin and _sa_level:
+                org_count = Organisation.objects.filter(
+                    id__in=user.organisation.get_subtree_ids()
+                ).count()
 
         # Recent projects (7 days)
         recent = projects.filter(
@@ -295,7 +301,12 @@ class GlobalSearchView(APIView):
         matched_users = []
         if user.can_manage_users:
             if user.is_superadmin:
-                user_qs = User.objects.all()
+                from apps.survey_projects.access import hq_level as _hq_search
+                _search_level = _hq_search(user)
+                if _search_level and user.organisation:
+                    user_qs = User.objects.filter(organisation=user.organisation)
+                else:
+                    user_qs = User.objects.all()
             elif user.organisation:
                 user_qs = User.objects.filter(
                     organisation_id__in=_visible_org_ids(user)

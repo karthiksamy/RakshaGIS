@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     'apps.collaboration',
     'apps.backups',
     'apps.external_data',
+    'apps.revenue_connectors',
 
     # Django Channels
     'channels',
@@ -195,6 +196,11 @@ CELERY_BEAT_SCHEDULE = {
     'cache-sentinel2-tiles': {
         'task': 'apps.core.tasks.cache_sentinel2_tiles',
         'schedule': crontab(hour='*/6', minute=30),
+    },
+    # Nightly cross-reference of all defence parcels against revenue portals
+    'cross-reference-all-parcels': {
+        'task': 'apps.revenue_connectors.tasks.cross_reference_all_parcels',
+        'schedule': crontab(hour=2, minute=0),
     },
 }
 

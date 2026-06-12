@@ -47,10 +47,15 @@ class OrganisationViewSet(viewsets.ModelViewSet):
         return [IsSuperAdmin()]
 
     def get_queryset(self):
+        from apps.survey_projects.access import hq_level
         user = self.request.user
         qs = super().get_queryset()
         if user.role == User.SUPERADMIN:
-            return qs  # sees every org in the system
+            org = getattr(user, 'organisation', None)
+            if org is not None and hq_level(user):
+                # HQ-attached superadmin: own subtree only (no access to other commands)
+                return qs.filter(id__in=org.get_subtree_ids())
+            return qs  # Global superadmin sees all orgs
         org = getattr(user, 'organisation', None)
         if org is None:
             return qs.none()
@@ -82,10 +87,15 @@ class UserViewSet(viewsets.ModelViewSet):
         return [CanManageUsers()]  # create
 
     def get_queryset(self):
+        from apps.survey_projects.access import hq_level
         user = self.request.user
         qs = User.objects.select_related('organisation').order_by('username')
         if user.role == User.SUPERADMIN:
-            return qs
+            org = getattr(user, 'organisation', None)
+            if org is not None and hq_level(user):
+                # HQ-attached superadmin: manage users in own org only
+                return qs.filter(organisation=org)
+            return qs  # Global superadmin sees all users
         if user.role in (User.DEO_ADMIN, User.CEO_ADMIN, User.ADEO_ADMIN):
             # Admins see non-admin users within their own org only
             return qs.filter(organisation=user.organisation).exclude(
@@ -94,9 +104,18 @@ class UserViewSet(viewsets.ModelViewSet):
         return qs.filter(pk=user.pk)
 
     def perform_create(self, serializer):
+        from apps.survey_projects.access import hq_level
         user = self.request.user
         if user.role == User.SUPERADMIN:
-            serializer.save()
+            org = getattr(user, 'organisation', None)
+            if org is not None and hq_level(user):
+                # HQ-attached superadmin: can only create users in own office
+                target_org = serializer.validated_data.get('organisation', org)
+                if target_org != org:
+                    raise PermissionDenied('HQ offices can only create users within their own office.')
+                serializer.save(organisation=org)
+            else:
+                serializer.save()
             return
 
         if user.role in (User.DEO_ADMIN, User.CEO_ADMIN, User.ADEO_ADMIN):

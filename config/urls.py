@@ -80,6 +80,7 @@ urlpatterns = [
     path('api/reports/', include('apps.reports.urls')),
     path('api/backups/', include('apps.backups.urls')),
     path('api/external/', include('apps.external_data.urls')),
+    path('api/revenue/', include('apps.revenue_connectors.urls')),
 
     # React SPA catch-all — must be last; serves Vite-built index.html for any non-API path
     re_path(r'^(?!api/|admin/|static/|media/|metrics/).*$', spa_index, name='frontend'),
